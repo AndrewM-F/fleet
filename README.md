@@ -12,6 +12,11 @@ bin/fleet doctor
 ```
 `FLEET_ROOT` / `FLEET_CONFIG` override the root/config location; everything else resolves from the root.
 
+## Tests
+```
+python3 -m unittest discover -s tests -t .
+```
+
 ## Commands
 | command | effect |
 |---|---|
