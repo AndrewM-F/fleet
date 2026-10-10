@@ -1,0 +1,54 @@
+# Fleet operating contract (for any agent: Claude, Codex, Pi, scripts)
+
+This directory is a small local manager that sends **root-authorized** tasks to existing
+Pi and Claude worker sessions. It never calls a model itself. Use `bin/fleet` for lifecycle and queue control; every
+command prints JSON on stdout and exits non-zero on failure.
+
+## Safe, read-only
+- `bin/fleet status` — pause flag, process liveness, per-session state, task counts.
+- `bin/fleet doctor` — validates config, worktrees, session identities, executables, DB.
+- `bin/fleet completions collect` — pending relay events with completion receipts.
+
+## State-changing (only when your principal asked for it)
+- `bin/fleet enqueue '<task-or-list>'` — task: `{"id","message","rootAuthorized":true}` plus
+  exactly one of `sessionId`, `lane`, `previousTaskId`. IDs are idempotent; reuse with different
+  content is rejected.
+- `bin/fleet control '<request>'` — enqueue + ack + wait in one call:
+  `{"tasks":[...],"ack":[eventIds],"after":0,"limit":1-4,"timeout":0-3600}`.
+- `bin/fleet completions wait|ack --ids 1,2` — block for / acknowledge relay events.
+- `bin/fleet pause` / `bin/fleet resume` — gate new dispatches. **Resume is a human decision.**
+- `bin/fleet start` / `bin/fleet stop [--lane L]` — never changes the pause flag; `stop` refuses
+  while any Pi lane is busy unless `--force`. A launchd supervisor restarts crashed components
+  every 30s; `stop` (whole fleet or `--lane`) disables that until the next `start`.
+- `bin/fleet resolve --events 1,2 | --task ID --as finished|cancelled | --worker SID --note "..."`
+  — record an operator decision (ack events, close an uncertain task, mark a failed Claude turn
+  reviewed so the worker can take work again). Notes are stored as events.
+- `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
+  group SIGTERM); the task becomes `cancelled` and is never resent.
+- `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
+  git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
+
+## Rules
+1. Never create, replace or duplicate worker sessions; identities live in
+   `config/fleet.local.json` (one entry per session).
+2. Never resend a task in state `uncertain`; inspect the worker and enqueue a new task ID.
+3. Acknowledge an event only after you have acted on it; unacked events persist across restarts.
+4. Don't edit `data/` by hand. Stop the fleet and run `scripts/db-check` before copying or moving it.
+5. Don't touch credentials, repository history, or `~/Developer/.codex/archive` (historical only).
+
+See README.md for layout and docs/ for architecture, configuration and troubleshooting.
+
+## Pull request lifecycle
+- Open every PR in draft. Do not mark it ready until its agreed implementation scope is complete and root has reviewed the exact resulting code head.
+- Do not mark a PR ready merely to trigger CI. Use supported draft CI or an explicit workflow dispatch where available; do not alter workflow gates or branch protections.
+- After root review approves the exact head, wait for every applicable test, build, lint, typecheck and integration check on that head to pass before enabling squash auto-merge. A relevant failing check blocks our merge even when GitHub does not require it. A skipped check is acceptable only when its documented applicability condition excludes this change; cancelled or missing applicable validation is not a pass.
+- Preserve all existing branch protections and review rules. If auto-merge is already enabled and a relevant non-required check fails, disable auto-merge promptly, report the failed job, and obtain root review of the repair before restoring eligibility.
+- If CI fails, assign the repair immediately to the current owner or an existing fleet worker, keep auto-merge enabled, and push the fix to the same PR branch. If the head changes after root review, return it to root for review before it remains eligible to merge.
+- Keep task handoffs consistent with these rules. Do not create sessions for repairs unless separately authorized.
+
+## Heavy validation scheduling
+- Keep existing sessions and issue ownership. Before starting a full monorepo build, full unit/integration/coverage suite, browser suite, or another CPU-heavy validation command, run it through `python3 /Users/amf/Developer/.codex/fleet/bin/fleet-heavy -- COMMAND ARGS...` from the intended worktree. The wrapper allows two heavy jobs at once across repositories and preserves command exit status, cwd and existing test timeouts.
+- A waiting slot is scheduling, not a test failure. Do not raise assertion/test timeouts, bypass the wrapper, or repeatedly rerun unchanged suites. Focused small tests and source editing may continue normally.
+- Do not nest wrappers. Do not delete lock files or terminate another worker's processes. Existing pre-wrapper tests are allowed to finish. A child inherits its lease so a crashed wrapper cannot silently free a still-running job's slot.
+
+For a root-reviewed PR with auto-merge enabled, gh --match-head-commit verifies the head when the command runs; it is not a permanent pin on future commits. Do not push an unreviewed source repair to such a PR. Prepare and test the repair locally, return the immutable commit SHA plus patch to root for review, then push only after root approves that commit. Keep auto-merge enabled and required checks intact. Do not self-approve, weaken checks or rely on an earlier head approval. Unrelated draft implementation branches may continue their authorized normal pushes.

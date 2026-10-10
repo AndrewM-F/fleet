@@ -1,0 +1,19 @@
+# Local configuration: paths, session IDs, providers, models
+config/*.local.json
+.env
+*.pem
+*.key
+credentials*
+# Runtime state and diagnostics
+data/
+logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sock
+*.lock
+*.pid
+# Caches
+__pycache__/
+*.pyc
+.DS_Store

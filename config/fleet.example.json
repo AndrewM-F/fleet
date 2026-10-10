@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "worktreeRoot": "~/Developer/.worktrees",
+  "executables": {"pi": "pi", "claude": "claude"},
+  "logs": {"maxBytes": 20971520, "keep": 5, "claudeTurnsPerSession": 20},
+  "pi": [
+    {
+      "lane": "example-lane",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "cwd": "~/Developer/.worktrees/example-repo/example-lane",
+      "sessionFile": "~/.pi/agent/sessions/<project>/<timestamp>_<sessionId>.jsonl",
+      "sessionCwd": "~/Developer/.worktrees/example-repo/example-lane",
+      "provider": "example-provider",
+      "model": "example-model",
+      "thinking": "high",
+      "apiProvider": "optional: verify live provider/model, no fallback",
+      "role": "optional label"
+    }
+  ],
+  "claude": [
+    {
+      "sessionId": "00000000-0000-4000-8000-000000000002",
+      "cwd": "~/Developer/.worktrees/example-repo/example-branch",
+      "sessionCwd": "optional: cwd recorded when the native session was created",
+      "model": "example-model",
+      "effort": "high",
+      "mode": "print",
+      "resume": true,
+      "dispatchEnabled": false
+    }
+  ]
+}

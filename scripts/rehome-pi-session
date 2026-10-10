@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Point a Pi session's header cwd at its configured (relocated) worktree.
+
+Pi RPC mode refuses to open a session whose stored cwd no longer exists and runs in the header
+cwd. This rewrites only the header line's "cwd" (session id and history untouched), saves the
+original header under data/records/pi-header-backups/, and updates sessionCwd in the config.
+Refuses while the lane's controller is running. Dry run unless --apply. Usage: [--lane L]..."""
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from fleet import paths, pi  # noqa: E402
+
+apply = "--apply" in sys.argv
+only = {sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--lane"}
+cfg = paths.config()
+backups = paths.DATA / "records" / "pi-header-backups"
+plan = []
+for raw, slot in zip(cfg["pi"], paths.slots(cfg)[0]):
+    if only and slot["lane"] not in only:
+        continue
+    session = Path(slot["sessionFile"])
+    lines = session.read_bytes().split(b"\n", 1)
+    header = json.loads(lines[0])
+    if header.get("id") != slot["sessionId"]:
+        sys.exit(f"{slot['lane']}: header id mismatch; refusing")
+    if header.get("cwd") == slot["cwd"]:
+        plan.append({"lane": slot["lane"], "action": "already canonical"})
+        continue
+    if not Path(slot["cwd"]).is_dir():
+        sys.exit(f"{slot['lane']}: configured cwd missing")
+    if pi.running(slot["lane"]):
+        sys.exit(f"{slot['lane']}: controller running; stop it first")
+    plan.append({"lane": slot["lane"], "action": "rehome", "from": header.get("cwd"),
+                 "to": slot["cwd"]})
+    if apply:
+        backups.mkdir(parents=True, exist_ok=True)
+        (backups / f"{slot['sessionId']}-{int(time.time())}.json").write_bytes(lines[0] + b"\n")
+        new = dict(header, cwd=slot["cwd"])
+        tmp = session.with_name(session.name + ".rehome.tmp")
+        tmp.write_bytes(json.dumps(new, separators=(",", ":")).encode() + b"\n" +
+                        (lines[1] if len(lines) > 1 else b""))
+        os.chmod(tmp, session.stat().st_mode & 0o777)
+        os.replace(tmp, session)
+        raw["sessionCwd"] = raw["cwd"]
+if apply:
+    tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, paths.CONFIG)
+print(json.dumps({"applied": apply, "plan": plan}, indent=2))

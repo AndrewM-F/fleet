@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Make native Claude transcripts discoverable from relocated worktrees.
+
+Claude Code files a session under ~/.claude/projects/<slug-of-cwd>/<id>.jsonl. After a
+worktree moves, `--resume <id>` from the new cwd may not find it. This adds a symlink in the
+new project folder pointing at the original transcript; the history stays where it is and keeps
+its ID. Dry run by default; pass --apply to create links. Never moves or edits transcripts."""
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from fleet import claude, paths  # noqa: E402
+
+apply = "--apply" in sys.argv
+plan = []
+for slot in paths.slots()[1]:
+    hits = claude.native_transcript(slot["sessionId"])
+    target_dir = Path.home() / ".claude" / "projects" / claude.project_slug(slot["cwd"])
+    link = target_dir / f"{slot['sessionId']}.jsonl"
+    if not hits:
+        plan.append({"sessionId": slot["sessionId"], "action": "missing transcript"})
+        continue
+    if any(h.parent == target_dir for h in hits):
+        plan.append({"sessionId": slot["sessionId"], "action": "already discoverable"})
+        continue
+    if len(hits) != 1:
+        plan.append({"sessionId": slot["sessionId"], "action": "ambiguous", "found": list(map(str, hits))})
+        continue
+    plan.append({"sessionId": slot["sessionId"], "action": "link", "link": str(link),
+                 "target": str(hits[0])})
+    if apply:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(hits[0])
+print(json.dumps({"applied": apply, "plan": plan}, indent=2))

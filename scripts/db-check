@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Checkpoint the fleet database's WAL into the main file and run integrity_check.
+Refuses while the manager holds its lock. Safe to run before copying or moving data/."""
+import fcntl
+import json
+from pathlib import Path
+import sqlite3
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from fleet import paths  # noqa: E402
+
+with paths.MANAGER_LOCK.open("a") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("manager is running; run `bin/fleet stop` first")
+    db = sqlite3.connect(paths.DB)
+    checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+    counts = dict(db.execute("SELECT state,count(*) FROM tasks GROUP BY state").fetchall())
+    events = db.execute("SELECT count(*), sum(acked) FROM events").fetchone()
+    db.close()
+print(json.dumps({"integrity": integrity, "checkpoint": checkpoint, "tasks": counts,
+                  "events": events[0], "acked": events[1]}, indent=2))
+sys.exit(0 if integrity == "ok" else 1)
