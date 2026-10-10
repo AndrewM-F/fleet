@@ -14,3 +14,20 @@
   `resume`, `dispatchEnabled`.
 Changing a running lane's model/provider/cwd makes the manager report it `unavailable` until the
 controller is restarted (`bin/fleet stop` / `start`).
+# Fresh and single-harness installations
+
+Only configured harnesses are required by `doctor`: a Claude-only roster does not
+need Pi installed. The first authorized enqueue creates an empty root-owned queue
+when none exists. A missing queue is idle; malformed or non-root queues still fail
+closed. Existing state is never replaced during bootstrap.
+
+Managed Claude workers may set `allowedTools` to an explicit array of Claude CLI
+tool permission rules. These rules apply to that worker's print turns, including
+resumes. Omit the field to preserve the CLI's default permission behavior. This
+setting is not a sandbox escape or permission to change credentials or deploy.
+
+Linux wrapper liveness checks verify the turn's request path in the process
+arguments, rather than accepting any process that happens to reuse the PID.
+After a verified wrapper failure, `resolve --worker` preserves native identity
+and allows the next task to resume it.
+

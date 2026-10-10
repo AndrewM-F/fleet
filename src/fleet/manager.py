@@ -49,7 +49,10 @@ def observe(db, sid, state, now=None):
 
 
 def import_queue(db, slots, queue=None):
-    data = json.loads(Path(queue or paths.QUEUE).read_text())
+    queue_path = Path(queue or paths.QUEUE)
+    if not queue_path.exists():
+        return
+    data = json.loads(queue_path.read_text())
     if data.get("author") != "root":
         raise ValueError("Queue must be authored by root")
     for task in data["tasks"]:

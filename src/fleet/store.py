@@ -10,6 +10,8 @@ BUSY = {"streaming", "queued", "working", "running", "active"}
 
 
 def database(path=None):
+    if path is None:
+        paths.DATA.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path or paths.DB, timeout=10)
     db.executescript("""
     PRAGMA journal_mode=WAL;

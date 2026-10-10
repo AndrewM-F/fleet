@@ -44,6 +44,18 @@ def claude_state(row):
             "progress": row.get("updatedAt", row.get("lastActivityAt"))}
 
 
+def wrapper_alive(pid, request_path):
+    """Avoid treating a reused or foreign PID as the managed turn wrapper."""
+    try:
+        os.kill(pid, 0)
+        if sys.platform.startswith("linux"):
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            return os.fsencode(request_path) in argv
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def print_state(slot):
     directory = session_dir(slot["sessionId"])
     pointer = directory / "current.json"
@@ -56,19 +68,17 @@ def print_state(slot):
         return {"state": "working" if time.time() - launch["startedAt"] < 15 else "blocked",
                 "progress": launch["turn"] + ":0", "cwd": slot["cwd"]}
     state = json.loads(state_file.read_text())
-    if launch.get("resolved") and state.get("state") in {"error", "blocked"}:
-        # An operator reviewed this failed turn (`fleet resolve --worker`); keep its session link.
-        return {"state": "idle", "progress": launch["turn"] + ":" + str(state.get("progress", 0)),
-                "cwd": slot["cwd"], "hasSession": state.get("hasSession", slot.get("resume", True)),
-                "resolvedTurn": launch["turn"]}
     # Turns recorded before relocation carry the session's original cwd.
     if state.get("sessionId") != slot["sessionId"] or state.get("cwd") not in paths.known_cwds(slot):
         raise RuntimeError("Claude managed identity/cwd mismatch")
     if state["state"] == "working":
-        try:
-            os.kill(state["wrapperPid"], 0)
-        except (ProcessLookupError, PermissionError):
+        if not wrapper_alive(state.get("wrapperPid"), state_file.parent / "request.json"):
             state.update(state="blocked", error="Claude wrapper liveness unconfirmed")
+    if launch.get("resolved") and state.get("state") in {"error", "blocked"}:
+        # Reconcile both recorded failures and a dead wrapper discovered by the monitor.
+        return {"state": "idle", "progress": launch["turn"] + ":" + str(state.get("progress", 0)),
+                "cwd": slot["cwd"], "hasSession": state.get("hasSession", slot.get("resume", True)),
+                "resolvedTurn": launch["turn"]}
     state["cwd"] = slot["cwd"]
     state["progress"] = launch["turn"] + ":" + str(state.get("progress", 0))
     return state
@@ -102,6 +112,11 @@ def send_print(slot, message):
                "executable": paths.executable("claude"), "logDir": str(logs),
                "timeoutSeconds": slot.get("turnTimeoutSeconds",
                                           paths.config().get("claudeTurnTimeoutSeconds", 0))}
+    if "allowedTools" in slot:
+        allowed = slot["allowedTools"]
+        if not isinstance(allowed, list) or not all(isinstance(tool, str) and tool for tool in allowed):
+            raise ValueError("allowedTools must be a list of nonempty tool names")
+        request["allowedTools"] = allowed
     atomic(path / "request.json", request)
     launch = {"turn": turn, "startedAt": time.time()}
     atomic(directory / "current.json", launch)
@@ -204,6 +219,8 @@ def run_turn(request_path):
             "--resume" if request["resume"] else "--session-id", native_sid,
             "--print", "--model", request["model"], "--effort", request["effort"],
             "--output-format", "stream-json", "--verbose", request["message"]]
+    if request.get("allowedTools"):
+        args[1:1] = ["--allowedTools", ",".join(request["allowedTools"])]
     result = None
     identity_error = False
     initialized = False

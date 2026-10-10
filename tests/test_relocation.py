@@ -155,7 +155,7 @@ class LocalDeploymentTests(unittest.TestCase):
     def test_session_identities_are_unique_and_complete(self):
         ids = [s["sessionId"] for s in self.cfg["pi"] + self.cfg["claude"]]
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(ids), 20)
+        self.assertTrue(all(isinstance(sid, str) and sid for sid in ids))
 
     def test_worktrees_are_canonical_and_exist(self):
         root = Path(os.path.expanduser(self.cfg["worktreeRoot"]))
