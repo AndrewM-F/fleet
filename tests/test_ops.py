@@ -43,6 +43,9 @@ class Sandbox(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         (root / "data").mkdir()
+        wrapper = patch.object(claude, "wrapper_alive", return_value=True)
+        wrapper.start()
+        self.addCleanup(wrapper.stop)
         self.db = store.database()
         self.addCleanup(self.db.close)
         self.addCleanup(self.tmp.cleanup)
@@ -57,6 +60,16 @@ class Sandbox(unittest.TestCase):
 
 
 class ResolveTests(Sandbox):
+    def test_dead_wrapper_can_be_resolved_without_losing_native_identity(self):
+        self.turn("working")
+        slot = paths.slots()[1][0]
+        with patch.object(claude, "wrapper_alive", return_value=False):
+            self.assertEqual(claude.print_state(slot)["state"], "blocked")
+            ops.resolve_worker(self.db, "c-1", "verified dead wrapper")
+            state = claude.print_state(slot)
+            self.assertEqual(state["state"], "idle")
+            self.assertTrue(state["hasSession"])
+
     def test_events_acked_with_record(self):
         ids = [store.emit(self.db, "runner_error", error="x") for _ in range(2)]
         result = ops.resolve_events(self.db, ids + [9999], "migration noise")
@@ -157,6 +170,7 @@ class RosterTests(Sandbox):
     def test_add_and_remove_claude(self):
         ops.add_claude("c-2", str(self.wt), "m", "high", new=True)
         self.assertEqual(len(paths.config()["claude"]), 2)
+        self.assertEqual(paths.config()["claude"][-1]["permissionMode"], "bypassPermissions")
         with self.assertRaises(ValueError):
             ops.add_claude("c-2", str(self.wt), "m", "high", new=True)
         ops.remove("c-2")

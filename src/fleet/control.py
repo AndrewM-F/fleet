@@ -15,7 +15,8 @@ def enqueue(db, supplied):
     slots = pi_slots + claude_slots
     with paths.QUEUE_LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        queue = json.loads(paths.QUEUE.read_text())
+        queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
+                 else {"author": "root", "tasks": []})
         if queue.get("author") != "root":
             raise ValueError("Root queue required")
         by_id = {t["id"]: t for t in queue["tasks"]}

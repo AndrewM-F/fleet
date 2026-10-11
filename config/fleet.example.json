@@ -1,5 +1,6 @@
 {
   "schemaVersion": 2,
+  "claudePermissionMode": "bypassPermissions",
   "worktreeRoot": "~/Developer/.worktrees",
   "executables": {"pi": "pi", "claude": "claude"},
   "logs": {"maxBytes": 20971520, "keep": 5, "claudeTurnsPerSession": 20},

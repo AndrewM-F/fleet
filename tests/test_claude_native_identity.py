@@ -10,6 +10,16 @@ import uuid
 from fleet import claude
 
 class NativeSessionIdTests(unittest.TestCase):
+    def test_permission_mode_validation_and_explicit_override(self):
+        with patch.object(claude.paths, "config", return_value={}):
+            self.assertEqual(claude.permission_mode({}), "bypassPermissions")
+            self.assertEqual(claude.permission_mode({"permissionMode": "auto"}), "auto")
+        with patch.object(claude.paths, "config", return_value={"claudePermissionMode": "default"}):
+            self.assertEqual(claude.permission_mode({}), "default")
+        for invalid in [None, "", "bypass", [], "--dangerously-skip-permissions"]:
+            with self.assertRaises(ValueError):
+                claude.validate_permission_mode(invalid)
+
     def test_uuid_identity_is_unchanged(self):
         sid = "01118b2f-1b90-4864-bdb4-b3e70b2df209"
         self.assertEqual(claude.native_session_id(sid), sid)
@@ -33,7 +43,7 @@ class NativeSessionIdTests(unittest.TestCase):
             with patch.object(claude.Path, "home", return_value=home):
                 self.assertEqual(claude.native_transcript(sid), [file])
 
-    def run_mock_turn(self, *, resume=False, wrong_identity=False):
+    def run_mock_turn(self, *, resume=False, wrong_identity=False, allowed_tools=None):
         sid = "pi-deepseek-1215-d532e2a8-0681-487a-a15d-1a88b829292b"
         expected = claude.native_session_id(sid)
         actual = str(uuid.uuid4()) if wrong_identity else expected
@@ -45,15 +55,24 @@ class NativeSessionIdTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             request = root / "request.json"
-            request.write_text(json.dumps({"sessionId":sid, "cwd":tmp, "model":"test-model", "effort":"xhigh", "resume":resume, "executable":"mock-claude", "message":"bounded test"}))
+            body = {"sessionId":sid, "cwd":tmp, "model":"test-model", "effort":"xhigh", "resume":resume, "executable":"mock-claude", "message":"bounded test"}
+            if allowed_tools is not None:
+                body["allowedTools"] = allowed_tools
+            request.write_text(json.dumps(body))
             with patch.object(claude.subprocess, "Popen", return_value=fake) as launch, patch.object(claude, "terminate_group") as stop:
                 claude.run_turn(request)
                 args = launch.call_args.args[0]
+                mode_index = args.index("--permission-mode")
+                self.assertEqual(args[mode_index + 1], "bypassPermissions")
+                if allowed_tools:
+                    self.assertEqual(args[1:3], ["--allowedTools", ",".join(allowed_tools)])
+                    args = [args[0], *args[3:]]
                 self.assertEqual(args[1], "--resume" if resume else "--session-id")
                 self.assertEqual(args[2], expected)
                 state = json.loads((root / "state.json").read_text())
                 self.assertEqual(state["sessionId"], sid)
                 self.assertEqual(state["nativeSessionId"], expected)
+                self.assertEqual(state["permissionMode"], "bypassPermissions")
                 self.assertEqual(state["state"], "blocked" if wrong_identity else "idle")
                 if wrong_identity:
                     stop.assert_called_once_with(12345)
@@ -66,6 +85,9 @@ class NativeSessionIdTests(unittest.TestCase):
 
     def test_resume_reuses_same_native_uuid(self):
         self.assertTrue(self.run_mock_turn(resume=True)["hasSession"])
+
+    def test_explicit_tool_rules_survive_resume_without_changing_identity(self):
+        self.assertTrue(self.run_mock_turn(resume=True, allowed_tools=["Read", "Bash(bun test *)"])["hasSession"])
 
     def test_mismatched_provider_identity_still_fails_closed(self):
         self.assertFalse(self.run_mock_turn(wrong_identity=True)["hasSession"])

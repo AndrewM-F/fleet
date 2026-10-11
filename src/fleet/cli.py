@@ -176,7 +176,9 @@ def cmd_doctor(args):
     ids = [s["sessionId"] for s in pi_slots + claude_slots]
     if len(ids) != len(set(ids)):
         problems.append("duplicate sessionId in configuration")
-    for name in ("pi", "claude"):
+    for name, configured in (("pi", pi_slots), ("claude", claude_slots)):
+        if not configured:
+            continue
         try:
             paths.executable(name, cfg)
         except RuntimeError as error:
@@ -199,6 +201,7 @@ def cmd_doctor(args):
             warnings.append(f"claude {slot['sessionId']}: transcript is under "
                             f"{hits[0].parent.name}, not {expected}; native --resume from the "
                             "canonical cwd may not find it (see docs/troubleshooting.md)")
+    paths.DATA.mkdir(parents=True, exist_ok=True)
     for path in (paths.DB,):
         db = sqlite3.connect(path)
         result = db.execute("PRAGMA integrity_check").fetchone()[0]
@@ -335,4 +338,5 @@ def main(argv=None):
     p.set_defaults(fn=lambda a: out(ops.install_launchd() if a.action == "install"
                                     else ops.uninstall_launchd()))
     args = parser.parse_args(argv)
+    paths.DATA.mkdir(parents=True, exist_ok=True)
     args.fn(args)

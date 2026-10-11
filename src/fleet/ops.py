@@ -157,6 +157,7 @@ def add_claude(session_id, cwd, model, effort, new=False, dispatch=False):
     if not new and not claude.native_transcript(session_id):
         raise ValueError("No native transcript for this session; pass --new to create on first turn")
     entry = {"sessionId": session_id, "cwd": cwd, "model": model, "effort": effort,
+             "permissionMode": claude.permission_mode({}),
              "mode": "print", "resume": not new, "dispatchEnabled": dispatch}
     cfg.setdefault("claude", []).append(entry)
     _write_config(cfg)
