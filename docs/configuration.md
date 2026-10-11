@@ -22,6 +22,14 @@ Changing a running lane's model/provider/cwd makes the manager report it `unavai
 controller is restarted (`bin/fleet stop` / `start`).
 # Fresh and single-harness installations
 
+Fleet-owned Claude launches set `ENABLE_CLAUDEAI_MCP_SERVERS=false` in the child
+environment, for both managed print turns and native resumes. This disables automatic
+discovery of account-level claude.ai connectors, which coding tasks do not require.
+It does not disconnect the user's account, edit global Claude settings, or affect
+ordinary Claude sessions. Explicit project or CLI-supplied MCP servers are not covered
+by this opt-out. Existing running processes need a new turn to pick up this setting.
+See https://code.claude.com/docs/en/mcp#disable-claude-ai-connectors.
+
 Only configured harnesses are required by `doctor`: a Claude-only roster does not
 need Pi installed. The first authorized enqueue creates an empty root-owned queue
 when none exists. A missing queue is idle; malformed or non-root queues still fail

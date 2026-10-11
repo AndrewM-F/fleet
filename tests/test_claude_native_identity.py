@@ -10,6 +10,13 @@ import uuid
 from fleet import claude
 
 class NativeSessionIdTests(unittest.TestCase):
+    def test_worker_environment_disables_only_inherited_connectors(self):
+        with patch.dict(claude.os.environ, {"ENABLE_CLAUDEAI_MCP_SERVERS": "true", "FLEET_TEST_KEEP": "yes"}):
+            env = claude.worker_environment()
+            self.assertEqual(env["ENABLE_CLAUDEAI_MCP_SERVERS"], "false")
+            self.assertEqual(env["FLEET_TEST_KEEP"], "yes")
+            self.assertEqual(claude.os.environ["ENABLE_CLAUDEAI_MCP_SERVERS"], "true")
+
     def test_permission_mode_validation_and_explicit_override(self):
         with patch.object(claude.paths, "config", return_value={}):
             self.assertEqual(claude.permission_mode({}), "bypassPermissions")
@@ -62,6 +69,7 @@ class NativeSessionIdTests(unittest.TestCase):
             with patch.object(claude.subprocess, "Popen", return_value=fake) as launch, patch.object(claude, "terminate_group") as stop:
                 claude.run_turn(request)
                 args = launch.call_args.args[0]
+                self.assertEqual(launch.call_args.kwargs["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"], "false")
                 mode_index = args.index("--permission-mode")
                 self.assertEqual(args[mode_index + 1], "bypassPermissions")
                 if allowed_tools:
@@ -73,6 +81,7 @@ class NativeSessionIdTests(unittest.TestCase):
                 self.assertEqual(state["sessionId"], sid)
                 self.assertEqual(state["nativeSessionId"], expected)
                 self.assertEqual(state["permissionMode"], "bypassPermissions")
+                self.assertFalse(state["automaticClaudeAiConnectors"])
                 self.assertEqual(state["state"], "blocked" if wrong_identity else "idle")
                 if wrong_identity:
                     stop.assert_called_once_with(12345)

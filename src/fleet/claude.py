@@ -16,6 +16,11 @@ DEFAULT_PERMISSION_MODE = "bypassPermissions"
 PERMISSION_MODES = {"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}
 
 
+def worker_environment():
+    """Keep account connectors out of coding workers without changing the user's settings."""
+    return dict(os.environ, ENABLE_CLAUDEAI_MCP_SERVERS="false")
+
+
 def validate_permission_mode(value):
     if not isinstance(value, str) or value not in PERMISSION_MODES:
         raise ValueError("Unsupported Claude permissionMode")
@@ -174,7 +179,7 @@ def send_native(slot, message):
     output = command([claude, "--resume", sid, "--bg",
                       "--model", slot["model"], "--effort", slot["effort"],
                       "--permission-mode", permission_mode(slot), message],
-                     cwd=slot["cwd"])
+                     cwd=slot["cwd"], env=worker_environment())
     session_dir(sid).mkdir(parents=True, exist_ok=True)
     atomic(session_dir(sid) / "native-resume.json",
            {"sessionId": sid, "at": time.time(), "output": output})
@@ -231,7 +236,7 @@ def run_turn(request_path):
     state = {"sessionId": sid, "nativeSessionId": native_sid, "state": "working", "progress": 0,
              "cwd": request["cwd"], "model": request["model"],
              "effort": request["effort"], "hasSession": request["resume"],
-             "permissionMode": mode,
+             "permissionMode": mode, "automaticClaudeAiConnectors": False,
              "startedAt": time.time(), "wrapperPid": os.getpid()}
     write(root / "state.json", state)
     args = [request.get("executable") or paths.executable("claude"),
@@ -248,7 +253,7 @@ def run_turn(request_path):
         with (logs / "stderr.log").open("w") as errors, (logs / "events.jsonl").open("w") as events:
             process = subprocess.Popen(args, cwd=request["cwd"], stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=errors, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, env=worker_environment())
             state["pid"] = process.pid
             write(root / "state.json", state)
             timer = None
