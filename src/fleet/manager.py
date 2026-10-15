@@ -6,7 +6,7 @@ from pathlib import Path
 import signal
 import time
 
-from . import claude, paths, pi, pr_queue
+from . import claude, opencode, paths, pi, pr_queue
 from .dispatch import dispatch, send
 from .store import BUSY, TERMINAL, database, emit
 from .util import atomic
@@ -71,7 +71,7 @@ def import_queue(db, slots, queue=None):
     db.commit()
 
 
-def collect_states(pi_slots, claude_slots):
+def collect_states(pi_slots, claude_slots, opencode_slots=()):
     states = {}
     for slot in pi_slots:
         try:
@@ -93,6 +93,12 @@ def collect_states(pi_slots, claude_slots):
                 states[slot["sessionId"]] = {"state": "unavailable", "cwd": slot["cwd"]}
     except Exception as error:
         states["claude-monitor"] = {"state": "unavailable", "error": str(error)}
+    for slot in opencode_slots:
+        try:
+            state = opencode.state(slot)
+        except Exception as error:
+            state = {"state": "unavailable", "error": str(error), "cwd": slot["cwd"]}
+        states[slot["sessionId"]] = state
     return states
 
 
@@ -121,8 +127,9 @@ def run():
             started = time.time()
             try:
                 pi_slots, claude_slots = paths.slots()
-                slots = {s["sessionId"]: s for s in pi_slots + claude_slots}
-                states = collect_states(pi_slots, claude_slots)
+                opencode_slots = paths.opencode_slots()
+                slots = {s["sessionId"]: s for s in pi_slots + claude_slots + opencode_slots}
+                states = collect_states(pi_slots, claude_slots, opencode_slots)
                 for sid, state in states.items():
                     observe(db, sid, state)
                 import_queue(db, slots)

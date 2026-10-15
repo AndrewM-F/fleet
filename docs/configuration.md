@@ -2,7 +2,7 @@
 `config/fleet.local.json` (ignored) — see `config/fleet.example.json`.
 - `worktreeRoot`: canonical worktrees (`~/Developer/.worktrees/<repo>/<name>`). Disposable
   per-worktree artifacts belong in `<worktree>/.fleet/` so pruning the worktree removes them.
-- `executables`: names or absolute paths for `pi`, `claude`; otherwise resolved via PATH.
+- `executables`: names or absolute paths for `pi`, `claude`, and `opencode`; otherwise resolved via PATH.
 - `logs`: `maxBytes`, `keep` (rotated files), `claudeTurnsPerSession` (turn log dirs kept).
 - `claudeTurnTimeoutSeconds` (per worker: `turnTimeoutSeconds`): terminate a managed turn after
   this long; 0 disables.
@@ -18,6 +18,17 @@
   `apiProvider` (live provider/model pin, no fallback) and `role`.
 - `claude[]`: `sessionId`, `cwd`, optional `sessionCwd`, `model`, `effort`, `mode` (`print`),
   `resume`, `dispatchEnabled`.
+- `opencode[]`: an existing native `sessionId` (`ses_…`), absolute `databasePath` for its native
+  OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (exactly
+  `opencode/deepseek-v4.1-flash-free`), and `dispatchEnabled` (defaults false). Set `databasePath`
+  from `opencode debug paths db`; this read-only command does not start a server or open the DB.
+  Before each `--session` launch, Fleet reads only that exact `session_v2` identity row in SQLite
+  read-only mode and requires its directory to match `cwd`. Unknown IDs fail before the CLI can
+  create a session. Dispatch uses a per-session lock and an isolated runtime config with `model`,
+  `small_model`, and the enabled provider pinned to the free model/provider. Agent overrides are
+  refused. The v2.0.5 JSON stream does not include actual provider/model IDs in its normal step
+  events, so receipts leave actual IDs blank unless the transport emits direct model metadata and
+  record the pinned CLI model separately.
 Changing a running lane's model/provider/cwd makes the manager report it `unavailable` until the
 controller is restarted (`bin/fleet stop` / `start`).
 # Fresh and single-harness installations
