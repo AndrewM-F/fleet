@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, manager, ops, paths, pi
+from . import claude, control, events, manager, opencode, ops, paths, pi
 from .store import BUSY, database
 
 
@@ -172,11 +172,15 @@ def cmd_status(args):
 def cmd_doctor(args):
     cfg = paths.config()
     pi_slots, claude_slots = paths.slots(cfg)
+    opencode_slots = paths.opencode_slots(cfg)
     problems, warnings = [], []
-    ids = [s["sessionId"] for s in pi_slots + claude_slots]
+    ids = [s["sessionId"] for s in pi_slots + claude_slots + opencode_slots]
     if len(ids) != len(set(ids)):
         problems.append("duplicate sessionId in configuration")
-    for name, configured in (("pi", pi_slots), ("claude", claude_slots)):
+    configured_executables = (("pi", pi_slots), ("claude", claude_slots))
+    if opencode_slots:
+        configured_executables += (("opencode", opencode_slots),)
+    for name, configured in configured_executables:
         if not configured:
             continue
         try:
@@ -201,6 +205,14 @@ def cmd_doctor(args):
             warnings.append(f"claude {slot['sessionId']}: transcript is under "
                             f"{hits[0].parent.name}, not {expected}; native --resume from the "
                             "canonical cwd may not find it (see docs/troubleshooting.md)")
+    for slot in opencode_slots:
+        try:
+            opencode.verify_slot(slot, cfg)
+            opencode.verify_native_session(slot["sessionId"], slot["cwd"], slot["databasePath"])
+        except Exception as error:
+            problems.append(f"opencode {slot.get('sessionId', '<unknown>')}: {error}")
+        warnings.append(f"opencode {slot.get('sessionId', '<unknown>')}: dispatch remains opt-in; "
+                        "confirm exact-model canary and sole Fleet ownership before enabling")
     paths.DATA.mkdir(parents=True, exist_ok=True)
     for path in (paths.DB,):
         db = sqlite3.connect(path)
@@ -302,6 +314,9 @@ def main(argv=None):
     p = sub.add_parser("claude-turn", help="run one managed Claude turn (internal)")
     p.add_argument("request")
     p.set_defaults(fn=lambda a: claude.run_turn(Path(a.request).resolve()))
+    p = sub.add_parser("opencode-turn", help="run one managed OpenCode turn (internal)")
+    p.add_argument("request")
+    p.set_defaults(fn=lambda a: opencode.run_turn(Path(a.request).resolve()))
     p = sub.add_parser("resolve", help="record an operator decision (events, uncertain task, failed worker)")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--events", help="comma-separated event IDs to acknowledge")

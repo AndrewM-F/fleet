@@ -11,8 +11,7 @@ from .store import database
 def enqueue(db, supplied):
     if not supplied:
         return []
-    pi_slots, claude_slots = paths.slots()
-    slots = pi_slots + claude_slots
+    slots = paths.all_slots()
     with paths.QUEUE_LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
@@ -94,10 +93,10 @@ def cycle(request):
 
 def queue_runway(db, minimum=1):
     """Report approved successors; active and uncertain work never count as reserve."""
-    pi_slots, claude_slots = paths.slots()
+    slots = paths.all_slots()
     rows = {s["sessionId"]: {"sessionId": s["sessionId"], "queued": 0,
                             "active": 0, "uncertain": 0, "awaitingImport": 0}
-            for s in pi_slots + claude_slots}
+            for s in slots}
     known = set()
     for task_id, sid, state in db.execute("SELECT id,sid,state FROM tasks"):
         known.add(task_id)

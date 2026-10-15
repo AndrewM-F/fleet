@@ -171,14 +171,14 @@ def main(argv=None):
         parser.error("--wait-seconds must be between 0 and 900")
     if not paths.DB.exists():
         raise RuntimeError("Fleet state unavailable")
-    pi, claude = paths.slots()
+    slots = paths.all_slots()
     queue = json.loads(paths.QUEUE.read_text())
     db = database()
     try:
         wait_for_event(db, args.after, args.wait_seconds)
         queue = json.loads(paths.QUEUE.read_text())
-        result = (incremental_report(db, pi + claude, queue, args.after, args.summary_limit, args.limit)
-                  if args.incremental else report(db, pi + claude, queue, args.after, args.summary_limit))
+        result = (incremental_report(db, slots, queue, args.after, args.summary_limit, args.limit)
+                  if args.incremental else report(db, slots, queue, args.after, args.summary_limit))
         print(json.dumps(result))
     finally:
         db.close()
