@@ -387,6 +387,25 @@ def _event_parts(item):
     return part if isinstance(part, dict) else {}
 
 
+def _event_message_id_conflict(item):
+    part = _event_parts(item)
+    top_id = item.get("messageID")
+    part_id = part.get("messageID")
+    return (isinstance(top_id, str) and bool(top_id)
+            and isinstance(part_id, str) and bool(part_id) and top_id != part_id)
+
+
+def _event_message_id(item):
+    """Read only the message identity attached to the event or its typed part."""
+    if _event_message_id_conflict(item):
+        return None
+    part = _event_parts(item)
+    top_id = item.get("messageID")
+    part_id = part.get("messageID")
+    value = part_id if isinstance(part_id, str) and part_id else top_id
+    return value if isinstance(value, str) and value else None
+
+
 def _event_session_ids(item):
     """Only read session IDs from v2.0.5 event envelope and its typed part metadata."""
     values = []
@@ -411,6 +430,87 @@ def _model_parts(item):
 def _usage(item):
     tokens = _event_parts(item).get("tokens")
     return tokens if isinstance(tokens, dict) else None
+
+
+def _verified_native_completion(database_path, sid, message_id, provider, model,
+                                started_at, streamed_text):
+    """Verify the streamed final message against OpenCode's read-only persisted turn state."""
+    if not message_id:
+        return None, "OpenCode completion message ID is missing"
+    db_path = _database_path(database_path)
+    uri = "file:" + quote(str(db_path), safe="/") + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            row = connection.execute(
+                "SELECT type,seq,data FROM session_message WHERE session_id=? AND id=?",
+                (sid, message_id),
+            ).fetchone()
+            if not row or row[0] != "assistant":
+                return None, "OpenCode native assistant completion is missing"
+            assistant = json.loads(row[2])
+            if not isinstance(assistant, dict):
+                return None, "OpenCode native assistant completion is invalid"
+            assistant_model = assistant.get("model")
+            assistant_model = assistant_model if isinstance(assistant_model, dict) else {}
+            actual_provider = assistant_model.get("providerID")
+            actual_model = assistant_model.get("id")
+            completion_time = assistant.get("time")
+            completion_time = completion_time if isinstance(completion_time, dict) else {}
+            created = completion_time.get("created")
+            completed = completion_time.get("completed")
+            if actual_provider != provider or actual_model != model:
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": assistant.get("finish")}, \
+                    "OpenCode persisted provider/model mismatch; fallback calls are blocked"
+            if (not isinstance(created, (int, float)) or isinstance(created, bool)
+                    or created < int(started_at * 1000)):
+                return None, "OpenCode native assistant completion does not belong to this turn"
+            if (not isinstance(completed, (int, float)) or isinstance(completed, bool)
+                    or completed < created):
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": assistant.get("finish")}, \
+                    "OpenCode native assistant completion timestamp is missing"
+            content = assistant.get("content")
+            persisted_text = "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text", ""), str)
+            ) if isinstance(content, list) else ""
+            if persisted_text != streamed_text:
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": assistant.get("finish")}, \
+                    "OpenCode streamed text does not match its native assistant completion"
+            finish = assistant.get("finish")
+            if assistant.get("error"):
+                error = assistant["error"]
+                message = error.get("message") if isinstance(error, dict) else error
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": finish}, "OpenCode assistant failed: " + str(message)
+            if finish != "stop":
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": finish}, "OpenCode assistant did not finish normally: " + str(finish)
+            idle = connection.execute(
+                "SELECT type,data FROM session_message WHERE session_id=? AND seq>? "
+                "ORDER BY seq LIMIT 1", (sid, row[1]),
+            ).fetchone()
+            if not idle or idle[0] != "idle":
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": finish}, "OpenCode native idle completion is missing"
+            idle_data = json.loads(idle[1])
+            if not isinstance(idle_data, dict) or idle_data.get("outcome") != "succeeded":
+                outcome = idle_data.get("outcome") if isinstance(idle_data, dict) else None
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": finish}, "OpenCode native turn outcome was not successful: " + str(outcome)
+            if idle_data.get("error"):
+                return {"provider": actual_provider, "model": actual_model,
+                        "finish": finish}, "OpenCode native turn failed: " + str(idle_data["error"])
+            return {"provider": actual_provider, "model": actual_model, "finish": finish}, None
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return None, "OpenCode native completion could not be read safely"
 
 
 def _event_error(item):
@@ -545,6 +645,8 @@ def run_turn(request_path):
     args = [request["executable"], "run", "--standalone", "--format", "json",
             "--session", sid, "--model", model, "--title", title]
     text_parts, tool_failures = [], []
+    final_message_id = None
+    final_message_text = []
     usage = actual_provider = actual_model = terminal_reason = None
     final_step_started = final_step_finished = False
     session_seen = False
@@ -562,6 +664,7 @@ def run_turn(request_path):
     def consume_event_line(line):
         nonlocal usage, actual_provider, actual_model, terminal_reason
         nonlocal final_step_started, final_step_finished, session_seen
+        nonlocal final_message_id, final_message_text
         nonlocal provider_mismatch, model_mismatch, fatal_error, parse_error
         events.write(line.decode("utf-8", "replace"))
         events.flush()
@@ -595,14 +698,26 @@ def run_turn(request_path):
 
         event_type = item.get("type")
         part = _event_parts(item)
+        if _event_message_id_conflict(item):
+            fatal_error = "OpenCode message ID mismatch in event"
+        message_id = _event_message_id(item)
         if event_type == "step_start":
             final_step_started = True
             final_step_finished = False
             terminal_reason = None
+            if message_id:
+                if message_id != final_message_id:
+                    final_message_text = []
+                final_message_id = message_id
         if event_type == "text":
             fragment = part.get("text")
             if isinstance(fragment, str):
                 text_parts.append(fragment)
+                if message_id and message_id != final_message_id:
+                    final_message_id = message_id
+                    final_message_text = []
+                if final_message_id:
+                    final_message_text.append(fragment)
         if event_type == "step_finish":
             terminal_reason = part.get("reason")
             final_step_finished = final_step_started
@@ -748,6 +863,21 @@ def run_turn(request_path):
                 cleanup = {"confirmed": False, "uncertain": True}
 
         summary = "".join(text_parts).strip()
+        event_terminal_reason = terminal_reason
+        completion, completion_error = _verified_native_completion(
+            request["databasePath"], sid, final_message_id, expected_provider,
+            expected_model, status["startedAt"], "".join(final_message_text),
+        )
+        completion_verified = False
+        if completion:
+            actual_provider = completion.get("provider")
+            actual_model = completion.get("model")
+            terminal_reason = completion.get("finish")
+            if final_step_finished and event_terminal_reason != terminal_reason:
+                completion_error = "OpenCode stream and native completion finish reasons differ"
+            completion_verified = completion_error is None
+        if completion_error and not fatal_error:
+            fatal_error = completion_error
         if timed_out:
             status.update(state="error", error="OpenCode turn exceeded timeoutSeconds; cleanup "
                           + ("confirmed" if cleanup["confirmed"] else "uncertain"))
@@ -762,8 +892,9 @@ def run_turn(request_path):
         elif cleanup["uncertain"]:
             status.update(state="blocked", error="OpenCode process-group cleanup is uncertain")
         elif code != 0 or not summary or not session_seen or not final_step_started \
-                or not final_step_finished or terminal_reason != "stop" or parse_error:
-            status.update(state="error", error="OpenCode turn did not produce a verified final stop")
+                or not completion_verified or terminal_reason != "stop" or parse_error:
+            status.update(state="error", error=fatal_error or
+                          "OpenCode turn did not produce a verified native completion")
         else:
             status.update(state="done", requestedProvider=expected_provider,
                           requestedModel=model, actualProvider=actual_provider,

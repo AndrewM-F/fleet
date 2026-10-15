@@ -1,4 +1,4 @@
-"""OpenCode v2 adapter checks using native v2.0.5 NDJSON event shapes."""
+"""OpenCode v2 adapter checks, including captured v2.0.29 NDJSON events."""
 import fcntl
 import json
 import os
@@ -28,7 +28,7 @@ def json_pipe(events):
 class FakeProcess:
     next_pid = 43001
 
-    def __init__(self, *args, events=(), code=0, **kwargs):
+    def __init__(self, *args, events=(), code=0, on_exit=None, **kwargs):
         self.args = args
         self.kwargs = kwargs
         self.pid = self.next_pid
@@ -41,8 +41,13 @@ class FakeProcess:
         self.code = code
         self.terminated = False
         self.killed = False
+        self.on_exit = on_exit
+        self.on_exit_called = False
 
     def wait(self, timeout=None):
+        if not self.on_exit_called and self.on_exit:
+            self.on_exit_called = True
+            self.on_exit()
         self.returncode = self.code
         if not self.stdin.closed:
             self.stdin.close()
@@ -75,6 +80,8 @@ class OpenCodeAdapterTests(unittest.TestCase):
             db.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, project_id TEXT, model TEXT)")
             db.execute("INSERT INTO session_v2 VALUES (?,?,?,?)",
                        (self.sid, str(self.cwd), "project-test", opencode.MODEL))
+            db.execute("CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, "
+                       "seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
         self.slot = {"sessionId": self.sid, "cwd": str(self.cwd),
                      "sessionCwd": str(self.cwd), "databasePath": str(self.native_db),
                      "model": opencode.MODEL, "provider": "opencode",
@@ -155,9 +162,59 @@ class OpenCodeAdapterTests(unittest.TestCase):
         event.update(top)
         return event
 
-    def run_events(self, request_path, events, code=0):
+    def persist_completion(self, request_path, events, *, finish="stop", outcome="succeeded",
+                           provider="opencode", model="deepseek-v4.1-flash-free",
+                           completed=True, idle=True, error=None, text=None):
+        message_id = None
+        for item in reversed(events):
+            part = item.get("part") if isinstance(item.get("part"), dict) else {}
+            message_id = part.get("messageID") or item.get("messageID")
+            if isinstance(message_id, str) and message_id:
+                break
+            message_id = None
+        if not message_id:
+            return
+        if text is None:
+            text = "".join(
+                item.get("part", {}).get("text", "")
+                for item in events if item.get("type") == "text"
+                and isinstance(item.get("part"), dict)
+            )
+        state = json.loads((request_path.parent / "state.json").read_text())
+        now = max(int(time.time() * 1000), int(state["startedAt"] * 1000) + 1)
+        assistant = {
+            "time": {"created": now, "streamed": now + 1},
+            "model": {"id": model, "providerID": provider},
+            "finish": finish,
+            "rawFinish": finish,
+            "content": [{"type": "text", "text": text}],
+        }
+        if completed:
+            assistant["time"]["completed"] = now + 2
+        if error is not None:
+            assistant["error"] = error
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                       ("msg_user", self.sid, "user", 4, now - 1, now - 1,
+                        json.dumps({"time": {"created": now - 1}, "text": "tiny task"})))
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                       (message_id, self.sid, "assistant", 5, now, now + 2,
+                        json.dumps(assistant)))
+            if idle:
+                idle_data = {"time": {"created": now + 3}, "outcome": outcome}
+                if error is not None and outcome != "succeeded":
+                    idle_data["error"] = error
+                db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           ("msg_idle", self.sid, "idle", 10, now + 3, now + 3,
+                            json.dumps(idle_data)))
+
+    def run_events(self, request_path, events, code=0, completion=None):
         def fake_popen(*args, **kwargs):
-            return FakeProcess(*args, events=events, code=code, **kwargs)
+            on_exit = None
+            if completion is not None:
+                options = {} if completion is True else dict(completion)
+                on_exit = lambda: self.persist_completion(request_path, events, **options)
+            return FakeProcess(*args, events=events, code=code, on_exit=on_exit, **kwargs)
         def fake_identity(pid):
             return dict(self.identity, pid=int(pid), pgid=int(pid))
         with patch.object(opencode.subprocess, "Popen", side_effect=fake_popen) as popen, \
@@ -393,15 +450,15 @@ class OpenCodeAdapterTests(unittest.TestCase):
             self.event("step_start", {"id": "prt_start", "sessionID": self.sid,
                                        "messageID": "msg_1", "type": "step-start"}),
             self.event("text", {"id": "prt_text", "sessionID": self.sid,
-                                 "type": "text", "text": "OK"}),
+                                 "messageID": "msg_1", "type": "text", "text": "OK"}),
             self.event("step_finish", {"id": "prt_finish", "sessionID": self.sid,
                                         "type": "step-finish", "reason": "stop",
                                         "tokens": {"input": 4, "output": 1}}),
         ]
-        result, popen, _ = self.run_events(request_path, events)
+        result, popen, _ = self.run_events(request_path, events, completion=True)
         self.assertEqual(result["state"], "done")
-        self.assertIsNone(result["actualProvider"])
-        self.assertIsNone(result["actualModel"])
+        self.assertEqual(result["actualProvider"], "opencode")
+        self.assertEqual(result["actualModel"], "deepseek-v4.1-flash-free")
         args = popen.call_args.args[0]
         self.assertIn("--standalone", args)
         self.assertEqual(args[args.index("--model") + 1], opencode.MODEL)
@@ -423,16 +480,18 @@ class OpenCodeAdapterTests(unittest.TestCase):
     def test_transport_ignores_tool_payload_identity_lookalikes(self):
         request_path = self.request()
         events = [
-            self.event("step_start", {"sessionID": self.sid, "type": "step-start"}),
+            self.event("step_start", {"sessionID": self.sid, "messageID": "msg_final",
+                                       "type": "step-start"}),
             self.event("tool_use", {"sessionID": self.sid, "type": "tool", "tool": "shell",
                                      "state": {"status": "completed", "input": {
                                          "cwd": str(self.cwd.parent), "sessionID": "ses_wrong",
                                          "modelID": "deepseek-v4.1-flash"}}}),
-            self.event("text", {"sessionID": self.sid, "type": "text", "text": "OK"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_final",
+                                 "type": "text", "text": "OK"}),
             self.event("step_finish", {"sessionID": self.sid, "type": "step-finish",
                                         "reason": "stop"}),
         ]
-        result, _, _ = self.run_events(request_path, events)
+        result, _, _ = self.run_events(request_path, events, completion=True)
         self.assertEqual(result["state"], "done")
 
     def test_direct_transport_provider_model_mismatch_stops_owned_turn(self):
@@ -478,11 +537,13 @@ class OpenCodeAdapterTests(unittest.TestCase):
             self.event("tool_use", {"partID": "prt_tool_2", "sessionID": self.sid,
                                      "type": "tool", "tool": "shell",
                                      "state": {"status": "completed", "input": {"command": "pytest"}}}),
-            self.event("text", {"sessionID": self.sid, "type": "text", "text": "fixed and passing"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_final",
+                                 "type": "text", "text": "fixed and passing"}),
             self.event("step_finish", {"sessionID": self.sid, "type": "step-finish",
-                                        "reason": "stop", "tokens": {"input": 7, "output": 3}}),
+                                        "messageID": "msg_final", "reason": "stop",
+                                        "tokens": {"input": 7, "output": 3}}),
         ]
-        result, _, terminate = self.run_events(request_path, events)
+        result, _, terminate = self.run_events(request_path, events, completion=True)
         self.assertEqual(result["state"], "done")
         self.assertEqual(len(result["toolFailures"]), 1)
         self.assertEqual(result["toolFailures"][0]["error"], "Command exited with code 1")
@@ -501,6 +562,174 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertIn("permission", result["error"])
         terminate.assert_called_once()
+
+    def test_v2029_json_stream_uses_persisted_completion_when_step_finish_is_absent(self):
+        request_path = self.request(turn="v2029-success")
+        events = [
+            self.event("step_start", {"id": "prt_start", "sessionID": self.sid,
+                                       "messageID": "msg_v2029_final", "snapshot": {},
+                                       "type": "step-start"}),
+            self.event("text", {"id": "prt_text", "sessionID": self.sid,
+                                 "messageID": "msg_v2029_final", "type": "text",
+                                 "text": "FLEET_CANARY_OK", "time": {"start": 0, "end": 1}}),
+        ]
+        result, _, _ = self.run_events(request_path, events, completion=True)
+        receipt = json.loads((request_path.parent / "result.json").read_text())
+        self.assertEqual(result["state"], "done")
+        self.assertEqual(receipt["summary"], "FLEET_CANARY_OK")
+        self.assertEqual(result["terminalReason"], "stop")
+        self.assertEqual(result["actualProvider"], "opencode")
+        self.assertEqual(result["actualModel"], "deepseek-v4.1-flash-free")
+
+    def test_prior_assistant_and_idle_records_cannot_complete_new_turn(self):
+        request_path = self.request(turn="prior-completion")
+        message_id = "msg_prior_completion"
+        old_time = int(time.time() * 1000) - 60_000
+        old_assistant = {
+            "time": {"created": old_time, "streamed": old_time + 1,
+                     "completed": old_time + 2},
+            "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"},
+            "finish": "stop",
+            "content": [{"type": "text", "text": "same response"}],
+        }
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                       ("msg_prior_user", self.sid, "user", 4, old_time - 1, old_time - 1,
+                        json.dumps({"time": {"created": old_time - 1}})))
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                       (message_id, self.sid, "assistant", 5, old_time, old_time + 2,
+                        json.dumps(old_assistant)))
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                       ("msg_prior_idle", self.sid, "idle", 10, old_time + 3, old_time + 3,
+                        json.dumps({"time": {"created": old_time + 3},
+                                    "outcome": "succeeded"})))
+        events = [
+            self.event("step_start", {"sessionID": self.sid, "messageID": message_id,
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": message_id,
+                                 "type": "text", "text": "same response"}),
+        ]
+        result, _, _ = self.run_events(request_path, events, code=0)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("does not belong to this turn", result["error"])
+
+    def test_conflicting_top_level_and_part_message_ids_fail_closed(self):
+        request_path = self.request(turn="message-id-conflict")
+        events = [
+            self.event("step_start", {"sessionID": self.sid, "messageID": "msg_current",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_current",
+                                 "type": "text", "text": "current response"},
+                       messageID="msg_conflicting"),
+        ]
+        result, _, terminate = self.run_events(request_path, events, completion=True)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("message ID mismatch", result["error"])
+        terminate.assert_called_once()
+
+    def test_zero_exit_and_text_without_persisted_completion_is_not_success(self):
+        request_path = self.request(turn="missing-completion")
+        events = [
+            self.event("step_start", {"sessionID": self.sid,
+                                       "messageID": "msg_missing_completion",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid,
+                                 "messageID": "msg_missing_completion",
+                                 "type": "text", "text": "apparently complete"}),
+        ]
+        result, _, _ = self.run_events(request_path, events, code=0)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("completion", result["error"].lower())
+
+    def test_persisted_length_finish_is_not_success_even_when_idle_succeeded(self):
+        request_path = self.request(turn="persisted-truncation")
+        events = [
+            self.event("step_start", {"sessionID": self.sid,
+                                       "messageID": "msg_truncated",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_truncated",
+                                 "type": "text", "text": "truncated"}),
+        ]
+        result, _, _ = self.run_events(
+            request_path, events, completion={"finish": "length", "outcome": "succeeded"})
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["terminalReason"], "length")
+
+    def test_completed_assistant_requires_successful_idle_marker(self):
+        request_path = self.request(turn="missing-idle-marker")
+        events = [
+            self.event("step_start", {"sessionID": self.sid, "messageID": "msg_no_idle",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_no_idle",
+                                 "type": "text", "text": "looks finished"}),
+        ]
+        result, _, _ = self.run_events(request_path, events, completion={"idle": False})
+        self.assertEqual(result["state"], "error")
+        self.assertIn("idle completion", result["error"])
+
+    def test_persisted_model_mismatch_remains_blocked(self):
+        request_path = self.request(turn="wrong-persisted-model")
+        events = [
+            self.event("step_start", {"sessionID": self.sid, "messageID": "msg_wrong_model",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_wrong_model",
+                                 "type": "text", "text": "unexpected model"}),
+        ]
+        result, _, _ = self.run_events(
+            request_path, events, completion={"model": "deepseek-v4.1-flash"})
+        receipt = json.loads((request_path.parent / "result.json").read_text())
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("provider/model mismatch", result["error"])
+        self.assertEqual(receipt["model"], "deepseek-v4.1-flash")
+
+    def test_provider_403_event_is_failure_without_fallback(self):
+        request_path = self.request(turn="provider-403")
+        events = [
+            self.event("step_start", {"sessionID": self.sid,
+                                       "messageID": "msg_provider_error",
+                                       "type": "step-start"}),
+            self.event("error", error={"type": "ProviderError",
+                                       "message": "HTTP 403: free-tier request rejected"}),
+        ]
+        result, popen, terminate = self.run_events(request_path, events, code=0)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("403", result["error"])
+        args = popen.call_args.args[0]
+        self.assertEqual(args[args.index("--model") + 1], opencode.MODEL)
+        config = json.loads(popen.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["enabled_providers"], ["opencode"])
+        self.assertEqual(config["model"], opencode.MODEL)
+        terminate.assert_called_once()
+
+    def test_disconnect_with_partial_persisted_turn_is_not_success(self):
+        request_path = self.request(turn="disconnect", message="tiny task")
+        events = [
+            self.event("step_start", {"sessionID": self.sid,
+                                       "messageID": "msg_disconnected",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_disconnected",
+                                 "type": "text", "text": "partial"}),
+        ]
+        result, _, _ = self.run_events(
+            request_path, events, code=1,
+            completion={"completed": False, "idle": True, "outcome": "interrupted"})
+        self.assertEqual(result["state"], "error")
+        self.assertNotEqual(result["state"], "done")
+
+    def test_persisted_failure_outcome_is_not_success(self):
+        request_path = self.request(turn="persisted-failure")
+        events = [
+            self.event("step_start", {"sessionID": self.sid,
+                                       "messageID": "msg_failed",
+                                       "type": "step-start"}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_failed",
+                                 "type": "text", "text": "partial"}),
+        ]
+        result, _, _ = self.run_events(
+            request_path, events,
+            completion={"finish": "error", "outcome": "failed", "error": {"message": "provider failed"}})
+        self.assertEqual(result["state"], "error")
+        self.assertIn("provider", result["error"].lower())
 
     def test_v205_interactive_question_cancellation_tool_event_is_blocked(self):
         request_path = self.request(turn="question-cancelled")
