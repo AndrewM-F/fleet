@@ -1,9 +1,11 @@
 """Dispatch queued tasks at most once to idle, non-conflicting workers."""
 import json
 from pathlib import Path
+import subprocess
 import time
 
 from . import claude, pi
+from . import recovery
 from .store import BUSY, emit
 
 
@@ -21,7 +23,35 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             continue
         slot = slots[sid]
         state = states.get(sid, {})
-        if state.get("state") not in {"idle", "done", "completed", "stopped"}:
+        task = json.loads(raw)
+        recovery_id = task.get("recoveryId")
+        recovering_error = (slot.get("provider") == "opencode"
+                            and state.get("state") == "error" and recovery_id)
+        if recovery_id:
+            record = recovery.recovery_for_task(
+                db, recovery_id, task_id, sid, task.get("previousTaskId"))
+            if not record:
+                continue
+            try:
+                recovery.validate_owned_worktree(db, record)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                already_reported = False
+                for (body,) in db.execute(
+                        "SELECT body FROM events WHERE kind='needs_attention'").fetchall():
+                    try:
+                        if json.loads(body).get("taskId") == task_id:
+                            already_reported = True
+                            break
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                if not already_reported:
+                    emit(db, "needs_attention", taskId=task_id, sessionId=sid,
+                         error=f"Owned worktree recovery check failed: {error}")
+                continue
+        if recovery_id and not recovering_error:
+            continue
+        if state.get("state") not in {"idle", "done", "completed", "stopped"} \
+                and not recovering_error:
             continue
         if slot.get("provider") in {"claude", "opencode"} and not slot.get("dispatchEnabled", False):
             continue
@@ -33,17 +63,28 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             continue
         if max_concurrent and active >= max_concurrent:
             return
-        task = json.loads(raw)
         task["baselineProgress"] = state.get("progress")
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
         claimed = db.execute(
             "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued'",
             (json.dumps(task), time.time(), task_id))
+        recovery_record = None
+        if claimed.rowcount == 1 and recovery_id:
+            recovery_record = recovery.claim_recovery(
+                db, recovery_id, task_id, sid, task.get("previousTaskId"))
+            if recovery_record is None:
+                db.rollback()
+                continue
         db.commit()  # Crash after this point means uncertain delivery; never resend.
         if claimed.rowcount != 1:
             continue  # An operator cancelled this task after the queue snapshot.
         try:
             if slot.get("provider") == "opencode":
-                sender(slot, task["message"], task_id=task_id)
+                if recovery_record:
+                    sender(slot, task["message"], task_id=task_id, recovery=recovery_record)
+                else:
+                    sender(slot, task["message"], task_id=task_id)
             else:
                 sender(slot, task["message"])
         except Exception as error:
@@ -57,12 +98,15 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         states[sid] = dict(state, state="queued")
 
 
-def send(slot, message, task_id=None):
+def send(slot, message, task_id=None, recovery=None):
     if slot.get("provider") == "opencode":
         if slot.get("mode") not in (None, "opencode"):
             raise ValueError("OpenCode workers cannot use Claude mode settings")
         from . import opencode
-        opencode.send(slot, message, task_id)
+        if recovery:
+            opencode.send(slot, message, task_id, recovery)
+        else:
+            opencode.send(slot, message, task_id)
     elif slot["provider"] == "pi":
         current = pi.query(slot)
         if current is None or current["state"] != "idle":

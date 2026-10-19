@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, manager, opencode, ops, paths, pi
+from . import claude, control, events, manager, opencode, ops, paths, pi, recovery
 from .store import BUSY, database
 
 
@@ -256,6 +256,21 @@ def cmd_resolve(args):
         out(ops.resolve_worker(db, args.worker, args.note))
 
 
+def cmd_recovery_snapshot(args):
+    out(recovery.worktree_snapshot(args.cwd))
+
+
+def cmd_recover_opencode(args):
+    out(recovery.authorize_opencode(database(), session_id=args.worker,
+                                    failed_task_id=args.task, turn=args.turn,
+                                    recovery_id=args.recovery_id,
+                                    successor_task_id=args.successor_task,
+                                    ownership_task_id=args.ownership_task,
+                                    owned_worktree=args.owned_worktree,
+                                    branch=args.branch, head=args.head,
+                                    worktree_sha256=args.worktree_sha256, note=args.note))
+
+
 def cmd_controller(args):
     if args.action == "start":
         out(pi.start(args.lane))
@@ -325,6 +340,26 @@ def main(argv=None):
     p.add_argument("--as", dest="outcome", choices=["finished", "cancelled"])
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_resolve)
+    p = sub.add_parser("recovery-snapshot",
+                       help="read exact branch/head/partial-worktree fingerprint")
+    p.add_argument("--cwd", required=True)
+    p.set_defaults(fn=cmd_recovery_snapshot)
+    p = sub.add_parser("recover-opencode",
+                       help="authorize one durable successor for a verified failed OpenCode turn")
+    p.add_argument("--worker", required=True)
+    p.add_argument("--task", required=True, help="failed terminal task ID")
+    p.add_argument("--turn", required=True, help="failed managed OpenCode turn UUID")
+    p.add_argument("--recovery-id", required=True)
+    p.add_argument("--successor-task", required=True)
+    p.add_argument("--ownership-task", required=True,
+                   help="finished Fleet task that records the owner branch and worktree")
+    p.add_argument("--owned-worktree", required=True,
+                   help="exact owner Git worktree; the native session CWD remains unchanged")
+    p.add_argument("--branch", required=True)
+    p.add_argument("--head", required=True)
+    p.add_argument("--worktree-sha256", required=True)
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_recover_opencode)
     p = sub.add_parser("cancel", help="cancel queued work or abort a sent/running turn; never resent")
     p.add_argument("task")
     p.add_argument("--note", required=True)

@@ -24,6 +24,30 @@ def database(path=None):
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, sid TEXT NOT NULL, cwd TEXT NOT NULL,
       body TEXT NOT NULL, state TEXT NOT NULL, updated REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS recoveries (
+      id TEXT PRIMARY KEY,
+      failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
+      owner_sid TEXT NOT NULL, owner_task_id TEXT NOT NULL,
+      ownership_task_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL,
+      owned_worktree TEXT NOT NULL DEFAULT '',
+      branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
+      note TEXT NOT NULL, status TEXT NOT NULL,
+      created REAL NOT NULL, updated REAL NOT NULL,
+      UNIQUE(failed_sid, failed_turn), UNIQUE(owner_task_id));
+    """)
+    recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}
+    if "ownership_task_id" not in recovery_columns:
+        db.execute("ALTER TABLE recoveries ADD COLUMN ownership_task_id TEXT NOT NULL DEFAULT ''")
+    if "owned_worktree" not in recovery_columns:
+        db.execute("ALTER TABLE recoveries ADD COLUMN owned_worktree TEXT NOT NULL DEFAULT ''")
+    db.executescript("""
+    CREATE UNIQUE INDEX IF NOT EXISTS recoveries_active_owner
+      ON recoveries(owner_sid) WHERE status IN ('preparing','authorized','claimed');
+    CREATE UNIQUE INDEX IF NOT EXISTS recoveries_active_cwd
+      ON recoveries(cwd) WHERE status IN ('preparing','authorized','claimed');
+    CREATE UNIQUE INDEX IF NOT EXISTS recoveries_active_worktree
+      ON recoveries(owned_worktree)
+      WHERE status IN ('preparing','authorized','claimed') AND owned_worktree<>'';
     """)
     db.commit()
     return db

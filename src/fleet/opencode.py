@@ -318,7 +318,7 @@ def _verify_inherited_lock(fd, lock_path):
         raise ValueError("OpenCode wrapper session lock could not be verified") from error
 
 
-def send(slot, message, task_id=None):
+def send(slot, message, task_id=None, recovery=None):
     """Start one locked CLI turn in an existing session; delivery is never retried."""
     slot = verify_slot(slot)
     if not slot.get("dispatchEnabled", False):
@@ -336,8 +336,30 @@ def send(slot, message, task_id=None):
     handed_off = False
     try:
         current = state(slot)
+        if recovery is not None and current["state"] != "error":
+            raise RuntimeError("Recovery is valid only for the recorded failed OpenCode turn")
         if current["state"] not in {"idle", "done", "completed", "stopped"}:
-            raise RuntimeError("OpenCode worker is not idle; reconcile before retry")
+            if not (current["state"] == "error" and isinstance(recovery, dict)
+                    and recovery.get("status") == "claimed"
+                    and recovery.get("owner_sid") == sid
+                    and recovery.get("owner_task_id") == task_id):
+                raise RuntimeError("OpenCode worker is not idle; reconcile before retry")
+            from .recovery import verify_failed_turn, worktree_snapshot
+            verify_failed_turn(sid, recovery.get("failed_task_id"),
+                               recovery.get("failed_turn"), slot["cwd"], slot["model"])
+            snapshot = worktree_snapshot(recovery.get("owned_worktree", ""))
+            if (snapshot["branch"] != recovery.get("branch")
+                    or snapshot["head"] != recovery.get("head")
+                    or snapshot["worktreeSha256"] != recovery.get("worktree_sha256")):
+                raise RuntimeError("Recovery worktree changed after authorization")
+            # Native session identity stays fixed. Every successor prompt carries
+            # its separately verified checkout, even if the caller only says continue.
+            context = {"ownedWorktree": recovery["owned_worktree"],
+                       "branch": recovery["branch"]}
+            message = ("Fleet recovery checkout: " + json.dumps(context) + "\n"
+                       "Continue this task in the ownedWorktree on the recorded branch. "
+                       "Use that checkout explicitly for file and Git operations; "
+                       "the native session CWD remains unchanged.\n\n" + message)
         native = verify_native_session(sid, slot["cwd"], slot["databasePath"])
         path.mkdir(parents=True)
         logs.mkdir(parents=True, exist_ok=True)
@@ -349,10 +371,16 @@ def send(slot, message, task_id=None):
                    "message": message, "executable": slot["executable"],
                    "logDir": str(logs), "timeoutSeconds": int(slot.get("turnTimeoutSeconds", 0)),
                    "lockFd": lock.fileno()}
+        if recovery:
+            request["recoveryId"] = recovery["id"]
+            request["ownedWorktree"] = recovery["owned_worktree"]
+            request["branch"] = recovery["branch"]
         atomic(path / "request.json", request, indent=None)
         os.chmod(path / "request.json", 0o600)
         launch = {"turn": turn, "taskId": task_id, "sessionId": sid,
                   "cwd": slot["cwd"], "model": slot["model"], "startedAt": time.time()}
+        if recovery:
+            launch["recoveryId"] = recovery["id"]
         atomic(directory / "current.json", launch, indent=None)
         os.chmod(directory / "current.json", 0o600)
         try:
@@ -904,12 +932,12 @@ def run_turn(request_path):
         status["terminalReason"] = terminal_reason
         status["toolFailures"] = tool_failures
         status["cleanup"] = "confirmed" if cleanup["confirmed"] else "uncertain"
-        result = {"taskId": request["taskId"], "sessionId": sid, "cwd": cwd,
+        result = {"turn": turn, "taskId": request["taskId"], "sessionId": sid, "cwd": cwd,
                   "state": status["state"], "provider": actual_provider, "model": actual_model,
                   "expectedProvider": expected_provider, "expectedModel": model,
                   "usage": usage, "terminalReason": terminal_reason, "summary": summary,
                   "toolFailures": tool_failures, "exitCode": code, "error": status.get("error"),
-                  "cleanup": status["cleanup"],
+                  "cleanup": status["cleanup"], "managedProcessIdentity": process_identity_record,
                   "finishedAt": status["finishedAt"]}
         atomic(root / "result.json", result, indent=None)
         os.chmod(root / "result.json", 0o600)

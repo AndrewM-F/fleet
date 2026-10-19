@@ -23,6 +23,15 @@ command prints JSON on stdout and exits non-zero on failure.
 - `bin/fleet resolve --events 1,2 | --task ID --as finished|cancelled | --worker SID --note "..."`
   — record an operator decision (ack events, close an uncertain task, mark a failed Claude turn
   reviewed so the worker can take work again). Notes are stored as events.
+- `bin/fleet recovery-snapshot --cwd PATH` / `bin/fleet recover-opencode ...` — fingerprint and
+  authorize a one-use successor for an errored OpenCode turn. Recovery requires exact failed task,
+  turn, owner task, explicit owned worktree, branch, commit, and worktree digest; verified cleanup;
+  and a free session lock. It keeps the native session CWD unchanged and records the separately
+  verified owned worktree. It preserves the failed task/turn and database history; never rebuild
+  `fleet.sqlite` from the queue. It does not clear pause/dispatch holds or alter the pinned model.
+  The successor must be a new root-authorized task linked by `previousTaskId` and the returned
+  `recoveryId`. Never retry the old task ID. Rate-limit/quota errors are not recoverable through
+  this command. Recovery is same-session only; do not infer or implement cross-session transfer.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a

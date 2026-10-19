@@ -6,7 +6,7 @@ from pathlib import Path
 import signal
 import time
 
-from . import claude, opencode, paths, pi, pr_queue
+from . import claude, opencode, paths, pi, pr_queue, recovery
 from .dispatch import dispatch, send
 from .store import BUSY, TERMINAL, database, emit
 from .util import atomic
@@ -41,6 +41,12 @@ def observe(db, sid, state, now=None):
             emit(db, "task_consumed", taskId=task_id, sessionId=sid)
         if phase == "running" and state["state"] in TERMINAL:
             db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=?", (now, task_id))
+            task_data = json.loads(db.execute("SELECT body FROM tasks WHERE id=?",
+                                              (task_id,)).fetchone()[0])
+            if task_data.get("recoveryId"):
+                db.execute("UPDATE recoveries SET status='completed',updated=? "
+                           "WHERE id=? AND status='claimed' AND owner_task_id=?",
+                           (now, task_data["recoveryId"], task_id))
             emit(db, "review_ready", taskId=task_id, sessionId=sid, state=state["state"])
         elif phase == "sent" and now - updated > 90:
             db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?", (now, task_id))
@@ -60,11 +66,22 @@ def import_queue(db, slots, queue=None):
         existing = db.execute("SELECT body FROM tasks WHERE id=?", (task["id"],)).fetchone()
         if existing:
             saved = json.loads(existing[0])
-            if any(saved.get(k) != task.get(k) for k in ("sessionId", "message")):
+            if any(saved.get(k) != task.get(k) for k in
+                   ("sessionId", "message", "previousTaskId", "recoveryId")):
                 raise ValueError("Task ID reused with different content")
             continue
         if task.get("rootAuthorized") is not True or sid not in slots or not task.get("message"):
             raise ValueError("Unapproved or unknown task target")
+        if task.get("recoveryId") and not recovery.recovery_for_task(
+                db, task["recoveryId"], task["id"], sid, task.get("previousTaskId")):
+            pending = db.execute("SELECT status FROM recoveries WHERE id=?",
+                                 (task["recoveryId"],)).fetchone()
+            if pending and pending[0] == "preparing":
+                continue
+            raise ValueError("Recovery task does not match an authorized durable handoff")
+        conflict = recovery.task_recovery_conflict(db, task, sid)
+        if conflict:
+            raise ValueError(f"Queued task conflicts with active recovery {conflict}")
         db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
                    (task["id"], sid, str(Path(slots[sid]["cwd"]).resolve()),
                     json.dumps(task), "queued", time.time()))
