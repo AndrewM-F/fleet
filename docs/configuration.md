@@ -32,7 +32,9 @@
   provider is `opencode-go`. The isolated runtime enables only that selected API provider and pins
   both primary and small models to the selected ID. Direct stream metadata, when present, and
   persisted native completion metadata must match it; a different approved provider is still a
-  mismatch. Rate-limit/quota errors never select another provider or model.
+  mismatch. Rate-limit/quota errors never select another provider or model. A turn request must
+  also name the turn directory it sits in, so the turn identity is bound as strictly as the
+  session, task and CWD identities around it.
 Changing a running lane's model/provider/cwd makes the manager report it `unavailable` until the
 controller is restarted (`bin/fleet stop` / `start`).
 # Fresh and single-harness installations

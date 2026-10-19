@@ -679,6 +679,8 @@ def run_turn(request_path):
     session_directory = root.parent.parent
     if session_directory.name != sid or root.parent.name != "turns":
         raise ValueError("OpenCode request is outside its native session directory")
+    if root.name != str(turn):
+        raise ValueError("OpenCode request turn ID does not match its turn directory")
     _verify_inherited_lock(request.get("lockFd"), session_directory / "dispatch.lock")
     native = verify_native_session(sid, cwd, request.get("databasePath"))
     request["databasePath"] = native["databasePath"]
