@@ -18,6 +18,12 @@ from . import paths
 from .util import atomic
 
 MODEL = "opencode/deepseek-v4.1-flash-free"
+# The only models this fleet may drive. Every entry is an explicitly approved
+# free model and the fleet default is first. A paid provider or model is
+# never listed, so a session configured with anything else is refused before
+# a turn starts, and the isolated runtime is pinned to the approved model and
+# its provider, so no other provider can be reached at all.
+APPROVED_FREE_MODELS = (MODEL, "opencode-go/minimax-m3.1-flash-free")
 _SESSION_ID = re.compile(r"ses_[A-Za-z0-9_-]+\Z")
 _TURN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 _POLL_SECONDS = 0.1
@@ -176,6 +182,46 @@ def _database_path(value):
     return path.resolve()
 
 
+def _split_model(model):
+    """Split a configured model id into its provider and model name."""
+    provider, separator, name = str(model).partition("/")
+    if not separator or not provider or not name:
+        raise ValueError("OpenCode model must be provider/model")
+    return provider, name
+
+
+def _native_model_parts(value):
+    """Read the provider and model the native session itself records.
+
+    The native database stores the session's own model as a JSON record with
+    the provider id and the model id. A plain provider/model string is also
+    accepted for older rows. Nothing else is read, and an unreadable record
+    yields no model at all, so the binding below fails closed.
+    """
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, None
+        if not text.startswith("{"):
+            provider, separator, name = text.partition("/")
+            if not separator or not provider or not name:
+                return None, None
+            return provider, name
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return None, None
+    if not isinstance(value, dict):
+        return None, None
+    provider = value.get("providerID")
+    name = value.get("id")
+    if not isinstance(provider, str) or not isinstance(name, str):
+        return None, None
+    return provider, name
+
+
 def verify_native_session(sid, cwd, database_path):
     """Read only the exact native session identity row; never inspect message data."""
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
@@ -204,8 +250,25 @@ def verify_native_session(sid, cwd, database_path):
     configured_cwd = Path(cwd).resolve()
     if actual_cwd != configured_cwd:
         raise ValueError("OpenCode native session directory differs from configured cwd")
+    native_provider, native_model = _native_model_parts(row[3])
     return {"databasePath": str(db_path), "projectId": row[2], "nativeModel": row[3],
+            "nativeModelProvider": native_provider, "nativeModelId": native_model,
             "sessionCwd": str(actual_cwd)}
+
+
+def verify_native_model(model, native):
+    """Bind the configured model to the model the native session itself runs.
+
+    The native session recorded the provider and model it was created with.
+    The configured model must be exactly that pair, so the model a turn
+    actually runs is the session's own approved model and never one a task
+    supplied. The native session CWD and identity are unchanged by this.
+    """
+    provider, name = _split_model(model)
+    if (native.get("nativeModelProvider") != provider
+            or native.get("nativeModelId") != name):
+        raise ValueError("OpenCode configured model differs from the native session model")
+    return model
 
 
 def configured_model(slot):
@@ -223,22 +286,35 @@ def configured_model(slot):
     return model
 
 
-def verify_slot(slot, cfg=None, expected_model=None):
-    """Validate the fixed free model and paths; session identity is checked at launch.
+def approved_free_model(slot):
+    """The approved free model configured for one OpenCode worker.
 
-    ``expected_model`` replaces the fleet-wide free-model pin with the model the
-    caller expects this worker to carry. The cancellation and recovery paths
-    pass the model configured for the target session, so their identity is
-    proven by the persisted launch and turn receipts rather than by a global
-    constant. Every other check is unchanged, and without ``expected_model``
-    the fleet-wide pin still applies.
+    The roster is the only place a session's model comes from, and it must
+    name one of the explicitly approved free models. A task never supplies
+    it. The native session's own recorded model must agree with it, so the
+    model a turn runs is always the session's own approved free model.
+    """
+    model = configured_model(slot)
+    if model not in APPROVED_FREE_MODELS:
+        raise ValueError("OpenCode model must be one of the approved free models: "
+                         + ", ".join(APPROVED_FREE_MODELS))
+    return model
+
+
+def verify_slot(slot, cfg=None, expected_model=None):
+    """Validate the approved free model and paths; session identity is checked at launch.
+
+    The slot must name an explicitly approved free model. ``expected_model``
+    additionally pins the worker to one exact model, which the cancellation
+    and recovery paths use to bind a worker to the model configured for the
+    target session. Every other check is unchanged.
     """
     sid = slot.get("sessionId")
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode sessionId must be an existing native ses_ ID")
-    pinned = MODEL if expected_model is None else expected_model
-    if slot.get("model") != pinned:
-        raise ValueError(f"OpenCode model must be pinned to {pinned}; paid/provider fallbacks are not allowed")
+    model = approved_free_model(slot)
+    if expected_model is not None and model != expected_model:
+        raise ValueError(f"OpenCode model must be pinned to {expected_model}")
     if slot.get("mode") not in (None, "opencode"):
         raise ValueError("OpenCode workers cannot use Claude mode settings")
     cwd = Path(os.path.expanduser(slot.get("cwd", ""))).resolve()
@@ -385,6 +461,11 @@ def send(slot, message, task_id=None, recovery=None):
                        "Use that checkout explicitly for file and Git operations; "
                        "the native session CWD remains unchanged.\n\n" + message)
         native = verify_native_session(sid, slot["cwd"], slot["databasePath"])
+        # Bind the configured model to the model the native session itself
+        # runs, immediately before the launch, so a task can never choose the
+        # model and a session whose native model differs never starts a turn.
+        # The native session CWD and identity are unchanged by this.
+        verify_native_model(slot["model"], native)
         path.mkdir(parents=True)
         logs.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o700)
@@ -618,8 +699,11 @@ def _runtime_environment(request):
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
-    config = {"$schema": "https://opencode.ai/config.json", "model": MODEL,
-              "small_model": MODEL, "enabled_providers": ["opencode"],
+    # The isolated runtime is pinned to the validated model and to exactly its
+    # provider, so the CLI can reach no other provider and no paid fallback.
+    provider, _ = _split_model(request["model"])
+    config = {"$schema": "https://opencode.ai/config.json", "model": request["model"],
+              "small_model": request["model"], "enabled_providers": [provider],
               "plugins": [], "mcp": {"servers": {}}}
     path_entries = [str(Path(executable).parent), "/opt/homebrew/bin", "/usr/local/bin",
                     "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
@@ -667,8 +751,8 @@ def run_turn(request_path):
     sid, cwd, model, turn = (request[k] for k in ("sessionId", "cwd", "model", "turn"))
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode request must target an existing native ses_ ID")
-    if model != MODEL:
-        raise ValueError("OpenCode request model is not the pinned free model")
+    if model not in APPROVED_FREE_MODELS:
+        raise ValueError("OpenCode request model is not an approved free model")
     if request.get("agent"):
         raise ValueError("OpenCode request agent override is not supported")
     if Path(request.get("sessionCwd", "")).resolve() != Path(cwd).resolve():
@@ -680,8 +764,14 @@ def run_turn(request_path):
     session_directory = root.parent.parent
     if session_directory.name != sid or root.parent.name != "turns":
         raise ValueError("OpenCode request is outside its native session directory")
+    if root.name != str(turn):
+        raise ValueError("OpenCode request turn ID does not match its turn directory")
     _verify_inherited_lock(request.get("lockFd"), session_directory / "dispatch.lock")
     native = verify_native_session(sid, cwd, request.get("databasePath"))
+    # The request model must be the model the native session itself runs. The
+    # native database is the authority here, not the request file, so a request
+    # that names any other model cannot start a turn.
+    verify_native_model(model, native)
     request["databasePath"] = native["databasePath"]
     request["turnRoot"] = str(root)
     logs = Path(request["logDir"])

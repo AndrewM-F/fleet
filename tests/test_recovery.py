@@ -642,7 +642,9 @@ class RecoveryTests(unittest.TestCase):
                                          self.sid, self.failed_task)
         self.db.commit()
         native = {"sessionCwd": str(self.native_cwd.resolve()),
-                  "databasePath": self.slot["databasePath"]}
+                  "databasePath": self.slot["databasePath"],
+                  "nativeModelProvider": "opencode",
+                  "nativeModelId": "deepseek-v4.1-flash-free"}
         real_popen = subprocess.Popen
 
         def launch(*args, **kwargs):

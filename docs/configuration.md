@@ -19,13 +19,18 @@
 - `claude[]`: `sessionId`, `cwd`, optional `sessionCwd`, `model`, `effort`, `mode` (`print`),
   `resume`, `dispatchEnabled`.
 - `opencode[]`: an existing native `sessionId` (`ses_…`), absolute `databasePath` for its native
-  OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (exactly
-  `opencode/deepseek-v4.1-flash-free`), and `dispatchEnabled` (defaults false). Set `databasePath`
+  OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (one of the
+  explicitly approved free models, `opencode/deepseek-v4.1-flash-free` by default and
+  `opencode-go/minimax-m3.1-flash-free` where the fleet has approved it), and `dispatchEnabled`
+  (defaults false). Set `databasePath`
   from `opencode debug paths db`; this read-only command does not start a server or open the DB.
   Before each `--session` launch, Fleet reads only that exact `session_v2` identity row in SQLite
   read-only mode and requires its directory to match `cwd`. Unknown IDs fail before the CLI can
-  create a session. Dispatch uses a per-session lock and an isolated runtime config with `model`,
-  `small_model`, and the enabled provider pinned to the free model/provider. Agent overrides are
+  create a session. The configured model must also be the model that native session itself records,
+  so the model a turn runs is the session's own approved model and never one a task supplied.
+  Dispatch uses a per-session lock and an isolated runtime config with `model`,
+  `small_model`, and the enabled provider pinned to that model and its provider, so no other
+  provider and no paid model can be reached. Agent overrides are
   refused. The v2.0.5 JSON stream does not include actual provider/model IDs in its normal step
   events, so receipts leave actual IDs blank unless the transport emits direct model metadata and
   record the pinned CLI model separately.

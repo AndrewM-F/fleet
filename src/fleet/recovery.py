@@ -256,7 +256,7 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
         raise ValueError("Adoption target must be one existing OpenCode slot")
     # The persisted turn is proved against the model configured for this
     # session, not against a fleet-wide constant.
-    configured_model = opencode.configured_model(slots[0])
+    configured_model = opencode.approved_free_model(slots[0])
     cwd = _resolve(slots[0].get("cwd") or "")
     if not cwd:
         raise ValueError("Adoption target has no configured native cwd")
@@ -552,7 +552,7 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
     # The failed turn is proved against the model configured for this session
     # and its persisted launch, turn and error receipts, not against a
     # fleet-wide constant.
-    configured_model = opencode.configured_model(slots[0])
+    configured_model = opencode.approved_free_model(slots[0])
     slot = opencode.verify_slot(slots[0], expected_model=configured_model)
     if not slot.get("dispatchEnabled", False):
         raise ValueError("OpenCode dispatch is disabled; recovery does not change that hold")
