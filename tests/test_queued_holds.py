@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -147,6 +149,39 @@ class QueuedHoldTests(unittest.TestCase):
         self.assertTrue(holds.is_held(self.db, "held"))
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id='sibling'")
                          .fetchone()[0], "sent")
+
+    def test_hold_wins_a_two_connection_race_with_the_atomic_claim(self):
+        # A hold committed while dispatch is mid-claim must win: the atomic claim's
+        # `NOT EXISTS(... status='held')` guard skips the task and nothing is sent.
+        self.add_task("t1")
+        holder = sqlite3.connect(self.db_path, timeout=10)
+        self.addCleanup(holder.close)
+        worker = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+        self.addCleanup(worker.close)
+        calls = []
+        # The hold owns the write lock with an uncommitted held row, so dispatch's
+        # pre-claim `is_held` read cannot see it and must rely on the atomic claim.
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO task_holds VALUES (?,?,?,?,?)",
+                       ("t1", "racing hold", "held", 1.0, 1.0))
+        started = threading.Event()
+
+        def run():
+            started.set()
+            dispatch.dispatch(worker, self.slots, self.states,
+                              lambda *args, **rest: calls.append((args, rest)))
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(started.wait(2))
+        time.sleep(0.5)     # let dispatch block on BEGIN IMMEDIATE behind the hold
+        holder.commit()     # the hold lands before the claim can be written
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, [])                       # hold won; nothing dispatched
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id='t1'")
+                         .fetchone()[0], "queued")
+        self.assertTrue(holds.is_held(self.db, "t1"))
 
     def test_release_clears_only_the_task_level_hold(self):
         self.add_task("t1")
@@ -313,6 +348,21 @@ class HoldCliTests(unittest.TestCase):
                                       env=env, capture_output=True, text=True)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("Task not found", json.loads(rejected.stdout)["message"])
+
+    def test_reconcile_recovery_cli_is_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            config = root / "fleet.json"
+            config.write_text("{}")
+            env = dict(os.environ, FLEET_ROOT=str(root), FLEET_CONFIG=str(config))
+            store.database(root / "data" / "fleet.sqlite").close()
+            fleet = str(Path(__file__).resolve().parents[1] / "bin" / "fleet")
+            result = subprocess.run([sys.executable, fleet, "reconcile-recovery",
+                                     "--task", "no-such-successor", "--note", "check"],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsNone(json.loads(result.stdout))   # no claimed recovery owns it
 
 
 if __name__ == "__main__":

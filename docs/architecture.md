@@ -21,6 +21,13 @@
   dispatchable. Dispatch atomically consumes that authorization with the successor's
   `dispatching` claim; restart turns an ambiguous claim into `uncertain`, never a resend. The old
   task ID is never reset or requeued, and `fleet.sqlite` is never reconstructed from the queue.
+  Cancelling a queued, unstarted successor retires its authorization in the same transaction, so
+  the reservation cannot outlive its successor; the failed task/turn are preserved and a fresh
+  successor may be authorized for the same turn. A `claimed` successor reservation is released only
+  through verified stopped-native-execution reconciliation (`reconcile-recovery`, or `resolve
+  --task` for an `uncertain` successor), never by a bare state flip. Retirement/reconciliation touch
+  only that recovery row and task: pause, `dispatchEnabled`, capacity/quota gates, and unrelated
+  recovery reservations stay in force.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.

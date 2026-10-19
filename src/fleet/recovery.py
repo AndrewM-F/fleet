@@ -10,8 +10,16 @@ import subprocess
 import time
 
 from . import opencode, paths
+from .store import emit
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Recovery statuses that still reserve a worker, worktree, cwd, or failed turn.
+ACTIVE_STATUSES = ("preparing", "authorized", "claimed")
+# Terminal statuses that keep the audit record but release every reservation.
+RETIRED = "retired"        # queued successor cancelled before it ever started
+RECONCILED = "reconciled"  # claimed successor released after verified native stop
+TERMINAL_STATUSES = ("completed", RETIRED, RECONCILED)
+
 _RATE_LIMIT = re.compile(
     r"rate.?limit|too many requests|\b(?:403|429)\b|forbidden|access denied|permission denied|"
     r"quota exceeded|resource exhausted|insufficient credits|billing|"
@@ -362,9 +370,10 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
             if row["status"] != "preparing":
                 return {"recoveryId": recovery_id, "status": row["status"], "alreadyRecorded": True}
         else:
-            if db.execute("SELECT 1 FROM recoveries WHERE failed_sid=? AND failed_turn=?",
+            if db.execute("SELECT 1 FROM recoveries WHERE failed_sid=? AND failed_turn=? "
+                          "AND status IN ('preparing','authorized','claimed')",
                           (session_id, turn)).fetchone():
-                raise ValueError("This failed OpenCode turn already has a recovery record")
+                raise ValueError("This failed OpenCode turn already has an active recovery record")
             if _queue_has_task(successor_task_id):
                 raise ValueError("Successor task ID already appears in the root queue")
 
@@ -445,3 +454,135 @@ def claim_recovery(db, recovery_id, task_id, sid, previous_task_id):
         return None
     record["status"] = "claimed"
     return record
+
+
+# --- retirement / reconciliation -------------------------------------------
+
+_TERMINAL_NATIVE = {"done", "completed", "stopped", "error", "blocked"}
+
+
+def recovery_for_successor(db, task_id, statuses):
+    """The durable recovery row owning this successor task, if any."""
+    placeholders = ",".join("?" * len(statuses))
+    try:
+        row = db.execute(f"SELECT * FROM recoveries WHERE owner_task_id=? "
+                         f"AND status IN ({placeholders})", (task_id, *statuses)).fetchone()
+    except sqlite3.OperationalError:
+        # A legacy store without a recoveries table has no successor reservations.
+        return None
+    if not row:
+        return None
+    names = [item[0] for item in db.execute("SELECT * FROM recoveries LIMIT 0").description]
+    return dict(zip(names, row))
+
+
+def claimed_successor(db, task_id):
+    """The claimed (dispatched) recovery owning this successor task, if any."""
+    return recovery_for_successor(db, task_id, ("claimed",))
+
+
+def _slot_for_session(session_id):
+    slots = [s for s in paths.opencode_slots() if s.get("sessionId") == session_id]
+    if len(slots) != 1:
+        raise ValueError("Recovery target must be one existing OpenCode slot")
+    return slots[0]
+
+
+def verify_stopped_native_execution(slot):
+    """Prove the worker cannot still be running a managed native turn.
+
+    Returns ``(True, evidence)`` only when the current managed turn is terminal,
+    its recorded process identity/group is gone, and its cleanup was confirmed.
+    Otherwise ``(False, reason)``. Never starts, resumes, or replays a turn.
+    """
+    sid = slot.get("sessionId")
+    pointer = opencode.session_dir(sid) / "current.json"
+    if not pointer.exists():
+        return True, "no managed native turn"
+    try:
+        launch = json.loads(pointer.read_text())
+    except (OSError, ValueError):
+        return False, "managed native turn pointer is unreadable"
+    turn = launch.get("turn")
+    state_path = opencode.turn_dir(sid, turn) / "state.json" if isinstance(turn, str) else None
+    if state_path is None or not state_path.exists():
+        return False, "managed native turn state is unavailable"
+    try:
+        current = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return False, "managed native turn state is unreadable"
+    identity = current.get("processIdentity")
+    if isinstance(identity, dict):
+        if opencode.identity_matches(identity):
+            return False, "managed native process is still live"
+        pgid = identity.get("pgid")
+        if pgid and opencode._group_exists(pgid):
+            return False, "managed native process group is still present"
+    if current.get("state") not in _TERMINAL_NATIVE:
+        return False, f"managed native turn is still {current.get('state')}"
+    if current.get("cleanup") != "confirmed":
+        return False, "managed native turn cleanup is not confirmed"
+    return True, "managed native turn is terminal with confirmed cleanup"
+
+
+def retire_queued_successor(db, task_id, note):
+    """Retire a queued-but-unstarted recovery atomically with its cancellation.
+
+    Only ``preparing``/``authorized`` reservations can be retired: those are the
+    states a task still in ``queued`` can hold. The failed task and turn rows are
+    left untouched and are never replayed. Runs in the caller's transaction.
+    """
+    rows = []
+    try:
+        rows = db.execute("SELECT id FROM recoveries WHERE owner_task_id=? "
+                          "AND status IN ('preparing','authorized')", (task_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    retired = []
+    for (recovery_id,) in rows:
+        changed = db.execute("UPDATE recoveries SET status=?,updated=? WHERE id=? "
+                             "AND status IN ('preparing','authorized')",
+                             (RETIRED, time.time(), recovery_id))
+        if changed.rowcount == 1:
+            retired.append(recovery_id)
+    if retired:
+        emit(db, "recovery_retired", taskId=task_id, recoveryIds=retired, note=note,
+             reason="queued successor cancelled before dispatch")
+    return retired
+
+
+def reconcile_successor(db, task_id, note, slot=None, outcome="cancelled"):
+    """Release a claimed successor reservation after a verified native stop.
+
+    The release is refused unless the claimed successor's native execution is
+    proven stopped; this is the single proof used by every release path, including
+    manual ``ops.resolve_task``. Returns ``None`` when no claimed recovery owns the
+    task. The failed task and turn rows are never touched or replayed.
+    """
+    record = claimed_successor(db, task_id)
+    if not record:
+        return None
+    slot = _slot_for_session(record["owner_sid"]) if slot is None else slot
+    stopped, evidence = verify_stopped_native_execution(slot)
+    if not stopped:
+        raise ValueError("Native execution is not verified stopped: " + evidence)
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        changed = db.execute("UPDATE recoveries SET status=?,updated=? "
+                             "WHERE owner_task_id=? AND status='claimed'",
+                             (RECONCILED, time.time(), task_id))
+        if changed.rowcount != 1:
+            db.rollback()
+            raise ValueError("Recovery state changed; inspect before reconciling")
+        row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row and row[0] not in {"finished", "cancelled"}:
+            db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?",
+                       (outcome, time.time(), task_id))
+        emit(db, "recovery_reconciled", recoveryId=record["id"], taskId=task_id,
+             evidence=evidence, note=note)
+    except Exception:
+        db.rollback()
+        raise
+    return {"taskId": task_id, "recoveryId": record["id"], "reconciled": True,
+            "evidence": evidence}

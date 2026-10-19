@@ -60,4 +60,15 @@
   separate owned Git worktree. Cross-session transfer is not supported. Never rebuild
   `fleet.sqlite` from `queue.json`; preserve its task/event/receipt history. A successor send becomes
   single-use at its durable dispatch claim; inspect an `uncertain` successor instead of replaying it.
+
+  **Retire or reconcile a recovery.** Cancelling a still-queued successor with `bin/fleet cancel`
+  atomically retires its authorization, releasing the reservation while preserving the failed task
+  and turn verbatim. A fresh successor may then be authorized for the same failed turn. Once a
+  successor has been dispatched (`claimed`), its reservation is released only after native
+  execution is verified stopped: `bin/fleet reconcile-recovery --task SUCCESSOR --note "..."` for a
+  `sent`/`running`/`cancelled` successor, or `bin/fleet resolve --task SUCCESSOR --as cancelled`
+  for an `uncertain` one. Both use the same proof — the managed turn must be terminal with confirmed
+  cleanup and no live process identity/group — and refuse a bare state flip. Retirement and
+  reconciliation touch only that recovery row and task; global pause, per-worker `dispatchEnabled`,
+  capacity/quota gates, and unrelated recovery reservations stay in force.
 - **Moving `data/`** — `bin/fleet stop`, `scripts/db-check`, then move including no `-wal/-shm`.

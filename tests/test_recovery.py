@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import control, dispatch, manager, opencode, paths, recovery, store  # noqa: E402
+from fleet import control, dispatch, manager, opencode, ops, paths, recovery, store  # noqa: E402
 
 
 class RecoveryTests(unittest.TestCase):
@@ -544,6 +544,141 @@ class RecoveryTests(unittest.TestCase):
                                          (self.successor,)).fetchone()[0], "finished")
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "completed")
+
+    # --- retirement / reconciliation --------------------------------------
+    def enqueue_successor(self):
+        task = {"id": self.successor, "previousTaskId": self.failed_task,
+                "recoveryId": "recovery-1", "rootAuthorized": True, "message": "continue"}
+        with patch.object(paths, "all_slots", return_value=[self.slot]):
+            control.enqueue(self.db, [task])
+        manager.import_queue(self.db, {self.sid: self.slot}, self.queue)
+
+    def mark_claimed_uncertain(self, state="uncertain"):
+        self.db.execute("UPDATE tasks SET state=? WHERE id=?", (state, self.successor))
+        self.db.execute("UPDATE recoveries SET status='claimed' WHERE id='recovery-1'")
+        self.db.commit()
+
+    def write_successor_turn(self, state, identity=None, turn="turn_successor"):
+        turn_dir = paths.OPENCODE / self.sid / "turns" / turn
+        turn_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"turn": turn, "taskId": self.successor, "sessionId": self.sid,
+                   "cwd": str(self.native_cwd), "model": opencode.MODEL, "state": state}
+        if identity is not None:
+            payload["processIdentity"] = identity
+        if state in {"stopped", "error", "done", "completed", "blocked"}:
+            payload["cleanup"] = "confirmed"
+        (turn_dir / "state.json").write_text(json.dumps(payload))
+        (paths.OPENCODE / self.sid / "current.json").write_text(json.dumps(
+            {"turn": turn, "taskId": self.successor, "sessionId": self.sid,
+             "cwd": str(self.native_cwd), "model": opencode.MODEL}))
+        return turn
+
+    def test_queued_cancel_retires_authorization_atomically(self):
+        self.authorize()
+        self.enqueue_successor()
+        failed_before = self.db.execute("SELECT * FROM tasks WHERE id=?",
+                                        (self.failed_task,)).fetchone()
+        state_before = (paths.OPENCODE / self.sid / "turns" / self.turn / "state.json").read_bytes()
+        result_before = (paths.OPENCODE / self.sid / "turns" / self.turn / "result.json").read_bytes()
+        result = ops.cancel(self.db, self.successor, "cancelled before dispatch")
+        self.assertEqual(result, {"taskId": self.successor,
+                                  "action": {"queuedCancelled": True,
+                                             "recoveryRetired": ["recovery-1"]}})
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "retired")
+        # The failed task and its failed turn are preserved verbatim, never replayed.
+        self.assertEqual(self.db.execute("SELECT * FROM tasks WHERE id=?",
+                                         (self.failed_task,)).fetchone(), failed_before)
+        self.assertEqual((paths.OPENCODE / self.sid / "turns" / self.turn /
+                          "state.json").read_bytes(), state_before)
+        self.assertEqual((paths.OPENCODE / self.sid / "turns" / self.turn /
+                          "result.json").read_bytes(), result_before)
+        kinds = {row[0] for row in self.db.execute("SELECT kind FROM events").fetchall()}
+        self.assertIn("recovery_retired", kinds)
+        self.assertIn("task_cancelled", kinds)
+
+    def test_safe_replacement_after_retirement_shares_the_failed_turn(self):
+        self.authorize()
+        self.enqueue_successor()
+        ops.cancel(self.db, self.successor, "cancel the first successor")
+        snap = recovery.worktree_snapshot(self.cwd)
+        replacement = recovery.authorize_opencode(
+            self.db, session_id=self.sid, failed_task_id=self.failed_task, turn=self.turn,
+            recovery_id="recovery-2", successor_task_id="successor-task-2",
+            ownership_task_id=self.failed_task, owned_worktree=str(self.cwd.resolve()),
+            branch=snap["branch"], head=snap["head"], worktree_sha256=snap["worktreeSha256"],
+            note="safe replacement after retirement")
+        self.assertEqual(replacement["status"], "authorized")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "retired")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-2'")
+                         .fetchone()[0], "authorized")
+        self.assertEqual(self.db.execute("SELECT failed_task_id,failed_turn FROM recoveries "
+                                         "WHERE id='recovery-2'").fetchone(),
+                         (self.failed_task, self.turn))
+
+    def test_uncertain_resolution_is_fenced_by_stopped_native_execution(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain()
+        identity = {"pid": 4242, "pgid": 4242, "start": [1, 2], "executable": "/usr/bin/opencode"}
+        self.write_successor_turn("working", identity=identity)
+        with patch.object(opencode, "identity_matches", return_value=True):
+            with self.assertRaisesRegex(ValueError, "not verified stopped"):
+                ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "uncertain")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.write_successor_turn("stopped")   # no live identity, cleanup confirmed
+        resolved = ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
+        self.assertEqual(resolved["state"], "cancelled")
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "reconciled")
+
+    def test_explicit_reconcile_releases_sent_successor_only_after_proof(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="sent")
+        identity = {"pid": 99, "pgid": 99, "start": [3, 4], "executable": "/usr/bin/opencode"}
+        self.write_successor_turn("working", identity=identity)
+        with patch.object(opencode, "identity_matches", return_value=True):
+            with self.assertRaisesRegex(ValueError, "not verified stopped"):
+                recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.write_successor_turn("stopped")
+        result = recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "reconciled")
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+
+    def test_retirement_keeps_other_reservations_and_gates_intact(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.db.execute("INSERT INTO recoveries (id,failed_sid,failed_turn,failed_task_id,"
+                        "owner_sid,owner_task_id,ownership_task_id,cwd,owned_worktree,branch,"
+                        "head,worktree_sha256,note,status,created,updated) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("unrelated", "ses_other", "turn-other", "failed-other", "ses_other",
+                         "successor-other", "ownership-other", str(self.other_native_cwd),
+                         str(self.other_native_cwd), "b", "h", "d", "n", "authorized", 1.0, 1.0))
+        self.db.commit()
+        paths.PAUSE.write_text("paused\n")
+        self.slot["dispatchEnabled"] = False
+        ops.cancel(self.db, self.successor, "cancel while other holds exist")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "retired")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='unrelated'")
+                         .fetchone()[0], "authorized")     # unrelated reservation untouched
+        self.assertTrue(paths.PAUSE.exists())              # global pause untouched
+        self.assertFalse(self.slot["dispatchEnabled"])     # per-worker hold untouched
 
 
 if __name__ == "__main__":

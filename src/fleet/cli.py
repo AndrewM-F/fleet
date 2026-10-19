@@ -272,6 +272,14 @@ def cmd_recover_opencode(args):
                                     worktree_sha256=args.worktree_sha256, note=args.note))
 
 
+def cmd_reconcile_recovery(args):
+    try:
+        out(recovery.reconcile_successor(database(), args.task, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
 def cmd_hold(args):
     try:
         out(holds.hold(database(), args.task, args.note))
@@ -377,6 +385,11 @@ def main(argv=None):
     p.add_argument("--worktree-sha256", required=True)
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
+    p = sub.add_parser("reconcile-recovery",
+                       help="release a claimed recovery reservation after a verified native stop")
+    p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")
+    p.add_argument("--note", required=True, help="operator evidence that native execution stopped")
+    p.set_defaults(fn=cmd_reconcile_recovery)
     p = sub.add_parser("hold", help="hold an unstarted queued task without cancelling it")
     p.add_argument("task")
     p.add_argument("--note", required=True, help="operator reason kept with the hold")

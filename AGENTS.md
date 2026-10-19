@@ -32,6 +32,11 @@ command prints JSON on stdout and exits non-zero on failure.
   The successor must be a new root-authorized task linked by `previousTaskId` and the returned
   `recoveryId`. Never retry the old task ID. Rate-limit/quota errors are not recoverable through
   this command. Recovery is same-session only; do not infer or implement cross-session transfer.
+  `bin/fleet cancel` of a queued, unstarted successor atomically retires its authorization, so the
+  reservation never outlives a cancelled successor; the failed task/turn stay preserved and a fresh
+  successor may then be authorized for the same failed turn. A dispatched (`claimed`) successor's
+  reservation is released only by `bin/fleet reconcile-recovery --task ID --note "..."` (or
+  `resolve --task` for an `uncertain` successor) after native execution is verified stopped.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one
