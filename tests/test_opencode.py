@@ -229,6 +229,13 @@ class OpenCodeAdapterTests(unittest.TestCase):
         request = json.loads(request_path.read_text())
         request["model"] = model
         request_path.write_text(json.dumps(request))
+        # The native session records the model and provider it runs. A session
+        # that ran a different model would have a different native row, so the
+        # row follows the model under test.
+        provider, _, name = model.partition("/")
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("UPDATE session_v2 SET model=? WHERE id=?",
+                       (json.dumps({"id": name, "providerID": provider}), self.sid))
         return request_path
 
     def minimax_events(self, provider=None):

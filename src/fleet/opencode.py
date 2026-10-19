@@ -190,6 +190,38 @@ def _database_path(value):
     return path.resolve()
 
 
+def _native_model_parts(value):
+    """Read the provider and model the native session itself records.
+
+    The native database stores the session's own model as a JSON record with
+    the provider id and the model id. A plain provider/model string is also
+    accepted for older rows. Nothing else is read, and an unreadable record
+    yields no model at all, so the binding below fails closed.
+    """
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, None
+        if not text.startswith("{"):
+            provider, separator, name = text.partition("/")
+            if not separator or not provider or not name:
+                return None, None
+            return provider, name
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return None, None
+    if not isinstance(value, dict):
+        return None, None
+    provider = value.get("providerID")
+    name = value.get("id")
+    if not isinstance(provider, str) or not isinstance(name, str):
+        return None, None
+    return provider, name
+
+
 def verify_native_session(sid, cwd, database_path):
     """Read only the exact native session identity row; never inspect message data."""
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
@@ -218,8 +250,27 @@ def verify_native_session(sid, cwd, database_path):
     configured_cwd = Path(cwd).resolve()
     if actual_cwd != configured_cwd:
         raise ValueError("OpenCode native session directory differs from configured cwd")
+    native_provider, native_model = _native_model_parts(row[3])
     return {"databasePath": str(db_path), "projectId": row[2], "nativeModel": row[3],
+            "nativeModelProvider": native_provider, "nativeModelId": native_model,
             "sessionCwd": str(actual_cwd)}
+
+
+def verify_native_model(model, native):
+    """Bind the configured model to the model the native session itself runs.
+
+    The native session recorded the provider and model it was created with.
+    The configured model must be exactly that pair, so the model a turn
+    actually runs is the session's own approved model and never one a task
+    supplied, and a session whose native identity has drifted cannot be
+    driven at all. The native session CWD and identity are unchanged by
+    this.
+    """
+    provider, name = _validate_model(model)
+    if (native.get("nativeModelProvider") != provider
+            or native.get("nativeModelId") != name):
+        raise ValueError("OpenCode configured model differs from the native session model")
+    return model
 
 
 def verify_slot(slot, cfg=None):
@@ -384,6 +435,12 @@ def send(slot, message, task_id=None, recovery=None):
                        "Use that checkout explicitly for file and Git operations; "
                        "the native session CWD remains unchanged.\n\n" + message)
         native = verify_native_session(sid, slot["cwd"], slot["databasePath"])
+        # The slot's configured model and provider must be the model and
+        # provider the native session itself runs. This is checked immediately
+        # before the launch, so a task can never choose the model and a
+        # session whose native identity has drifted never starts a turn. The
+        # native session CWD and identity are unchanged by this.
+        verify_native_model(slot["model"], native)
         path.mkdir(parents=True)
         logs.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o700)
@@ -683,6 +740,10 @@ def run_turn(request_path):
         raise ValueError("OpenCode request turn ID does not match its turn directory")
     _verify_inherited_lock(request.get("lockFd"), session_directory / "dispatch.lock")
     native = verify_native_session(sid, cwd, request.get("databasePath"))
+    # The request model must be the model the native session itself runs. The
+    # native database is the authority here, not the request file, so a request
+    # that names any other model or provider cannot start a turn.
+    verify_native_model(model, native)
     request["databasePath"] = native["databasePath"]
     request["turnRoot"] = str(root)
     logs = Path(request["logDir"])

@@ -25,7 +25,11 @@
   no automatic preference switch or fallback; choose the exact model explicitly. Set `databasePath`
   from `opencode debug paths db`; this read-only command does not start a server or open the DB.
   Before each `--session` launch, Fleet reads only that exact `session_v2` identity row in SQLite
-  read-only mode and requires its directory to match `cwd`. Unknown IDs fail before the CLI can
+  read-only mode and requires its directory to match `cwd`. That same row records the model and
+  provider the native session runs, and the target slot's configured model and provider must
+  match it exactly, at the managed launch and again at the turn itself. A session whose native
+  identity has drifted, or a request that names another approved model or provider, is refused
+  before a turn starts. Unknown IDs fail before the CLI can
   create a session. Dispatch uses a per-session lock and an isolated runtime config with `model`,
   `small_model`, and the enabled provider pinned to the free model/provider. Agent overrides are
   refused. `provider: "opencode"` remains the Fleet transport tag even when the exact model's API
