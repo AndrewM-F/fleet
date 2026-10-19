@@ -28,6 +28,7 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet enqueue JSON` / `control JSON` | queue tasks / enqueue+ack+wait (was `fleet-control.py`) |
 | `bin/fleet completions collect\|wait\|ack` | relay events + receipts (was `fleet-events.py`) |
 | `bin/fleet resolve …` / `cancel TASK` | operator decisions, abort a running turn |
+| `bin/fleet hold TASK` / `release TASK` | durably pause/resume one unstarted queued task (never a cancel; never clears pause/dispatch/profile/recovery holds) |
 | `bin/fleet recovery-snapshot --cwd PATH` / `recover-opencode …` | fingerprint a checkout and authorize one verified OpenCode successor |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |

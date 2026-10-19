@@ -5,7 +5,7 @@ import subprocess
 import time
 
 from . import claude, pi
-from . import recovery
+from . import holds, recovery
 from .store import BUSY, emit
 
 
@@ -24,6 +24,8 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         slot = slots[sid]
         state = states.get(sid, {})
         task = json.loads(raw)
+        if holds.is_held(db, task_id):
+            continue  # An operator hold pauses this task; never consume or cancel it.
         recovery_id = task.get("recoveryId")
         recovering_error = (slot.get("provider") == "opencode"
                             and state.get("state") == "error" and recovery_id)
@@ -67,8 +69,9 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         db.commit()
         db.execute("BEGIN IMMEDIATE")
         claimed = db.execute(
-            "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued'",
-            (json.dumps(task), time.time(), task_id))
+            "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued' "
+            "AND NOT EXISTS (SELECT 1 FROM task_holds WHERE task_id=? AND status='held')",
+            (json.dumps(task), time.time(), task_id, task_id))
         recovery_record = None
         if claimed.rowcount == 1 and recovery_id:
             recovery_record = recovery.claim_recovery(

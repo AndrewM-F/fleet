@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, manager, opencode, ops, paths, pi, recovery
+from . import claude, control, events, holds, manager, opencode, ops, paths, pi, recovery
 from .store import BUSY, database
 
 
@@ -166,6 +166,7 @@ def cmd_status(args):
          "supervisor": {"installed": ops.plist_path().exists(), "disabled": DISABLED.exists()},
          "sessions": {sid: s.get("state") for sid, s in status.get("sessions", {}).items()},
          "tasks": dict(db.execute("SELECT state,count(*) FROM tasks GROUP BY state").fetchall()),
+         "heldTasks": sorted(holds.held_ids(db)),
          "unackedEvents": db.execute("SELECT count(*) FROM events WHERE acked=0").fetchone()[0]})
 
 
@@ -271,6 +272,22 @@ def cmd_recover_opencode(args):
                                     worktree_sha256=args.worktree_sha256, note=args.note))
 
 
+def cmd_hold(args):
+    try:
+        out(holds.hold(database(), args.task, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_release(args):
+    try:
+        out(holds.release(database(), args.task, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
 def cmd_controller(args):
     if args.action == "start":
         out(pi.start(args.lane))
@@ -360,6 +377,15 @@ def main(argv=None):
     p.add_argument("--worktree-sha256", required=True)
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
+    p = sub.add_parser("hold", help="hold an unstarted queued task without cancelling it")
+    p.add_argument("task")
+    p.add_argument("--note", required=True, help="operator reason kept with the hold")
+    p.set_defaults(fn=cmd_hold)
+    p = sub.add_parser("release",
+                       help="release only this task-level hold; other dispatch holds stay in force")
+    p.add_argument("task")
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_release)
     p = sub.add_parser("cancel", help="cancel queued work or abort a sent/running turn; never resent")
     p.add_argument("task")
     p.add_argument("--note", required=True)

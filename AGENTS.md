@@ -34,6 +34,13 @@ command prints JSON on stdout and exits non-zero on failure.
   this command. Recovery is same-session only; do not infer or implement cross-session transfer.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
+- `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one
+  **unstarted queued** task without cancelling it or changing its ID. The hold, its reason, and the
+  audit trail are durable in `fleet.sqlite`, so a manager restart preserves them and dispatch never
+  consumes a held task. Repeat operations are idempotent. Holding or releasing a started
+  (`dispatching`/`sent`/`running`) or terminal task is refused. `release` clears only this
+  task-level hold: it never clears the global pause, a per-provider/worker `dispatchEnabled` hold,
+  a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
 

@@ -7,6 +7,12 @@
   `unavailable` for that cwd (or with no cwd). State goes `queued → dispatching` (committed before
   send) `→ sent → running → finished`; a send error or a restart during `dispatching` gives
   `uncertain`, which is never retried automatically. `sent` not consumed in 90s → `uncertain`.
+- **queued holds**: an operator may hold one unstarted queued task without cancelling it. The
+  current status/reason live in `fleet.sqlite` (`task_holds`) with an event audit trail, so a manager
+  restart preserves the hold and dispatch skips the task. Hold/release are idempotent and refuse a
+  started or terminal task. The dispatch claim re-checks the hold atomically, so a hold that races a
+  send wins. Release clears only this task-level hold; pause, `dispatchEnabled`, capacity/quota gates,
+  and recovery reservations are untouched.
 - **OpenCode recovery**: a failed task and native turn stay terminal. An operator may authorize one
   new task only after the exact error/cleanup receipt, free session lock, and an explicit owned
   worktree path recorded by a finished task for the same session. Native session CWD stays

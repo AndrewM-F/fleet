@@ -19,6 +19,13 @@
 - **Hung turn** — Claude turns stop after `claudeTurnTimeoutSeconds` (config, 0 = off); otherwise
   `bin/fleet cancel <task> --note …`.
 - **`uncertain` task** — inspect the worker's transcript; enqueue a new task ID if work is needed.
+- **Held queued task** — an operator paused it with `bin/fleet hold TASK --note …`; it stays queued
+  under the same ID and dispatch skips it. Inspect holds with `bin/fleet status` (`heldTasks`) and
+  resume one with `bin/fleet release TASK --note …`. Both commands are idempotent and refuse a
+  started or terminal task. The hold is durable, so a manager restart keeps it. `release` clears only
+  that task-level hold — a global `bin/fleet pause`, a worker's `dispatchEnabled`, a capacity limit,
+  or an active recovery reservation still gates dispatch, so a released task may stay queued until
+  those clear too.
 - **OpenCode error turn** — do not resolve it with the Claude-only `--worker` command or reset its
   task. Verify the failed task and cleanup receipt, then snapshot the separate owned checkout with
   `bin/fleet recovery-snapshot --cwd OWNED_WORKTREE`. The configured native session CWD stays as-is.

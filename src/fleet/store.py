@@ -24,6 +24,9 @@ def database(path=None):
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, sid TEXT NOT NULL, cwd TEXT NOT NULL,
       body TEXT NOT NULL, state TEXT NOT NULL, updated REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS task_holds (
+      task_id TEXT PRIMARY KEY, reason TEXT NOT NULL, status TEXT NOT NULL,
+      created REAL NOT NULL, updated REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS recoveries (
       id TEXT PRIMARY KEY,
       failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
