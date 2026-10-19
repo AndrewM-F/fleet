@@ -32,6 +32,9 @@
   recovery reservations stay in force. Ownership adoption is append-only evidence: it never queues,
   dispatches, starts a turn, or authorizes a successor by itself, never rewrites task/event/turn
   history, and authorization plus dispatch revalidate the same adoption row and pinned snapshot.
+  The adoption separates a locator (`evidence_reference`) from substantive ownership prose
+  (`ownership_evidence`); a URL, checksum, or path alone is rejected as evidence, and the operator
+  must inspect and verify the referenced source. The locator is not proof by itself.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.

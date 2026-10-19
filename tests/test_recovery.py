@@ -163,6 +163,37 @@ class RecoveryTests(unittest.TestCase):
             "SELECT count(*) FROM recoveries WHERE status IN ('authorized','claimed')"
         ).fetchone()[0], 2)
 
+    def test_legacy_adoption_schema_splits_locator_and_fails_closed(self):
+        legacy_path = self.root / "legacy-adoption.sqlite"
+        old = sqlite3.connect(legacy_path)
+        old.executescript("""
+        CREATE TABLE recovery_adoptions (
+          id TEXT PRIMARY KEY,
+          owner_task_id TEXT NOT NULL, owner_sid TEXT NOT NULL,
+          failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
+          cwd TEXT NOT NULL, owned_worktree TEXT NOT NULL,
+          branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
+          decision TEXT NOT NULL, evidence TEXT NOT NULL, note TEXT NOT NULL,
+          created REAL NOT NULL);
+        INSERT INTO recovery_adoptions VALUES ('legacy-adoption','owner','sid','sid','turn',
+          'failed','/cwd','/tree','branch','head','digest','decision',
+          'legacy substantive evidence text','note',1);
+        """)
+        old.close()
+
+        migrated = store.database(legacy_path)
+        self.addCleanup(migrated.close)
+        row = migrated.execute("SELECT evidence_reference,ownership_evidence,decision "
+                               "FROM recovery_adoptions WHERE id='legacy-adoption'").fetchone()
+        self.assertEqual(row, ("", "legacy substantive evidence text", "decision"))
+        record = {"ownership_task_id": "owner", "owner_sid": "sid",
+                  "failed_sid": "sid", "failed_turn": "turn", "failed_task_id": "failed",
+                  "cwd": "/cwd", "owned_worktree": "/tree", "branch": "branch",
+                  "head": "head", "worktree_sha256": "digest"}
+        # The legacy row has no locator, so it cannot be consumed as strict evidence.
+        with self.assertRaisesRegex(ValueError, "evidence reference locator"):
+            recovery._validate_adoption(migrated, record, "legacy-adoption")
+
     def test_legacy_recovery_migration_rolls_back_as_one_transaction(self):
         legacy_path = self.root / "interrupted-legacy-fleet.sqlite"
         old = sqlite3.connect(legacy_path)
@@ -878,8 +909,10 @@ class RecoveryTests(unittest.TestCase):
                   "branch": snap["branch"], "head": snap["head"],
                   "worktree_sha256": snap["worktreeSha256"],
                   "decision": "adopt the W4 checkout as this worker's explicitly owned worktree",
-                  "evidence": ("W4 handoff: branch repair was created in this isolated checkout; "
-                               "see operator note 2026-10-18"),
+                  "evidence_reference": "operator-handoff:W4-2026-10-18T09:00Z",
+                  "ownership_evidence": ("W4 handoff: the operator confirmed branch repair was "
+                                         "created in this isolated checkout for the owner task, "
+                                         "and this checkout is the one the owner task used."),
                   "note": "ownership adoption for the original W4 task"}
         values.update(overrides)
         return values
@@ -949,6 +982,76 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(second, {"recoveryId": "recovery-1", "status": "authorized",
                                   "alreadyRecorded": True})
 
+    def test_adopted_successor_dispatch_is_restart_persistent_and_single_use(self):
+        owner = self.add_adoption_owner()
+        owner_before = self.db.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone()
+        turn_before = (paths.OPENCODE / self.sid / "turns" / self.turn / "state.json").read_bytes()
+        self.adopt()
+        adoption_before = self.db.execute("SELECT * FROM recovery_adoptions "
+                                          "WHERE id='adoption-1'").fetchone()
+        sent = []
+
+        def sender(*args, **kwargs):
+            sent.append((args, kwargs))
+
+        def run_dispatch(db):
+            dispatch.dispatch(db, {self.sid: self.slot},
+                              {self.sid: {"state": "error", "cwd": str(self.native_cwd)}},
+                              sender)
+            return sent
+
+        # Adoption is evidence only: it creates no recovery, successor, or queue entry,
+        # and dispatch has nothing to send.
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], 0)
+        self.assertFalse(self.queue.exists())
+        self.assertEqual(run_dispatch(self.db), [])
+        # Authorization alone still does not send.
+        self.authorize_adopted()
+        self.assertEqual(run_dispatch(self.db), [])
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "authorized")
+        self.enqueue_successor()
+
+        # A manager restart sees the same adoption, authorization, and queued successor.
+        reopened = store.database(self.db_path)
+        self.addCleanup(reopened.close)
+        manager.import_queue(reopened, {self.sid: self.slot}, self.queue)
+        self.assertEqual(reopened.execute("SELECT state FROM tasks WHERE id=?",
+                                          (self.successor,)).fetchone()[0], "queued")
+        self.assertEqual(reopened.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "authorized")
+        self.assertEqual(reopened.execute("SELECT * FROM recovery_adoptions "
+                                          "WHERE id='adoption-1'").fetchone(), adoption_before)
+
+        # The first dispatch atomically claims the authorization and sends exactly once.
+        run_dispatch(reopened)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1]["task_id"], self.successor)
+        self.assertEqual(sent[0][1]["recovery"]["id"], "recovery-1")
+        self.assertEqual(reopened.execute("SELECT state FROM tasks WHERE id=?",
+                                          (self.successor,)).fetchone()[0], "sent")
+        self.assertEqual(reopened.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+
+        # Neither a repeated dispatch nor another restart can consume the claim twice.
+        run_dispatch(reopened)
+        self.assertEqual(len(sent), 1)
+        restarted = store.database(self.db_path)
+        self.addCleanup(restarted.close)
+        manager.import_queue(restarted, {self.sid: self.slot}, self.queue)
+        run_dispatch(restarted)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(restarted.execute("SELECT count(*) FROM events "
+                                           "WHERE kind='task_sent'").fetchone()[0], 1)
+        self.assertEqual(restarted.execute("SELECT * FROM recovery_adoptions "
+                                           "WHERE id='adoption-1'").fetchone(), adoption_before)
+        self.assertEqual(restarted.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone(),
+                         owner_before)
+        self.assertEqual((paths.OPENCODE / self.sid / "turns" / self.turn /
+                          "state.json").read_bytes(), turn_before)
+
     def test_adoption_rejects_wrong_owner_identity(self):
         self.add_adoption_owner(state="queued")
         with self.assertRaisesRegex(ValueError, "terminal"):
@@ -985,14 +1088,39 @@ class RecoveryTests(unittest.TestCase):
 
     def test_adoption_rejects_missing_or_invalid_evidence(self):
         self.add_adoption_owner()
+        with self.assertRaisesRegex(ValueError, "evidence reference locator"):
+            self.adopt(evidence_reference="")
+        with self.assertRaisesRegex(ValueError, "evidence reference locator"):
+            self.adopt(evidence_reference=12345)
+        with self.assertRaisesRegex(ValueError, "single locator"):
+            self.adopt(evidence_reference="operator note\nsecond line")
         with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
-            self.adopt(evidence="")
+            self.adopt(ownership_evidence="")
         with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
-            self.adopt(evidence="too short")
+            self.adopt(ownership_evidence="too short")
         with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
-            self.adopt(evidence=12345)
+            self.adopt(ownership_evidence=12345)
+        with self.assertRaisesRegex(ValueError, "distinct from the evidence reference"):
+            self.adopt(ownership_evidence="operator-handoff:W4-2026-10-18T09:00Z")
         with self.assertRaisesRegex(ValueError, "explicit operator decision"):
             self.adopt(decision="  ")
+
+    def test_adoption_rejects_locator_or_checksum_as_ownership_evidence(self):
+        self.add_adoption_owner()
+        cases = (
+            "https://example.com/w4-ownership-record",
+            "file:///tmp/w4-ownership-record.txt",
+            "a" * 64,
+            "sha256:" + "a" * 64,
+            "b" * 40,
+            "/tmp/w4 ownership record.txt",
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence), \
+                    self.assertRaisesRegex(ValueError, "cannot be only a URL, checksum, or path"):
+                self.adopt(ownership_evidence=evidence)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recovery_adoptions").fetchone()[0],
+                         0)
 
     def test_adoption_rejects_conflicting_worktree_owner(self):
         self.add_adoption_owner()
@@ -1008,7 +1136,13 @@ class RecoveryTests(unittest.TestCase):
         self.add_adoption_owner()
         self.adopt()
         with self.assertRaisesRegex(ValueError, "reused with different content"):
-            self.adopt(decision="a different decision")
+            self.adopt(decision="a different but explicit operator decision")
+        with self.assertRaisesRegex(ValueError, "reused with different content"):
+            self.adopt(evidence_reference="operator-handoff:W4-2026-10-19T10:00Z")
+        with self.assertRaisesRegex(ValueError, "reused with different content"):
+            self.adopt(ownership_evidence=(
+                "A different substantive statement claiming this checkout belongs to the "
+                "owner task, but not the immutable excerpt that was originally recorded."))
         with self.assertRaisesRegex(ValueError, "reused with different content"):
             self.adopt(branch="another-branch")
         self.assertEqual(self.adopt()["alreadyRecorded"], True)
@@ -1100,7 +1234,9 @@ class RecoveryTests(unittest.TestCase):
              "adopt-ownership", "--help"],
             cwd=self.root, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--evidence", result.stdout)
+        self.assertIn("--evidence-reference", result.stdout)
+        self.assertIn("--ownership-evidence", result.stdout)
+        self.assertNotIn("--evidence ", result.stdout)
         self.assertIn("--owner-task", result.stdout)
         self.assertFalse((fleet_root / "data" / "fleet.sqlite").exists())
 

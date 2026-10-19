@@ -281,7 +281,9 @@ def cmd_adopt_ownership(args):
                                      turn=args.turn, owned_worktree=args.owned_worktree,
                                      branch=args.branch, head=args.head,
                                      worktree_sha256=args.worktree_sha256,
-                                     decision=args.decision, evidence=args.evidence,
+                                     decision=args.decision,
+                                     evidence_reference=args.evidence_reference,
+                                     ownership_evidence=args.ownership_evidence,
                                      note=args.note))
     except Exception as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
@@ -416,8 +418,10 @@ def main(argv=None):
     p.add_argument("--head", required=True, help="full HEAD commit SHA")
     p.add_argument("--worktree-sha256", required=True)
     p.add_argument("--decision", required=True, help="explicit operator ownership decision")
-    p.add_argument("--evidence", required=True,
-                   help="external ownership evidence excerpt or reference")
+    p.add_argument("--evidence-reference", required=True,
+                   help="locator (URL, path, message ID, or record ID) for the source to inspect")
+    p.add_argument("--ownership-evidence", required=True,
+                   help="substantive ownership excerpt/statement; a URL or checksum alone is rejected")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_adopt_ownership)
     p = sub.add_parser("reconcile-recovery",

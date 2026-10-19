@@ -44,15 +44,22 @@
   bin/fleet adopt-ownership --id ADOPTION_ID --owner-task OWNER_TASK_ID --worker SESSION_ID \
     --failed-task FAILED_TASK_ID --turn TURN_ID --owned-worktree OWNED_WORKTREE \
     --branch BRANCH --head FULL_COMMIT_SHA --worktree-sha256 DIGEST \
-    --decision 'explicit ownership decision' --evidence 'external excerpt or reference' --note '...'
+    --decision 'explicit ownership decision' \
+    --evidence-reference 'URL, path, message ID, or record ID to inspect' \
+    --ownership-evidence 'quoted ownership excerpt or substantive statement' --note '...'
   bin/fleet recover-opencode ... --adoption-id ADOPTION_ID
   ```
   Adoption requires a finished owner task on the same session and native CWD, the canonical
-  checkout, branch, full HEAD SHA, current digest, an explicit decision, and substantive external
-  evidence. Adoption alone never queues or dispatches a task, starts a turn, rehomes a session,
-  or authorizes a successor, and it never rewrites task/event/turn history. Authorization and
-  dispatch revalidate the same adoption row and pinned snapshot; a missing record or any checkout
-  change fails closed. Reusing an adoption ID with altered content is rejected.
+  checkout, branch, full HEAD SHA, current digest, an explicit decision, a distinct evidence
+  reference, and substantive ownership evidence. The reference is only a locator: the operator
+  must inspect and verify the referenced source before adopting. A URL, checksum, or path alone
+  is not substantive evidence and is rejected; quote the ownership statement in
+  `--ownership-evidence` and put the locator in `--evidence-reference`. Adoption alone never
+  queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor, and
+  it never rewrites task/event/turn history. Authorization and dispatch revalidate the same
+  adoption row and pinned snapshot; a missing record or any checkout change fails closed.
+  Reusing an adoption ID with an altered reference, evidence excerpt, decision, or any other
+  field is rejected; an exact replay remains idempotent across restart.
   Enqueue only the new task, linked to both the failed task and returned recovery ID:
   `{"id":"NEW_TASK_ID","previousTaskId":"FAILED_TASK_ID","recoveryId":"RECOVERY_ID","rootAuthorized":true,"message":"..."}`.
   Fleet prepends the recorded owned checkout and branch to every recovery turn's prompt,

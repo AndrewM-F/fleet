@@ -35,9 +35,48 @@ CREATE TABLE IF NOT EXISTS recovery_adoptions (
   failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
   cwd TEXT NOT NULL, owned_worktree TEXT NOT NULL,
   branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
-  decision TEXT NOT NULL, evidence TEXT NOT NULL, note TEXT NOT NULL,
+  decision TEXT NOT NULL, evidence_reference TEXT NOT NULL,
+  ownership_evidence TEXT NOT NULL, note TEXT NOT NULL,
   created REAL NOT NULL);
 """
+_RECOVERY_ADOPTIONS_COLUMNS = (
+    "id", "owner_task_id", "owner_sid", "failed_sid", "failed_turn", "failed_task_id",
+    "cwd", "owned_worktree", "branch", "head", "worktree_sha256", "decision",
+    "evidence_reference", "ownership_evidence", "note", "created")
+
+
+def _upgrade_recovery_adoptions(db):
+    """Preserve legacy adoption rows while adding the locator/evidence split.
+
+    The first local adoption schema stored one ``evidence`` string. A legacy value is
+    kept as ``ownership_evidence`` and its reference is left empty, so consumption
+    fails closed until an operator records a new adoption through the stricter path.
+    """
+    columns = [row[1] for row in db.execute("PRAGMA table_info(recovery_adoptions)")]
+    if ({"evidence_reference", "ownership_evidence"} <= set(columns)
+            or "evidence" not in columns):
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        legacy = [dict(zip(columns, row)) for row in db.execute(
+            "SELECT * FROM recovery_adoptions").fetchall()]
+        db.execute("ALTER TABLE recovery_adoptions RENAME TO recovery_adoptions_legacy")
+        db.execute(_RECOVERY_ADOPTIONS_TABLE)
+        for row in legacy:
+            values = {name: row.get(name, "") for name in _RECOVERY_ADOPTIONS_COLUMNS
+                      if name not in {"evidence_reference", "ownership_evidence"}}
+            values["evidence_reference"] = ""
+            values["ownership_evidence"] = row.get("evidence", "")
+            db.execute(
+                f"INSERT INTO recovery_adoptions ({','.join(_RECOVERY_ADOPTIONS_COLUMNS)}) "
+                f"VALUES ({','.join('?' * len(_RECOVERY_ADOPTIONS_COLUMNS))})",
+                tuple(values[name] for name in _RECOVERY_ADOPTIONS_COLUMNS))
+        db.execute("DROP TABLE recovery_adoptions_legacy")
+    except Exception:
+        db.rollback()
+        raise
+    else:
+        db.commit()
 
 
 def _retire_legacy_recoveries(db):
@@ -95,6 +134,7 @@ def database(path=None):
     """)
     db.executescript(_RECOVERIES_TABLE)
     db.executescript(_RECOVERY_ADOPTIONS_TABLE)
+    _upgrade_recovery_adoptions(db)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}
     if "ownership_task_id" not in recovery_columns:

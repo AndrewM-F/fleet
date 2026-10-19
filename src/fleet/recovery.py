@@ -14,10 +14,19 @@ from .store import emit
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEAD = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+# A bare URL, a bare Git/SHA checksum, or a bare filesystem path is a locator, not
+# substantive ownership evidence. The locator belongs in evidence_reference.
+_LOCATOR_ONLY = re.compile(
+    r"^(?:"
+    r"[a-z][a-z0-9+.-]*://\S+"                         # URL
+    r"|(?:sha(?:1|256):)?[0-9a-f]{40}(?:[0-9a-f]{24})?"  # SHA-1 or SHA-256
+    r"|(?:~?/|\.{1,2}/|[A-Za-z]:[\\/]).*"               # filesystem path
+    r")$", re.I)
 # Fields that make an ownership adoption immutable and comparable on replay.
 _ADOPTION_FIELDS = ("id", "owner_task_id", "owner_sid", "failed_sid", "failed_turn",
                     "failed_task_id", "cwd", "owned_worktree", "branch", "head",
-                    "worktree_sha256", "decision", "evidence", "note")
+                    "worktree_sha256", "decision", "evidence_reference",
+                    "ownership_evidence", "note")
 # Recovery statuses that still reserve a worker, worktree, cwd, or failed turn.
 ACTIVE_STATUSES = ("preparing", "authorized", "claimed")
 # Terminal statuses that keep the audit record but release every reservation.
@@ -172,9 +181,44 @@ def _verify_pointer_identity(session_id, failed_task_id, turn, cwd):
         raise ValueError("Adoption failed turn identity differs from the current managed turn")
 
 
+def _evidence_reference(value):
+    """Normalize the locator for the external ownership record.
+
+    A reference identifies where the operator should look; it is deliberately not
+    accepted as proof by itself. The operator must inspect and verify that source.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Adoption requires an external evidence reference locator")
+    text = value.strip()
+    if "\n" in text or "\r" in text:
+        raise ValueError("Adoption evidence reference must be a single locator")
+    return text
+
+
+def _substantive_ownership_evidence(value, reference):
+    """Require an excerpt/statement, not merely a URL, checksum, or path locator."""
+    if not isinstance(value, str):
+        raise ValueError(
+            "Adoption requires a substantive external ownership evidence excerpt or statement")
+    text = value.strip()
+    if len(text) < 24:
+        raise ValueError(
+            "Adoption requires a substantive external ownership evidence excerpt or statement")
+    if _LOCATOR_ONLY.fullmatch(text):
+        raise ValueError(
+            "Ownership evidence cannot be only a URL, checksum, or path; put the locator in "
+            "evidence_reference and quote the ownership statement in ownership_evidence")
+    if text == reference:
+        raise ValueError("Ownership evidence must be distinct from the evidence reference")
+    if not re.search(r"[A-Za-z]", text) or not re.search(r"\s", text):
+        raise ValueError(
+            "Adoption requires a substantive external ownership evidence excerpt or statement")
+    return text
+
+
 def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_id, turn,
-                    owned_worktree, branch, head, worktree_sha256, decision, evidence,
-                    note):
+                    owned_worktree, branch, head, worktree_sha256, decision,
+                    evidence_reference, ownership_evidence, note):
     """Append immutable ownership evidence for a recovery whose owner task predates the
     exact worktree/branch message convention.
 
@@ -182,6 +226,10 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
     and checkout, so that path/branch never appears in historical text. This records the
     verified structured ownership facts instead of rewriting the owner task, event, or
     turn history.
+
+    ``evidence_reference`` is only a locator for the operator to inspect. ``ownership_evidence``
+    is the substantive excerpt/statement; a URL or checksum alone never qualifies. The operator
+    remains responsible for inspecting and verifying the referenced source.
 
     Adoption is evidence only. It never queues or dispatches a task, starts a model turn,
     changes/rehomes a session, or authorizes a successor by itself. Replaying an identical
@@ -192,10 +240,8 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
         raise ValueError("Adoption identifiers and note must be non-empty strings")
     if not isinstance(decision, str) or not decision.strip():
         raise ValueError("Adoption requires an explicit operator decision")
-    # An external excerpt/reference is the operator's evidence that this checkout and
-    # branch belong to the owner task; a token or placeholder is not substantive.
-    if not isinstance(evidence, str) or len(evidence.strip()) < 16:
-        raise ValueError("Adoption requires a substantive external ownership evidence reference")
+    reference = _evidence_reference(evidence_reference)
+    ownership_evidence = _substantive_ownership_evidence(ownership_evidence, reference)
     if not _SHA256.fullmatch(worktree_sha256 or ""):
         raise ValueError("worktree_sha256 must be a lowercase SHA-256 digest")
     if not _HEAD.fullmatch(head or ""):
@@ -220,7 +266,8 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
               "failed_turn": turn, "failed_task_id": failed_task_id, "cwd": cwd,
               "owned_worktree": worktree, "branch": branch, "head": head,
               "worktree_sha256": worktree_sha256, "decision": decision.strip(),
-              "evidence": evidence.strip(), "note": note}
+              "evidence_reference": reference, "ownership_evidence": ownership_evidence,
+              "note": note}
     # Immutability is checked before live state so a reused ID with altered content
     # is always rejected as such, never masked by a later checkout check.
     existing = adoption_record(db, adoption_id)
@@ -263,11 +310,12 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
     try:
         db.execute("""INSERT INTO recovery_adoptions
             (id,owner_task_id,owner_sid,failed_sid,failed_turn,failed_task_id,cwd,
-             owned_worktree,branch,head,worktree_sha256,decision,evidence,note,created)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             owned_worktree,branch,head,worktree_sha256,decision,evidence_reference,
+             ownership_evidence,note,created)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                    (adoption_id, owner_task_id, session_id, session_id, turn, failed_task_id,
                     cwd, worktree, branch, head, worktree_sha256, decision.strip(),
-                    evidence.strip(), note, now))
+                    reference, ownership_evidence, note, now))
         db.execute("INSERT INTO events(kind,body,created) VALUES (?,?,?)",
                    ("recovery_ownership_adopted", json.dumps(values), now))
         db.commit()
@@ -296,6 +344,12 @@ def _validate_adoption(db, record, adoption_id):
             ("head", "head"), ("worktree_sha256", "worktree_sha256")):
         if adoption[adoption_field] != record[record_field]:
             raise ValueError(f"Recovery adoption no longer matches the recorded {record_field}")
+    # Revalidate the evidence split on every consumption. This keeps legacy rows that
+    # lack a reference, or rows whose "evidence" is only a locator/checksum, fail closed.
+    if not isinstance(adoption.get("decision"), str) or not adoption["decision"].strip():
+        raise ValueError("Recovery adoption record has no operator decision")
+    reference = _evidence_reference(adoption.get("evidence_reference"))
+    _substantive_ownership_evidence(adoption.get("ownership_evidence"), reference)
     return adoption
 
 

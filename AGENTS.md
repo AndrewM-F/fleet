@@ -40,12 +40,17 @@ command prints JSON on stdout and exits non-zero on failure.
   When the original owner task predates the exact worktree/branch convention (for example, it
   instructed the worker to create them), `bin/fleet adopt-ownership --id ID --owner-task TASK
   --worker SID --failed-task TASK --turn TURN --owned-worktree PATH --branch BRANCH --head SHA
-  --worktree-sha256 DIGEST --decision "..." --evidence "REF" --note "..."` appends immutable
-  ownership evidence, and `recover-opencode --adoption-id ID` consumes it instead of free text.
-  Adoption alone never queues or dispatches a task, starts a turn, rehomes a session, or authorizes
-  a successor, and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
+  --worktree-sha256 DIGEST --decision "..." --evidence-reference "LOCATOR"
+  --ownership-evidence "EXCERPT/STATEMENT" --note "..."` appends immutable ownership evidence,
+  and `recover-opencode --adoption-id ID` consumes it instead of free text. `--evidence-reference`
+  is only a locator (URL, path, message ID, or record ID) that the operator must inspect and
+  verify; it is not proof by itself. `--ownership-evidence` must be the substantive ownership
+  excerpt or statement, not the same locator and not a bare URL, checksum, or path. Adoption alone
+  never queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor,
+  and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
   authorization and dispatch revalidate the same record and fail closed if it is missing or the
-  checkout changed. An adoption ID reused with any altered field is rejected.
+  checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
+  or any other field is rejected; an exact replay remains idempotent across restart.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one
