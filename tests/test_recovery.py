@@ -163,6 +163,85 @@ class RecoveryTests(unittest.TestCase):
             "SELECT count(*) FROM recoveries WHERE status IN ('authorized','claimed')"
         ).fetchone()[0], 2)
 
+    def test_legacy_recovery_migration_rolls_back_as_one_transaction(self):
+        legacy_path = self.root / "interrupted-legacy-fleet.sqlite"
+        old = sqlite3.connect(legacy_path)
+        old.executescript("""
+        CREATE TABLE recoveries (
+          id TEXT PRIMARY KEY, failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL,
+          failed_task_id TEXT NOT NULL, owner_sid TEXT NOT NULL, owner_task_id TEXT NOT NULL,
+          cwd TEXT NOT NULL, branch TEXT NOT NULL, head TEXT NOT NULL,
+          worktree_sha256 TEXT NOT NULL, note TEXT NOT NULL, status TEXT NOT NULL,
+          created REAL NOT NULL, updated REAL NOT NULL,
+          UNIQUE(failed_sid, failed_turn), UNIQUE(owner_task_id));
+        CREATE INDEX preserved_legacy_lookup ON recoveries(status, owner_sid);
+        INSERT INTO recoveries VALUES ('r1','s1','t1','f1','s1','o1','/w1','b1','h1','d1','n1','authorized',1,1);
+        INSERT INTO recoveries VALUES ('r2','s2','t2','f2','s2','o2','/w2','b2','h2','d2','n2','claimed',2,2);
+        INSERT INTO recoveries VALUES ('r3','s3','t3','f3','s3','o3','/w3','b3','h3','d3','n3','completed',3,3);
+        """)
+        old.close()
+
+        real = sqlite3.connect(legacy_path)
+
+        class InterruptCopy:
+            def execute(self, sql, *args):
+                if sql.startswith("INSERT INTO recoveries ("):
+                    raise RuntimeError("simulated process interruption during row copy")
+                return real.execute(sql, *args)
+
+            def executescript(self, sql):
+                return real.executescript(sql)
+
+            def commit(self):
+                return real.commit()
+
+            def rollback(self):
+                return real.rollback()
+
+        with self.assertRaisesRegex(RuntimeError, "simulated process interruption"):
+            store._retire_legacy_recoveries(InterruptCopy())
+        real.close()
+
+        # Reopening after an interrupted migration must see the complete old schema,
+        # rows, and indexes, not a new empty table shadowing recoveries_legacy.
+        check = sqlite3.connect(legacy_path)
+        self.assertIsNotNone(check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recoveries'"
+        ).fetchone())
+        self.assertIsNone(check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recoveries_legacy'"
+        ).fetchone())
+        self.assertEqual(check.execute("SELECT id,status FROM recoveries ORDER BY id").fetchall(),
+                         [("r1", "authorized"), ("r2", "claimed"), ("r3", "completed")])
+        self.assertIsNotNone(check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='preserved_legacy_lookup'"
+        ).fetchone())
+        check.close()
+
+        migrated = store.database(legacy_path)
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.execute(
+            "SELECT id,failed_sid,failed_turn,failed_task_id,owner_sid,owner_task_id,cwd,branch,head,"
+            "worktree_sha256,note,status,created,updated,ownership_task_id,owned_worktree "
+            "FROM recoveries ORDER BY id"
+        ).fetchall(), [
+            ("r1", "s1", "t1", "f1", "s1", "o1", "/w1", "b1", "h1", "d1", "n1",
+             "authorized", 1.0, 1.0, "", ""),
+            ("r2", "s2", "t2", "f2", "s2", "o2", "/w2", "b2", "h2", "d2", "n2",
+             "claimed", 2.0, 2.0, "", ""),
+            ("r3", "s3", "t3", "f3", "s3", "o3", "/w3", "b3", "h3", "d3", "n3",
+             "completed", 3.0, 3.0, "", ""),
+        ])
+        indexes = {row[0] for row in migrated.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='recoveries'")}
+        self.assertTrue({"recoveries_active_owner", "recoveries_active_cwd",
+                         "recoveries_active_worktree", "recoveries_active_turn"} <= indexes)
+        self.assertIsNotNone(recovery.recovery_for_successor(migrated, "o1", ("authorized",)))
+        self.assertIsNotNone(recovery.recovery_for_successor(migrated, "o2", ("claimed",)))
+        self.assertIsNone(migrated.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recoveries_legacy'"
+        ).fetchone())
+
     def add_second_failed_task(self):
         second_turn = "turn_failed_2"
         self.prepare_failure(self.other_sid, "failed-task-2", second_turn, self.other_native_cwd)
@@ -658,6 +737,107 @@ class RecoveryTests(unittest.TestCase):
                          .fetchone()[0], "reconciled")
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "cancelled")
+
+    def test_reconcile_refuses_dispatching_successor_with_old_failed_pointer(self):
+        self.authorize()
+        self.enqueue_successor()
+        attempted = []
+
+        def sender(*args, **kwargs):
+            # dispatch has committed the successor claim, but opencode.send has
+            # not yet replaced current.json; it still points at the old failed turn.
+            with self.assertRaisesRegex(ValueError, "dispatching"):
+                recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+            attempted.append(kwargs["task_id"])
+
+        dispatch.dispatch(self.db, {self.sid: self.slot},
+                          {self.sid: {"state": "error", "cwd": str(self.native_cwd)}}, sender)
+        self.assertEqual(attempted, [self.successor])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "sent")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+
+    def test_reconcile_requires_exact_successor_turn_and_present_pointer(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain()
+        with self.assertRaisesRegex(ValueError, "successor task"):
+            recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        (paths.OPENCODE / self.sid / "current.json").unlink()
+        with self.assertRaisesRegex(ValueError, "pointer is unavailable"):
+            recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+
+    def test_reconcile_cannot_pass_while_session_dispatch_lock_is_held(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain()
+        lock_path = paths.OPENCODE / self.sid / "dispatch.lock"
+        child_code = (
+            "import fcntl,sys; f=open(sys.argv[1], 'a'); "
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX); print('locked', flush=True); "
+            "sys.stdin.read()"
+        )
+        child = subprocess.Popen([sys.executable, "-c", child_code, str(lock_path)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "locked")
+            with self.assertRaisesRegex(RuntimeError, "already has a Fleet turn"):
+                recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        finally:
+            child.stdin.close()
+            child.wait(timeout=5)
+            child.stdout.close()
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+
+    def _assert_cancelled_successor_reconciles(self, state):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state=state)
+        self.write_successor_turn("stopped")
+        with patch.object(paths, "all_slots", return_value=[self.slot]), \
+                patch.object(opencode, "cancel", return_value={"stopped": True}):
+            cancelled = ops.cancel(self.db, self.successor,
+                                   "operator stopped the recovery successor")
+        self.assertEqual(cancelled["taskId"], self.successor)
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+
+        result = recovery.reconcile_successor(
+            self.db, self.successor, "verified stopped successor")
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "reconciled")
+
+    def test_cancelled_sent_successor_reconciles_after_confirmed_cleanup(self):
+        self._assert_cancelled_successor_reconciles("sent")
+
+    def test_cancelled_running_successor_reconciles_after_confirmed_cleanup(self):
+        self._assert_cancelled_successor_reconciles("running")
+
+    def test_cancelled_successor_with_unconfirmed_cleanup_keeps_reservation(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="cancelled")
+        self.write_successor_turn("stopped")
+        state_path = (paths.OPENCODE / self.sid / "turns" / "turn_successor" / "state.json")
+        native_state = json.loads(state_path.read_text())
+        native_state["cleanup"] = "uncertain"
+        state_path.write_text(json.dumps(native_state))
+        with self.assertRaisesRegex(ValueError, "cleanup is not confirmed"):
+            recovery.reconcile_successor(self.db, self.successor, "cleanup was not verified")
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "cancelled")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
 
     def test_retirement_keeps_other_reservations_and_gates_intact(self):
         self.authorize()

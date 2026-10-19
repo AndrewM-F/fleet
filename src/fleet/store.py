@@ -35,17 +35,30 @@ def _retire_legacy_recoveries(db):
     or reconciled. Replace it with an active-only unique index (created below). The failed
     task and turn rows themselves are copied verbatim and are never replayed.
     """
-    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='recoveries'").fetchone()
-    if not row or not row[0] or "UNIQUE(failed_sid, failed_turn)" not in row[0]:
-        return
-    present = [item[1] for item in db.execute("PRAGMA table_info(recoveries)")]
-    copy = [name for name in _RECOVERIES_COLUMNS if name in present]
-    db.execute("ALTER TABLE recoveries RENAME TO recoveries_legacy")
-    db.executescript(_RECOVERIES_TABLE)
-    db.execute(f"INSERT INTO recoveries ({','.join(copy)}) "
-               f"SELECT {','.join(copy)} FROM recoveries_legacy")
-    db.execute("DROP TABLE recoveries_legacy")
-    db.commit()
+    # DDL, row copy, and old-table removal must be one SQLite transaction. In
+    # particular, executescript() commits an open transaction before running;
+    # using it between RENAME and INSERT can leave an empty new table shadowing
+    # the legacy rows after a crash.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='recoveries'"
+        ).fetchone()
+        if not row or not row[0] or "UNIQUE(failed_sid, failed_turn)" not in row[0]:
+            db.commit()
+            return
+        present = [item[1] for item in db.execute("PRAGMA table_info(recoveries)")]
+        copy = [name for name in _RECOVERIES_COLUMNS if name in present]
+        db.execute("ALTER TABLE recoveries RENAME TO recoveries_legacy")
+        db.execute(_RECOVERIES_TABLE)
+        db.execute(f"INSERT INTO recoveries ({','.join(copy)}) "
+                   f"SELECT {','.join(copy)} FROM recoveries_legacy")
+        db.execute("DROP TABLE recoveries_legacy")
+    except Exception:
+        db.rollback()
+        raise
+    else:
+        db.commit()
 
 
 def database(path=None):

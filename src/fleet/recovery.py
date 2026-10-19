@@ -488,7 +488,7 @@ def _slot_for_session(session_id):
     return slots[0]
 
 
-def verify_stopped_native_execution(slot):
+def verify_stopped_native_execution(slot, successor_task_id):
     """Prove the worker cannot still be running a managed native turn.
 
     Returns ``(True, evidence)`` only when the current managed turn is terminal,
@@ -498,12 +498,14 @@ def verify_stopped_native_execution(slot):
     sid = slot.get("sessionId")
     pointer = opencode.session_dir(sid) / "current.json"
     if not pointer.exists():
-        return True, "no managed native turn"
+        return False, "managed native turn pointer is unavailable for successor task"
     try:
         launch = json.loads(pointer.read_text())
     except (OSError, ValueError):
         return False, "managed native turn pointer is unreadable"
     turn = launch.get("turn")
+    if launch.get("sessionId") != sid or launch.get("taskId") != successor_task_id:
+        return False, "managed native turn pointer does not identify the successor task"
     state_path = opencode.turn_dir(sid, turn) / "state.json" if isinstance(turn, str) else None
     if state_path is None or not state_path.exists():
         return False, "managed native turn state is unavailable"
@@ -511,6 +513,8 @@ def verify_stopped_native_execution(slot):
         current = json.loads(state_path.read_text())
     except (OSError, ValueError):
         return False, "managed native turn state is unreadable"
+    if (current.get("sessionId") != sid or current.get("taskId") != successor_task_id):
+        return False, "managed native turn state does not identify the successor task"
     identity = current.get("processIdentity")
     if isinstance(identity, dict):
         if opencode.identity_matches(identity):
@@ -563,12 +567,24 @@ def reconcile_successor(db, task_id, note, slot=None, outcome="cancelled"):
     if not record:
         return None
     slot = _slot_for_session(record["owner_sid"]) if slot is None else slot
-    stopped, evidence = verify_stopped_native_execution(slot)
-    if not stopped:
-        raise ValueError("Native execution is not verified stopped: " + evidence)
-    db.commit()
-    db.execute("BEGIN IMMEDIATE")
+    # Synchronize with OpenCode send/turn ownership, then inspect the task state
+    # inside a serialized DB transaction. Dispatching means the durable claim
+    # exists but the new turn may not have written current.json yet; an old
+    # terminal pointer must never authorize retiring that live claim.
+    session_lock = opencode._session_lock(opencode.session_dir(record["owner_sid"]))
     try:
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT state,sid FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task[1] != record["owner_sid"]:
+            raise ValueError("Recovery successor task ownership changed; inspect before reconciling")
+        if task[0] == "dispatching":
+            raise ValueError("Recovery successor is dispatching; wait for restart/uncertainty boundary")
+        if task[0] not in {"sent", "running", "uncertain", "cancelled"}:
+            raise ValueError(f"Recovery successor is {task[0]}; stopped proof is not applicable")
+        stopped, evidence = verify_stopped_native_execution(slot, task_id)
+        if not stopped:
+            raise ValueError("Native execution is not verified stopped: " + evidence)
         changed = db.execute("UPDATE recoveries SET status=?,updated=? "
                              "WHERE owner_task_id=? AND status='claimed'",
                              (RECONCILED, time.time(), task_id))
@@ -584,5 +600,8 @@ def reconcile_successor(db, task_id, note, slot=None, outcome="cancelled"):
     except Exception:
         db.rollback()
         raise
+    finally:
+        fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+        session_lock.close()
     return {"taskId": task_id, "recoveryId": record["id"], "reconciled": True,
             "evidence": evidence}
