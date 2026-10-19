@@ -29,7 +29,7 @@
 - **OpenCode error turn** — do not resolve it with the Claude-only `--worker` command or reset its
   task. Verify the failed task and cleanup receipt, then snapshot the separate owned checkout with
   `bin/fleet recovery-snapshot --cwd OWNED_WORKTREE`. The configured native session CWD stays as-is.
-  Authorize a successor only when a finished task for the same worker records the branch and exact
+  Authorize a successor only when a finished task for the same worker proves the branch and exact
   owned-worktree path:
   ```sh
   bin/fleet recover-opencode --worker SESSION_ID --task FAILED_TASK_ID --turn TURN_ID \
@@ -37,6 +37,22 @@
     --owned-worktree OWNED_WORKTREE --branch BRANCH --head COMMIT_SHA \
     --worktree-sha256 DIGEST --note 'verified cleanup and preserved partial work'
   ```
+  If the original owner task legitimately instructed the worker to create that branch and
+  worktree, its historical message may not contain them. Record append-only ownership evidence
+  once, then consume it instead of free text:
+  ```sh
+  bin/fleet adopt-ownership --id ADOPTION_ID --owner-task OWNER_TASK_ID --worker SESSION_ID \
+    --failed-task FAILED_TASK_ID --turn TURN_ID --owned-worktree OWNED_WORKTREE \
+    --branch BRANCH --head FULL_COMMIT_SHA --worktree-sha256 DIGEST \
+    --decision 'explicit ownership decision' --evidence 'external excerpt or reference' --note '...'
+  bin/fleet recover-opencode ... --adoption-id ADOPTION_ID
+  ```
+  Adoption requires a finished owner task on the same session and native CWD, the canonical
+  checkout, branch, full HEAD SHA, current digest, an explicit decision, and substantive external
+  evidence. Adoption alone never queues or dispatches a task, starts a turn, rehomes a session,
+  or authorizes a successor, and it never rewrites task/event/turn history. Authorization and
+  dispatch revalidate the same adoption row and pinned snapshot; a missing record or any checkout
+  change fails closed. Reusing an adoption ID with altered content is rejected.
   Enqueue only the new task, linked to both the failed task and returned recovery ID:
   `{"id":"NEW_TASK_ID","previousTaskId":"FAILED_TASK_ID","recoveryId":"RECOVERY_ID","rootAuthorized":true,"message":"..."}`.
   Fleet prepends the recorded owned checkout and branch to every recovery turn's prompt,

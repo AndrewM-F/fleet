@@ -15,7 +15,9 @@
   and recovery reservations are untouched.
 - **OpenCode recovery**: a failed task and native turn stay terminal. An operator may authorize one
   new task only after the exact error/cleanup receipt, free session lock, and an explicit owned
-  worktree path recorded by a finished task for the same session. Native session CWD stays
+  worktree path proven by a finished task for the same session (its free-text message, or an
+  immutable `recovery_adoptions` record when history predates the exact path/branch convention).
+  Native session CWD stays
   unchanged; branch/head and tracked/untracked fingerprint are checked at authorization, dispatch,
   and send. SQLite records the immutable failure-to-successor/worktree owner link before it becomes
   dispatchable. Dispatch atomically consumes that authorization with the successor's
@@ -27,7 +29,9 @@
   through verified stopped-native-execution reconciliation (`reconcile-recovery`, or `resolve
   --task` for an `uncertain` successor), never by a bare state flip. Retirement/reconciliation touch
   only that recovery row and task: pause, `dispatchEnabled`, capacity/quota gates, and unrelated
-  recovery reservations stay in force.
+  recovery reservations stay in force. Ownership adoption is append-only evidence: it never queues,
+  dispatches, starts a turn, or authorizes a successor by itself, never rewrites task/event/turn
+  history, and authorization plus dispatch revalidate the same adoption row and pinned snapshot.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.

@@ -17,14 +17,27 @@ CREATE TABLE IF NOT EXISTS recoveries (
   ownership_task_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL,
   owned_worktree TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
+  adoption_id TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL, status TEXT NOT NULL,
   created REAL NOT NULL, updated REAL NOT NULL,
   UNIQUE(owner_task_id));
 """
 _RECOVERIES_COLUMNS = ("id", "failed_sid", "failed_turn", "failed_task_id", "owner_sid",
                        "owner_task_id", "ownership_task_id", "cwd", "owned_worktree",
-                       "branch", "head", "worktree_sha256", "note", "status",
+                       "branch", "head", "worktree_sha256", "adoption_id", "note", "status",
                        "created", "updated")
+# Append-only ownership evidence for recoveries whose original owner task predates the
+# exact worktree/branch convention. Rows are never updated or deleted.
+_RECOVERY_ADOPTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS recovery_adoptions (
+  id TEXT PRIMARY KEY,
+  owner_task_id TEXT NOT NULL, owner_sid TEXT NOT NULL,
+  failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
+  cwd TEXT NOT NULL, owned_worktree TEXT NOT NULL,
+  branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
+  decision TEXT NOT NULL, evidence TEXT NOT NULL, note TEXT NOT NULL,
+  created REAL NOT NULL);
+"""
 
 
 def _retire_legacy_recoveries(db):
@@ -81,12 +94,15 @@ def database(path=None):
       created REAL NOT NULL, updated REAL NOT NULL);
     """)
     db.executescript(_RECOVERIES_TABLE)
+    db.executescript(_RECOVERY_ADOPTIONS_TABLE)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}
     if "ownership_task_id" not in recovery_columns:
         db.execute("ALTER TABLE recoveries ADD COLUMN ownership_task_id TEXT NOT NULL DEFAULT ''")
     if "owned_worktree" not in recovery_columns:
         db.execute("ALTER TABLE recoveries ADD COLUMN owned_worktree TEXT NOT NULL DEFAULT ''")
+    if "adoption_id" not in recovery_columns:
+        db.execute("ALTER TABLE recoveries ADD COLUMN adoption_id TEXT NOT NULL DEFAULT ''")
     db.executescript("""
     CREATE UNIQUE INDEX IF NOT EXISTS recoveries_active_owner
       ON recoveries(owner_sid) WHERE status IN ('preparing','authorized','claimed');

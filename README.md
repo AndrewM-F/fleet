@@ -30,6 +30,7 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet resolve …` / `cancel TASK` | operator decisions, abort a running turn |
 | `bin/fleet hold TASK` / `release TASK` | durably pause/resume one unstarted queued task (never a cancel; never clears pause/dispatch/profile/recovery holds) |
 | `bin/fleet recovery-snapshot --cwd PATH` / `recover-opencode …` | fingerprint a checkout and authorize one verified OpenCode successor |
+| `bin/fleet adopt-ownership …` / `recover-opencode --adoption-id ID` | append immutable ownership evidence for an owner task whose history predates the exact checkout/branch convention |
 | `bin/fleet reconcile-recovery --task ID` | release a claimed recovery reservation after verified native stop |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |

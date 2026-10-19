@@ -13,6 +13,11 @@ from . import opencode, paths
 from .store import emit
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_HEAD = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+# Fields that make an ownership adoption immutable and comparable on replay.
+_ADOPTION_FIELDS = ("id", "owner_task_id", "owner_sid", "failed_sid", "failed_turn",
+                    "failed_task_id", "cwd", "owned_worktree", "branch", "head",
+                    "worktree_sha256", "decision", "evidence", "note")
 # Recovery statuses that still reserve a worker, worktree, cwd, or failed turn.
 ACTIVE_STATUSES = ("preparing", "authorized", "claimed")
 # Terminal statuses that keep the audit record but release every reservation.
@@ -138,8 +143,160 @@ def _queue_has_task(task_id):
 def _same_record(row, values):
     fields = ("id", "failed_sid", "failed_turn", "failed_task_id", "owner_sid",
               "owner_task_id", "ownership_task_id", "cwd", "owned_worktree",
-              "branch", "head", "worktree_sha256", "note")
+              "branch", "head", "worktree_sha256", "adoption_id", "note")
     return all(row[key] == values[key] for key in fields)
+
+
+def adoption_record(db, adoption_id):
+    """The immutable ownership-adoption row, if this store records one."""
+    try:
+        row = db.execute("SELECT * FROM recovery_adoptions WHERE id=?",
+                         (adoption_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    names = [item[0] for item in
+             db.execute("SELECT * FROM recovery_adoptions LIMIT 0").description]
+    return dict(zip(names, row))
+
+
+def _verify_pointer_identity(session_id, failed_task_id, turn, cwd):
+    pointer = opencode.session_dir(session_id) / "current.json"
+    if not pointer.is_file():
+        raise ValueError("No managed OpenCode turn exists for this worker")
+    launch = json.loads(pointer.read_text())
+    if (launch.get("turn") != turn or launch.get("taskId") != failed_task_id
+            or launch.get("sessionId") != session_id or launch.get("cwd") != cwd
+            or launch.get("model") != opencode.MODEL):
+        raise ValueError("Adoption failed turn identity differs from the current managed turn")
+
+
+def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_id, turn,
+                    owned_worktree, branch, head, worktree_sha256, decision, evidence,
+                    note):
+    """Append immutable ownership evidence for a recovery whose owner task predates the
+    exact worktree/branch message convention.
+
+    The original W4 task may legitimately have instructed the worker to create its branch
+    and checkout, so that path/branch never appears in historical text. This records the
+    verified structured ownership facts instead of rewriting the owner task, event, or
+    turn history.
+
+    Adoption is evidence only. It never queues or dispatches a task, starts a model turn,
+    changes/rehomes a session, or authorizes a successor by itself. Replaying an identical
+    request is idempotent; reusing the same adoption ID with any altered field is rejected.
+    """
+    identities = (adoption_id, owner_task_id, session_id, failed_task_id, turn, note)
+    if any(not isinstance(value, str) or not value.strip() for value in identities):
+        raise ValueError("Adoption identifiers and note must be non-empty strings")
+    if not isinstance(decision, str) or not decision.strip():
+        raise ValueError("Adoption requires an explicit operator decision")
+    # An external excerpt/reference is the operator's evidence that this checkout and
+    # branch belong to the owner task; a token or placeholder is not substantive.
+    if not isinstance(evidence, str) or len(evidence.strip()) < 16:
+        raise ValueError("Adoption requires a substantive external ownership evidence reference")
+    if not _SHA256.fullmatch(worktree_sha256 or ""):
+        raise ValueError("worktree_sha256 must be a lowercase SHA-256 digest")
+    if not _HEAD.fullmatch(head or ""):
+        raise ValueError("Adoption head must be the full commit SHA, not an abbreviation")
+    if not isinstance(branch, str) or not branch.strip():
+        raise ValueError("Adoption branch must be a non-empty string")
+    branch = branch.strip()
+
+    all_slots = paths.opencode_slots()
+    slots = [s for s in all_slots if s.get("sessionId") == session_id]
+    if len(slots) != 1:
+        raise ValueError("Adoption target must be one existing OpenCode slot")
+    cwd = _resolve(slots[0].get("cwd") or "")
+    if not cwd:
+        raise ValueError("Adoption target has no configured native cwd")
+    configured = _configured_cwds(all_slots)
+    if configured.get(session_id) != cwd:
+        raise ValueError("Adoption native CWD does not match the configured session roster")
+    worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
+    values = {"id": adoption_id, "owner_task_id": owner_task_id,
+              "owner_sid": session_id, "failed_sid": session_id,
+              "failed_turn": turn, "failed_task_id": failed_task_id, "cwd": cwd,
+              "owned_worktree": worktree, "branch": branch, "head": head,
+              "worktree_sha256": worktree_sha256, "decision": decision.strip(),
+              "evidence": evidence.strip(), "note": note}
+    # Immutability is checked before live state so a reused ID with altered content
+    # is always rejected as such, never masked by a later checkout check.
+    existing = adoption_record(db, adoption_id)
+    if existing:
+        if any(existing[field] != values[field] for field in _ADOPTION_FIELDS):
+            raise ValueError("Adoption ID was reused with different content")
+        return {"adoptionId": adoption_id, "alreadyRecorded": True}
+
+    # The inviter must be an existing finished owner task on the same session and CWD.
+    _task_message(db, owner_task_id, session_id, cwd)
+    _validate_recovery_mapping(db, {"ownership_task_id": owner_task_id,
+                                    "owner_sid": session_id, "cwd": cwd}, configured)
+    failed = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?",
+                        (failed_task_id,)).fetchone()
+    if not failed or failed[0] != session_id or _resolve(failed[1]) != cwd:
+        raise ValueError("Failed task ownership/cwd does not match the configured worker")
+    if failed[2] != "finished":
+        raise ValueError("Failed task must remain terminal before adoption")
+    _verify_pointer_identity(session_id, failed_task_id, turn, cwd)
+
+    snapshot = worktree_snapshot(worktree)
+    if (snapshot["branch"] != branch or snapshot["head"] != head
+            or snapshot["worktreeSha256"] != worktree_sha256):
+        raise ValueError("Adoption branch/head/worktree fingerprint does not match the checkout")
+    conflict = _active_task_for_worktree(db, worktree, configured,
+                                         exclude_task_id=failed_task_id)
+    if conflict:
+        raise ValueError(f"Another active task owns the explicit worktree: {conflict}")
+    queued = _queued_task_for_worktree(db, worktree, configured,
+                                       exclude_task_id=failed_task_id)
+    if queued:
+        raise ValueError(f"Another queued task owns the explicit worktree: {queued}")
+    other = db.execute("SELECT id FROM recoveries WHERE owned_worktree=? AND status IN "
+                       "('preparing','authorized','claimed') LIMIT 1",
+                       (worktree,)).fetchone()
+    if other:
+        raise ValueError(f"Another recovery owns the explicit worktree: {other[0]}")
+
+    now = time.time()
+    try:
+        db.execute("""INSERT INTO recovery_adoptions
+            (id,owner_task_id,owner_sid,failed_sid,failed_turn,failed_task_id,cwd,
+             owned_worktree,branch,head,worktree_sha256,decision,evidence,note,created)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (adoption_id, owner_task_id, session_id, session_id, turn, failed_task_id,
+                    cwd, worktree, branch, head, worktree_sha256, decision.strip(),
+                    evidence.strip(), note, now))
+        db.execute("INSERT INTO events(kind,body,created) VALUES (?,?,?)",
+                   ("recovery_ownership_adopted", json.dumps(values), now))
+        db.commit()
+    except sqlite3.IntegrityError:
+        # A concurrent identical request may have won the primary-key race.
+        db.rollback()
+        existing = adoption_record(db, adoption_id)
+        if existing and not any(existing[field] != values[field]
+                                for field in _ADOPTION_FIELDS):
+            return {"adoptionId": adoption_id, "alreadyRecorded": True}
+        raise ValueError("Adoption ID was reused with different content")
+    return {"adoptionId": adoption_id, "alreadyRecorded": False}
+
+
+def _validate_adoption(db, record, adoption_id):
+    adoption = adoption_record(db, adoption_id)
+    if not adoption:
+        raise ValueError("Recovery adoption record is missing")
+    # Adoption rows name the inviter as ``owner_task_id``; recovery rows keep that
+    # task in ``ownership_task_id`` and use ``owner_task_id`` for the successor.
+    for adoption_field, record_field in (
+            ("owner_task_id", "ownership_task_id"), ("owner_sid", "owner_sid"),
+            ("failed_sid", "failed_sid"), ("failed_turn", "failed_turn"),
+            ("failed_task_id", "failed_task_id"), ("cwd", "cwd"),
+            ("owned_worktree", "owned_worktree"), ("branch", "branch"),
+            ("head", "head"), ("worktree_sha256", "worktree_sha256")):
+        if adoption[adoption_field] != record[record_field]:
+            raise ValueError(f"Recovery adoption no longer matches the recorded {record_field}")
+    return adoption
 
 
 def _task_message(db, task_id, session_id, cwd):
@@ -256,12 +413,21 @@ def validate_owned_worktree(db, record, slots=None):
     configured = _configured_cwds(slots)
     _validate_recovery_mapping(db, record, configured)
     message = _task_message(db, record["ownership_task_id"], record["owner_sid"], record["cwd"])
-    if worktree not in message or record["branch"] not in message:
+    adoption = None
+    adoption_id = record.get("adoption_id") or ""
+    if adoption_id:
+        # The immutable adoption, not free text, is the provenance for this checkout.
+        adoption = _validate_adoption(db, record, adoption_id)
+    elif worktree not in message or record["branch"] not in message:
         raise ValueError("Owned worktree/branch no longer match the owner task record")
     snapshot = worktree_snapshot(worktree)
     if (snapshot["branch"] != record["branch"] or snapshot["head"] != record["head"]
             or snapshot["worktreeSha256"] != record["worktree_sha256"]):
         raise ValueError("Owned worktree changed after recovery authorization")
+    if adoption and (snapshot["branch"] != adoption["branch"]
+                     or snapshot["head"] != adoption["head"]
+                     or snapshot["worktreeSha256"] != adoption["worktree_sha256"]):
+        raise ValueError("Owned worktree changed after ownership adoption")
     conflict = _active_task_for_worktree(db, worktree, configured, record["owner_task_id"])
     if conflict:
         raise ValueError(f"Another active task owns the explicit worktree: {conflict}")
@@ -304,16 +470,22 @@ def task_recovery_conflict(db, task, sid, slots=None):
 
 def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
                        successor_task_id, ownership_task_id, owned_worktree,
-                       branch, head, worktree_sha256, note):
+                       branch, head, worktree_sha256, note, adoption_id=""):
     """Record a verified error-turn handoff without editing task or turn history.
 
     The successor remains root-queued work. This operation only creates its
     single-use authorization; it never starts a model turn or changes a hold.
+
+    Provenance is the owner task's free-text message unless ``adoption_id`` names an
+    immutable ownership adoption, which substitutes structured evidence for history
+    that predates the exact worktree/branch convention.
     """
     fields = (session_id, failed_task_id, turn, recovery_id, successor_task_id,
               ownership_task_id, owned_worktree, branch, head, note)
     if any(not isinstance(value, str) or not value.strip() for value in fields):
         raise ValueError("Recovery identifiers, branch, and note must be non-empty strings")
+    if not isinstance(adoption_id, str):
+        raise ValueError("adoption_id must be a string")
     if not _SHA256.fullmatch(worktree_sha256 or ""):
         raise ValueError("worktree_sha256 must be a lowercase SHA-256 digest")
     all_slots = paths.opencode_slots()
@@ -334,7 +506,15 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
                                     "owner_sid": session_id, "cwd": cwd}, configured)
     worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
     ownership_message = _task_message(db, ownership_task_id, session_id, cwd)
-    if worktree not in ownership_message or branch not in ownership_message:
+    adoption = None
+    if adoption_id:
+        adoption = _validate_adoption(
+            db, {"ownership_task_id": ownership_task_id, "owner_sid": session_id,
+                 "failed_sid": session_id, "failed_turn": turn,
+                 "failed_task_id": failed_task_id, "cwd": cwd,
+                 "owned_worktree": worktree, "branch": branch, "head": head,
+                 "worktree_sha256": worktree_sha256}, adoption_id)
+    elif worktree not in ownership_message or branch not in ownership_message:
         raise ValueError("Owned worktree and branch are not recorded by this worker's owner task")
     task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (failed_task_id,)).fetchone()
     if not task or task[0] != session_id or str(Path(task[1]).resolve()) != cwd:
@@ -352,7 +532,8 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
               "failed_task_id": failed_task_id, "owner_sid": session_id,
               "owner_task_id": successor_task_id, "ownership_task_id": ownership_task_id,
               "cwd": cwd, "owned_worktree": worktree, "branch": branch,
-              "head": head, "worktree_sha256": worktree_sha256, "note": note}
+              "head": head, "worktree_sha256": worktree_sha256,
+              "adoption_id": adoption_id, "note": note}
 
     # Hold both queue and session locks while establishing the recovery record.
     # Dispatch cannot see an authorized record until the verified old lock is released.
@@ -390,17 +571,22 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
         if (snapshot["branch"] != branch or snapshot["head"] != head
                 or snapshot["worktreeSha256"] != worktree_sha256):
             raise ValueError("Worktree branch/head/partial-state fingerprint changed")
+        if adoption is not None and (
+                snapshot["branch"] != adoption["branch"]
+                or snapshot["head"] != adoption["head"]
+                or snapshot["worktreeSha256"] != adoption["worktree_sha256"]):
+            raise ValueError("Worktree changed after ownership adoption")
 
         if not existing:
             now = time.time()
             db.execute("""INSERT INTO recoveries
                 (id,failed_sid,failed_turn,failed_task_id,owner_sid,owner_task_id,
                  ownership_task_id,cwd,owned_worktree,branch,head,worktree_sha256,
-                 note,status,created,updated)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?)""",
+                 adoption_id,note,status,created,updated)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?)""",
                        (recovery_id, session_id, turn, failed_task_id, session_id,
                         successor_task_id, ownership_task_id, cwd, worktree, branch, head,
-                        worktree_sha256, note, now, now))
+                        worktree_sha256, adoption_id, note, now, now))
             db.execute("INSERT INTO events(kind,body,created) VALUES (?,?,?)",
                        ("opencode_recovery_prepared", json.dumps(values), now))
             db.commit()

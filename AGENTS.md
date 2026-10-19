@@ -37,6 +37,15 @@ command prints JSON on stdout and exits non-zero on failure.
   successor may then be authorized for the same failed turn. A dispatched (`claimed`) successor's
   reservation is released only by `bin/fleet reconcile-recovery --task ID --note "..."` (or
   `resolve --task` for an `uncertain` successor) after native execution is verified stopped.
+  When the original owner task predates the exact worktree/branch convention (for example, it
+  instructed the worker to create them), `bin/fleet adopt-ownership --id ID --owner-task TASK
+  --worker SID --failed-task TASK --turn TURN --owned-worktree PATH --branch BRANCH --head SHA
+  --worktree-sha256 DIGEST --decision "..." --evidence "REF" --note "..."` appends immutable
+  ownership evidence, and `recover-opencode --adoption-id ID` consumes it instead of free text.
+  Adoption alone never queues or dispatches a task, starts a turn, rehomes a session, or authorizes
+  a successor, and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
+  authorization and dispatch revalidate the same record and fail closed if it is missing or the
+  checkout changed. An adoption ID reused with any altered field is rejected.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one

@@ -269,7 +269,23 @@ def cmd_recover_opencode(args):
                                     ownership_task_id=args.ownership_task,
                                     owned_worktree=args.owned_worktree,
                                     branch=args.branch, head=args.head,
-                                    worktree_sha256=args.worktree_sha256, note=args.note))
+                                    worktree_sha256=args.worktree_sha256, note=args.note,
+                                    adoption_id=args.adoption_id))
+
+
+def cmd_adopt_ownership(args):
+    try:
+        out(recovery.adopt_ownership(database(), adoption_id=args.adoption_id,
+                                     owner_task_id=args.owner_task,
+                                     session_id=args.worker, failed_task_id=args.failed_task,
+                                     turn=args.turn, owned_worktree=args.owned_worktree,
+                                     branch=args.branch, head=args.head,
+                                     worktree_sha256=args.worktree_sha256,
+                                     decision=args.decision, evidence=args.evidence,
+                                     note=args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
 
 
 def cmd_reconcile_recovery(args):
@@ -383,8 +399,27 @@ def main(argv=None):
     p.add_argument("--branch", required=True)
     p.add_argument("--head", required=True)
     p.add_argument("--worktree-sha256", required=True)
+    p.add_argument("--adoption-id", default="",
+                   help="immutable ownership adoption recorded by adopt-ownership")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
+    p = sub.add_parser("adopt-ownership",
+                       help="append immutable ownership evidence for a recovery successor")
+    p.add_argument("--id", dest="adoption_id", required=True)
+    p.add_argument("--owner-task", required=True,
+                   help="existing finished task that owns the checkout and branch")
+    p.add_argument("--worker", required=True)
+    p.add_argument("--failed-task", required=True, help="failed terminal task ID")
+    p.add_argument("--turn", required=True, help="failed managed OpenCode turn UUID")
+    p.add_argument("--owned-worktree", required=True)
+    p.add_argument("--branch", required=True)
+    p.add_argument("--head", required=True, help="full HEAD commit SHA")
+    p.add_argument("--worktree-sha256", required=True)
+    p.add_argument("--decision", required=True, help="explicit operator ownership decision")
+    p.add_argument("--evidence", required=True,
+                   help="external ownership evidence excerpt or reference")
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_adopt_ownership)
     p = sub.add_parser("reconcile-recovery",
                        help="release a claimed recovery reservation after a verified native stop")
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")

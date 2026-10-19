@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import control, dispatch, manager, opencode, ops, paths, recovery, store  # noqa: E402
+from fleet import control, dispatch, holds, manager, opencode, ops, paths, recovery, store  # noqa: E402
 
 
 class RecoveryTests(unittest.TestCase):
@@ -859,6 +859,268 @@ class RecoveryTests(unittest.TestCase):
                          .fetchone()[0], "authorized")     # unrelated reservation untouched
         self.assertTrue(paths.PAUSE.exists())              # global pause untouched
         self.assertFalse(self.slot["dispatchEnabled"])     # per-worker hold untouched
+
+    # --- explicit append-only ownership adoption ---------------------------
+    def add_adoption_owner(self, task_id="owner-w4", sid=None, cwd=None, state="finished",
+                           message="create the isolated worktree and branch for W4, then continue"):
+        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                        (task_id, sid or self.sid, str(cwd or self.native_cwd),
+                         json.dumps({"message": message, "sessionId": sid or self.sid,
+                                     "rootAuthorized": True}), state, 0))
+        self.db.commit()
+        return task_id
+
+    def adoption_inputs(self, **overrides):
+        snap = recovery.worktree_snapshot(self.cwd)
+        values = {"adoption_id": "adoption-1", "owner_task_id": "owner-w4",
+                  "session_id": self.sid, "failed_task_id": self.failed_task,
+                  "turn": self.turn, "owned_worktree": str(self.cwd.resolve()),
+                  "branch": snap["branch"], "head": snap["head"],
+                  "worktree_sha256": snap["worktreeSha256"],
+                  "decision": "adopt the W4 checkout as this worker's explicitly owned worktree",
+                  "evidence": ("W4 handoff: branch repair was created in this isolated checkout; "
+                               "see operator note 2026-10-18"),
+                  "note": "ownership adoption for the original W4 task"}
+        values.update(overrides)
+        return values
+
+    def adopt(self, **overrides):
+        return recovery.adopt_ownership(self.db, **self.adoption_inputs(**overrides))
+
+    def authorize_adopted(self, **overrides):
+        values = {"ownership_task_id": "owner-w4", "adoption_id": "adoption-1"}
+        values.update(overrides)
+        return self.authorize(**values)
+
+    def test_adoption_authorizes_history_without_exact_path_or_branch(self):
+        self.add_adoption_owner()
+        with self.assertRaisesRegex(ValueError, "not recorded by this worker's owner task"):
+            self.authorize(ownership_task_id="owner-w4")
+        adopted = self.adopt()
+        self.assertEqual(adopted, {"adoptionId": "adoption-1", "alreadyRecorded": False})
+        result = self.authorize_adopted()
+        self.assertEqual(result["status"], "authorized")
+        snap = self.adoption_inputs()
+        row = self.db.execute("SELECT adoption_id,ownership_task_id,branch,head,worktree_sha256 "
+                              "FROM recoveries WHERE id='recovery-1'").fetchone()
+        self.assertEqual(row, ("adoption-1", "owner-w4", snap["branch"], snap["head"],
+                               snap["worktree_sha256"]))
+        # The original W4 owner message is untouched.
+        self.assertEqual(self.db.execute("SELECT body FROM tasks WHERE id='owner-w4'")
+                         .fetchone()[0],
+                         json.dumps({"message": "create the isolated worktree and branch for W4, "
+                                               "then continue", "sessionId": self.sid,
+                                     "rootAuthorized": True}))
+
+    def test_adoption_alone_creates_no_task_turn_or_authorization(self):
+        owner = self.add_adoption_owner()
+        tasks_before = self.db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        owner_before = self.db.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone()
+        events_before = self.db.execute("SELECT count(*) FROM events").fetchone()[0]
+        turns = sorted((paths.OPENCODE / self.sid / "turns").iterdir())
+        pointer_before = (paths.OPENCODE / self.sid / "current.json").read_bytes()
+        self.adopt()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks").fetchone()[0],
+                         tasks_before)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone(),
+                         owner_before)
+        self.assertEqual(sorted((paths.OPENCODE / self.sid / "turns").iterdir()), turns)
+        self.assertEqual((paths.OPENCODE / self.sid / "current.json").read_bytes(),
+                         pointer_before)
+        self.assertFalse(self.queue.exists())
+        kinds = [row[0] for row in self.db.execute(
+            "SELECT kind FROM events ORDER BY id").fetchall()][events_before:]
+        self.assertEqual(kinds, ["recovery_ownership_adopted"])
+
+    def test_adoption_is_idempotent_across_restart(self):
+        self.add_adoption_owner()
+        self.assertEqual(self.adopt()["alreadyRecorded"], False)
+        self.assertEqual(self.adopt(), {"adoptionId": "adoption-1", "alreadyRecorded": True})
+        reopened = store.database(self.db_path)
+        self.addCleanup(reopened.close)
+        self.assertIsNotNone(recovery.adoption_record(reopened, "adoption-1"))
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]):
+            first = recovery.authorize_opencode(reopened, **self.inputs(
+                ownership_task_id="owner-w4", adoption_id="adoption-1"))
+            second = recovery.authorize_opencode(reopened, **self.inputs(
+                ownership_task_id="owner-w4", adoption_id="adoption-1"))
+        self.assertEqual(first["alreadyRecorded"], False)
+        self.assertEqual(second, {"recoveryId": "recovery-1", "status": "authorized",
+                                  "alreadyRecorded": True})
+
+    def test_adoption_rejects_wrong_owner_identity(self):
+        self.add_adoption_owner(state="queued")
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            self.adopt()
+        self.add_adoption_owner(task_id="owner-other-session", sid=self.other_sid)
+        with self.assertRaisesRegex(ValueError, "same native worker and CWD"):
+            self.adopt(owner_task_id="owner-other-session")
+        with self.assertRaisesRegex(ValueError, "same native worker and CWD"):
+            self.adopt(owner_task_id="missing-owner")
+
+    def test_adoption_rejects_native_cwd_and_session_mismatch(self):
+        self.add_adoption_owner(cwd=self.other_native_cwd)
+        with self.assertRaisesRegex(ValueError, "same native worker and CWD"):
+            self.adopt()
+        self.add_adoption_owner(task_id="owner-good")
+        with self.assertRaisesRegex(ValueError, "one existing OpenCode slot"):
+            self.adopt(session_id="ses_missing")
+
+    def test_adoption_rejects_noncanonical_branch_head_or_digest(self):
+        self.add_adoption_owner()
+        (self.cwd / "sub").mkdir()
+        with self.assertRaisesRegex(ValueError, "root of its owned Git worktree"):
+            self.adopt(owned_worktree=str(self.cwd / "sub"))
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            self.adopt(branch="not-the-owner-branch")
+        with self.assertRaisesRegex(ValueError, "full commit SHA"):
+            self.adopt(head=recovery.worktree_snapshot(self.cwd)["head"][:12])
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            self.adopt(head="0" * 40)
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            self.adopt(worktree_sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "lowercase SHA-256"):
+            self.adopt(worktree_sha256="not-a-digest")
+
+    def test_adoption_rejects_missing_or_invalid_evidence(self):
+        self.add_adoption_owner()
+        with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
+            self.adopt(evidence="")
+        with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
+            self.adopt(evidence="too short")
+        with self.assertRaisesRegex(ValueError, "substantive external ownership evidence"):
+            self.adopt(evidence=12345)
+        with self.assertRaisesRegex(ValueError, "explicit operator decision"):
+            self.adopt(decision="  ")
+
+    def test_adoption_rejects_conflicting_worktree_owner(self):
+        self.add_adoption_owner()
+        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                        ("conflict", self.sid, str(self.cwd),
+                         json.dumps({"message": "conflict", "sessionId": self.sid}),
+                         "queued", 2))
+        self.db.commit()
+        with self.assertRaisesRegex(ValueError, "Another active task owns"):
+            self.adopt()
+
+    def test_adoption_reused_id_with_altered_content_is_rejected(self):
+        self.add_adoption_owner()
+        self.adopt()
+        with self.assertRaisesRegex(ValueError, "reused with different content"):
+            self.adopt(decision="a different decision")
+        with self.assertRaisesRegex(ValueError, "reused with different content"):
+            self.adopt(branch="another-branch")
+        self.assertEqual(self.adopt()["alreadyRecorded"], True)
+
+    def test_authorization_requires_matching_adoption(self):
+        self.add_adoption_owner()
+        self.adopt()
+        with self.assertRaisesRegex(ValueError, "adoption record is missing"):
+            self.authorize_adopted(adoption_id="missing-adoption")
+        with self.assertRaisesRegex(ValueError, "recorded ownership_task_id"):
+            self.authorize_adopted(ownership_task_id=self.failed_task)
+        with self.assertRaisesRegex(ValueError, "recorded head"):
+            self.authorize_adopted(head="0" * 40)
+        with self.assertRaisesRegex(ValueError, "recorded worktree_sha256"):
+            self.authorize_adopted(worktree_sha256="0" * 64)
+
+    def test_changed_snapshot_after_adoption_blocks_authorization(self):
+        self.add_adoption_owner()
+        self.adopt()
+        snap = self.adoption_inputs()
+        (self.cwd / "late.txt").write_text("changed after adoption\n")
+        pinned = {key: snap[key] for key in ("branch", "head", "worktree_sha256")}
+        with self.assertRaisesRegex(ValueError, "fingerprint changed"):
+            self.authorize_adopted(**pinned)
+        changed = recovery.worktree_snapshot(self.cwd)
+        with self.assertRaisesRegex(ValueError, "recorded worktree_sha256"):
+            self.authorize_adopted(worktree_sha256=changed["worktreeSha256"])
+
+    def test_changed_snapshot_before_dispatch_fails_closed(self):
+        self.add_adoption_owner()
+        self.adopt()
+        self.authorize_adopted()
+        self.enqueue_successor()
+        (self.cwd / "late.txt").write_text("changed before dispatch\n")
+        calls = []
+        dispatch.dispatch(self.db, {self.sid: self.slot},
+                          {self.sid: {"state": "error", "cwd": str(self.native_cwd)}},
+                          lambda *args, **kwargs: calls.append(args))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "queued")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "authorized")
+        errors = [json.loads(row[0]).get("error") for row in self.db.execute(
+            "SELECT body FROM events WHERE kind='needs_attention'").fetchall()]
+        self.assertTrue(any("changed after" in str(error) for error in errors), errors)
+
+    def test_dispatch_fails_closed_when_adoption_record_disappears(self):
+        self.add_adoption_owner()
+        self.adopt()
+        self.authorize_adopted()
+        self.enqueue_successor()
+        self.db.execute("DELETE FROM recovery_adoptions WHERE id='adoption-1'")
+        self.db.commit()
+        calls = []
+        dispatch.dispatch(self.db, {self.sid: self.slot},
+                          {self.sid: {"state": "error", "cwd": str(self.native_cwd)}},
+                          lambda *args, **kwargs: calls.append(args))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "queued")
+        errors = [json.loads(row[0]).get("error") for row in self.db.execute(
+            "SELECT body FROM events WHERE kind='needs_attention'").fetchall()]
+        self.assertTrue(any("adoption record is missing" in str(error) for error in errors))
+
+    def test_held_adopted_successor_stays_queued(self):
+        self.add_adoption_owner()
+        self.adopt()
+        self.authorize_adopted()
+        self.enqueue_successor()
+        holds.hold(self.db, self.successor, "hold the adopted successor")
+        calls = []
+        dispatch.dispatch(self.db, {self.sid: self.slot},
+                          {self.sid: {"state": "error", "cwd": str(self.native_cwd)}},
+                          lambda *args, **kwargs: calls.append(args))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "queued")
+        self.assertTrue(holds.is_held(self.db, self.successor))
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "authorized")
+
+    def test_adopt_ownership_cli_is_registered(self):
+        fleet_root = self.root / "adopt-cli-root"
+        env = dict(os.environ, FLEET_ROOT=str(fleet_root))
+        env.pop("FLEET_CONFIG", None)
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "bin" / "fleet"),
+             "adopt-ownership", "--help"],
+            cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--evidence", result.stdout)
+        self.assertIn("--owner-task", result.stdout)
+        self.assertFalse((fleet_root / "data" / "fleet.sqlite").exists())
+
+    def test_cancelling_adopted_successor_retires_only_the_authorization(self):
+        owner = self.add_adoption_owner()
+        self.adopt()
+        self.authorize_adopted()
+        self.enqueue_successor()
+        adoption_before = self.db.execute("SELECT * FROM recovery_adoptions "
+                                          "WHERE id='adoption-1'").fetchone()
+        owner_before = self.db.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone()
+        result = ops.cancel(self.db, self.successor, "cancel the adopted successor")
+        self.assertEqual(result["action"], {"queuedCancelled": True,
+                                            "recoveryRetired": ["recovery-1"]})
+        self.assertEqual(self.db.execute("SELECT * FROM recovery_adoptions "
+                                         "WHERE id='adoption-1'").fetchone(), adoption_before)
+        self.assertEqual(self.db.execute("SELECT * FROM tasks WHERE id=?", (owner,)).fetchone(),
+                         owner_before)
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "retired")
 
 
 if __name__ == "__main__":
