@@ -1,0 +1,720 @@
+"""Durable, single-use recovery authorization for a verified failed OpenCode turn."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import time
+
+from . import opencode, paths
+from .store import emit
+from .util import atomic
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Recovery statuses that still reserve a worker, worktree, cwd, or failed turn.
+ACTIVE_STATUSES = ("preparing", "authorized", "claimed")
+# Terminal statuses that keep the audit record but release every reservation.
+RETIRED = "retired"        # queued successor cancelled before it ever started
+RECONCILED = "reconciled"  # claimed successor released after verified native stop
+TERMINAL_STATUSES = ("completed", RETIRED, RECONCILED)
+
+_RATE_LIMIT = re.compile(
+    r"rate.?limit|too many requests|\b(?:403|429)\b|forbidden|access denied|permission denied|"
+    r"quota exceeded|resource exhausted|insufficient credits|billing|"
+    r"account.{0,20}(?:disabled|restricted)",
+    re.I,
+)
+
+
+def worktree_snapshot(cwd):
+    """Fingerprint branch/head, Git status/diff, and non-ignored untracked files.
+
+    This is not a backup or a complete partial-state capture: ignored contents,
+    nested repository/submodule contents and intermediate index blobs are omitted.
+    """
+    root = Path(cwd).expanduser().resolve(strict=True)
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(root), *args], check=True,
+                              stdin=subprocess.DEVNULL, capture_output=True).stdout
+
+    top_level = Path(git("rev-parse", "--show-toplevel").decode().strip()).resolve()
+    if top_level != root:
+        raise ValueError("Recovery path must be the root of its owned Git worktree")
+    branch = git("branch", "--show-current").decode().strip()
+    head = git("rev-parse", "HEAD").decode().strip()
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    diff = git("diff", "--binary", "HEAD", "--")
+    digest = hashlib.sha256()
+    for label, value in ((b"branch", branch.encode()), (b"head", head.encode()),
+                         (b"status", status), (b"diff", diff)):
+        digest.update(label + b"\0" + value + b"\0")
+    for entry in status.split(b"\0"):
+        if entry.startswith(b"?? "):
+            raw_path = entry[3:]
+            path = root / os.fsdecode(raw_path)
+            digest.update(b"untracked\0" + raw_path + b"\0")
+            if path.is_symlink():
+                digest.update(b"symlink\0" + os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                digest.update(b"file\0")
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            else:
+                digest.update(b"other\0")
+            digest.update(b"\0")
+    if not branch:
+        raise ValueError("Recovery requires a named Git branch, not detached HEAD")
+    return {"branch": branch, "head": head, "worktreeSha256": digest.hexdigest()}
+
+
+def verify_failed_turn(session_id, failed_task_id, turn, cwd, model):
+    """Verify the durable pointer, error receipt, cleanup and any recorded PID identity."""
+    pointer = opencode.session_dir(session_id) / "current.json"
+    if not pointer.is_file():
+        raise ValueError("No managed OpenCode turn exists for this worker")
+    launch = json.loads(pointer.read_text())
+    if (launch.get("turn") != turn or launch.get("taskId") != failed_task_id
+            or launch.get("sessionId") != session_id or launch.get("cwd") != cwd
+            or launch.get("model") != model):
+        raise ValueError("Current OpenCode turn identity differs from the requested failed task")
+    state_path = opencode.turn_dir(session_id, turn) / "state.json"
+    result_path = opencode.turn_dir(session_id, turn) / "result.json"
+    if not state_path.is_file() or not result_path.is_file():
+        raise ValueError("OpenCode turn state/result is incomplete; recovery is blocked")
+    state = json.loads(state_path.read_text())
+    result = json.loads(result_path.read_text())
+    identity = (state.get("turn", turn) == turn
+                and state.get("taskId") == failed_task_id
+                and state.get("sessionId") == session_id and state.get("cwd") == cwd
+                and state.get("model") == model and state.get("state") == "error"
+                and state.get("cleanup") == "confirmed"
+                and isinstance(state.get("finishedAt"), (int, float))
+                and result.get("turn", turn) == turn
+                and result.get("taskId") == failed_task_id
+                and result.get("sessionId") == session_id and result.get("cwd") == cwd
+                and result.get("state") == "error" and result.get("cleanup") == "confirmed"
+                and isinstance(result.get("finishedAt"), (int, float)))
+    if not identity:
+        raise ValueError("OpenCode error result identity or cleanup is not verified")
+    failures = result.get("toolFailures") or []
+    if not isinstance(failures, list):
+        raise ValueError("OpenCode error receipt has an invalid tool-failure list")
+    failure_text = " ".join([str(result.get("error") or ""),
+                             *(str(item.get("error") or "") for item in failures
+                               if isinstance(item, dict))])
+    if _RATE_LIMIT.search(failure_text):
+        raise ValueError("Rate-limit/quota failures cannot be recovered by this operation")
+    process_identity = result.get("managedProcessIdentity")
+    if process_identity is not None:
+        if not isinstance(process_identity, dict) or not process_identity.get("pid") \
+                or not process_identity.get("pgid"):
+            raise ValueError("OpenCode error receipt has an invalid native process identity")
+        if (opencode.identity_matches(process_identity)
+                or opencode._group_exists(process_identity["pgid"])):
+            raise ValueError("OpenCode native process group is still live")
+    return launch, state, result
+
+
+def _queue_lock():
+    Path(paths.QUEUE_LOCK).parent.mkdir(parents=True, exist_ok=True)
+    handle = Path(paths.QUEUE_LOCK).open("a")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _queue_has_task(task_id):
+    if not Path(paths.QUEUE).exists():
+        return False
+    queue = json.loads(Path(paths.QUEUE).read_text())
+    if queue.get("author") != "root" or not isinstance(queue.get("tasks"), list):
+        raise ValueError("Root task queue is invalid; recovery is blocked")
+    return any(task.get("id") == task_id for task in queue["tasks"])
+
+
+def _same_record(row, values):
+    fields = ("id", "failed_sid", "failed_turn", "failed_task_id", "owner_sid",
+              "owner_task_id", "ownership_task_id", "cwd", "owned_worktree",
+              "branch", "head", "worktree_sha256", "note")
+    return all(row[key] == values[key] for key in fields)
+
+
+def _task_message(db, task_id, session_id, cwd):
+    row = db.execute("SELECT sid,cwd,state,body FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not row or row[0] != session_id or str(Path(row[1]).resolve()) != cwd:
+        raise ValueError("Ownership task must belong to the same native worker and CWD")
+    if row[2] != "finished":
+        raise ValueError("Ownership task must be terminal before recovery")
+    try:
+        message = json.loads(row[3]).get("message", "")
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("Ownership task record is invalid") from error
+    if not isinstance(message, str):
+        raise ValueError("Ownership task record has no message")
+    return message
+
+
+def _resolve(value):
+    """Resolve a path for identity comparison; empty values stay empty."""
+    return str(Path(value).expanduser().resolve()) if value else ""
+
+
+def _configured_cwds(slots=None):
+    """Map every configured session to its structured, resolved CWD.
+
+    Accepts a slot list or a ``{sessionId: slot}`` mapping, as produced by
+    ``paths.all_slots()`` and the manager roster. Falls back to the OpenCode
+    roster so recovery callers that already read it stay consistent.
+    """
+    if slots is None:
+        try:
+            slots = paths.opencode_slots()
+        except (FileNotFoundError, ValueError):
+            slots = []
+    if isinstance(slots, dict):
+        slots = slots.values()
+    result = {}
+    for slot in slots or []:
+        sid, cwd = slot.get("sessionId"), slot.get("cwd")
+        if sid and cwd:
+            result[sid] = _resolve(cwd)
+    return result
+
+
+def _claims_worktree(tree, *, cwd=None, sid=None, message="", configured=None):
+    """Does this task claim ``tree`` through structured or supplemental evidence?
+
+    Structured ownership wins: the task's durable ``tasks.cwd`` column and its
+    target session's configured CWD. A path substring in the free-text message is
+    kept only as conservative supplemental evidence, never as the sole basis.
+    """
+    if cwd and _resolve(cwd) == tree:
+        return True
+    if configured and sid and configured.get(sid) == tree:
+        return True
+    return bool(tree and message and tree in message)
+
+
+def _active_task_for_worktree(db, owned_worktree, configured, exclude_task_id=None):
+    tree = _resolve(owned_worktree)
+    rows = db.execute("SELECT id,sid,cwd,body FROM tasks WHERE state IN "
+                      "('queued','dispatching','sent','running','uncertain')").fetchall()
+    for task_id, sid, cwd, body in rows:
+        if task_id == exclude_task_id:
+            continue
+        try:
+            message = json.loads(body).get("message", "")
+        except (TypeError, json.JSONDecodeError):
+            message = ""
+        if not isinstance(message, str):
+            message = ""
+        if _claims_worktree(tree, cwd=cwd, sid=sid, message=message, configured=configured):
+            return task_id
+    return None
+
+
+def _queued_task_for_worktree(db, owned_worktree, configured, exclude_task_id=None):
+    if not Path(paths.QUEUE).exists():
+        return None
+    queue = json.loads(Path(paths.QUEUE).read_text())
+    if queue.get("author") != "root" or not isinstance(queue.get("tasks"), list):
+        raise ValueError("Root task queue is invalid; recovery is blocked")
+    tree = _resolve(owned_worktree)
+    for task in queue["tasks"]:
+        task_id = task.get("id")
+        if task_id == exclude_task_id:
+            continue
+        if not _claims_worktree(tree, sid=task.get("sessionId"),
+                                message=str(task.get("message") or ""),
+                                configured=configured):
+            continue
+        row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row or row[0] in {"queued", "dispatching", "sent", "running", "uncertain"}:
+            return task_id or "unknown"
+    return None
+
+
+def _validate_recovery_mapping(db, record, configured):
+    """Bind the recovery's native CWD/worker to structured task and roster fields."""
+    row = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?",
+                     (record["ownership_task_id"],)).fetchone()
+    if not row or row[0] != record["owner_sid"] or _resolve(row[1]) != _resolve(record["cwd"]):
+        raise ValueError("Recovery native CWD/worker does not match the ownership task")
+    if row[2] != "finished":
+        raise ValueError("Ownership task must be terminal before recovery")
+    expected = configured.get(record["owner_sid"])
+    if expected and expected != _resolve(record["cwd"]):
+        raise ValueError("Recovery native CWD does not match the configured session cwd")
+
+
+def validate_owned_worktree(db, record, slots=None):
+    """Recheck task provenance and exclusivity before dispatching a successor."""
+    worktree = record["owned_worktree"]
+    configured = _configured_cwds(slots)
+    _validate_recovery_mapping(db, record, configured)
+    message = _task_message(db, record["ownership_task_id"], record["owner_sid"], record["cwd"])
+    if worktree not in message or record["branch"] not in message:
+        raise ValueError("Owned worktree/branch no longer match the owner task record")
+    snapshot = worktree_snapshot(worktree)
+    if (snapshot["branch"] != record["branch"] or snapshot["head"] != record["head"]
+            or snapshot["worktreeSha256"] != record["worktree_sha256"]):
+        raise ValueError("Owned worktree changed after recovery authorization")
+    conflict = _active_task_for_worktree(db, worktree, configured, record["owner_task_id"])
+    if conflict:
+        raise ValueError(f"Another active task owns the explicit worktree: {conflict}")
+    conflict = _queued_task_for_worktree(db, worktree, configured, record["owner_task_id"])
+    if conflict and conflict != record["owner_task_id"]:
+        raise ValueError(f"Another queued task owns the explicit worktree: {conflict}")
+    other = db.execute("SELECT id FROM recoveries WHERE owned_worktree=? AND id<>? "
+                       "AND status IN ('preparing','authorized','claimed') LIMIT 1",
+                       (worktree, record["id"])).fetchone()
+    if other:
+        raise ValueError(f"Another recovery owns the explicit worktree: {other[0]}")
+
+
+def task_recovery_conflict(db, task, sid, slots=None):
+    """Return a recovery reserving this session or a worktree the task claims.
+
+    A task claims a worktree through its structured CWD and its target session's
+    configured CWD, not only through a path string in its message.
+    """
+    valid = recovery_for_task(db, task.get("recoveryId"), task.get("id"), sid,
+                              task.get("previousTaskId"),
+                              statuses=("authorized", "claimed", "completed")) \
+        if task.get("recoveryId") else None
+    if valid:
+        return None
+    configured = _configured_cwds(slots)
+    task_cwd = task.get("cwd")
+    message = str(task.get("message") or "")
+    rows = db.execute("SELECT id,owner_sid,owned_worktree,cwd FROM recoveries "
+                      "WHERE status IN ('preparing','authorized','claimed')").fetchall()
+    for recovery_id, owner_sid, worktree, native_cwd in rows:
+        if sid == owner_sid:
+            return recovery_id
+        for reserved in (worktree, native_cwd):
+            if reserved and _claims_worktree(_resolve(reserved), cwd=task_cwd, sid=sid,
+                                             message=message, configured=configured):
+                return recovery_id
+    return None
+
+
+def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
+                       successor_task_id, ownership_task_id, owned_worktree,
+                       branch, head, worktree_sha256, note):
+    """Record a verified error-turn handoff without editing task or turn history.
+
+    The successor remains root-queued work. This operation only creates its
+    single-use authorization; it never starts a model turn or changes a hold.
+    """
+    fields = (session_id, failed_task_id, turn, recovery_id, successor_task_id,
+              ownership_task_id, owned_worktree, branch, head, note)
+    if any(not isinstance(value, str) or not value.strip() for value in fields):
+        raise ValueError("Recovery identifiers, branch, and note must be non-empty strings")
+    if not _SHA256.fullmatch(worktree_sha256 or ""):
+        raise ValueError("worktree_sha256 must be a lowercase SHA-256 digest")
+    all_slots = paths.opencode_slots()
+    slots = [s for s in all_slots if s.get("sessionId") == session_id]
+    if len(slots) != 1:
+        raise ValueError("Recovery target must be one existing OpenCode slot")
+    slot = opencode.verify_slot(slots[0])
+    if not slot.get("dispatchEnabled", False):
+        raise ValueError("OpenCode dispatch is disabled; recovery does not change that hold")
+
+    # Structured ownership: bind the native CWD/worker to the roster and the
+    # ownership task's durable row before trusting any free-text message.
+    configured = _configured_cwds(all_slots)
+    cwd = _resolve(slot["cwd"])
+    if configured.get(session_id) != cwd:
+        raise ValueError("Recovery native CWD does not match the configured session roster")
+    _validate_recovery_mapping(db, {"ownership_task_id": ownership_task_id,
+                                    "owner_sid": session_id, "cwd": cwd}, configured)
+    worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
+    ownership_message = _task_message(db, ownership_task_id, session_id, cwd)
+    if worktree not in ownership_message or branch not in ownership_message:
+        raise ValueError("Owned worktree and branch are not recorded by this worker's owner task")
+    task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (failed_task_id,)).fetchone()
+    if not task or task[0] != session_id or str(Path(task[1]).resolve()) != cwd:
+        raise ValueError("Failed task ownership/cwd does not match the configured worker")
+    if task[2] != "finished":
+        raise ValueError("Failed task must remain terminal before recovery")
+    if db.execute("SELECT 1 FROM tasks WHERE cwd=? AND id<>? AND state IN "
+                  "('queued','dispatching','sent','running','uncertain') LIMIT 1",
+                  (cwd, failed_task_id)).fetchone():
+        raise ValueError("Another task owns this worktree; recovery is blocked")
+    if db.execute("SELECT 1 FROM tasks WHERE id=?", (successor_task_id,)).fetchone():
+        raise ValueError("Successor task ID already exists; choose a new task ID")
+
+    values = {"id": recovery_id, "failed_sid": session_id, "failed_turn": turn,
+              "failed_task_id": failed_task_id, "owner_sid": session_id,
+              "owner_task_id": successor_task_id, "ownership_task_id": ownership_task_id,
+              "cwd": cwd, "owned_worktree": worktree, "branch": branch,
+              "head": head, "worktree_sha256": worktree_sha256, "note": note}
+
+    # Hold both queue and session locks while establishing the recovery record.
+    # Dispatch cannot see an authorized record until the verified old lock is released.
+    session_lock = opencode._session_lock(opencode.session_dir(session_id))
+    queue_lock = None
+    try:
+        queue_lock = _queue_lock()
+        existing = db.execute("SELECT * FROM recoveries WHERE id=?", (recovery_id,)).fetchone()
+        if existing:
+            columns = [column[0] for column in
+                       db.execute("SELECT * FROM recoveries LIMIT 0").description]
+            row = dict(zip(columns, existing))
+            if not _same_record(row, values):
+                raise ValueError("Recovery ID was reused with different content")
+            if row["status"] != "preparing":
+                return {"recoveryId": recovery_id, "status": row["status"], "alreadyRecorded": True}
+        else:
+            if db.execute("SELECT 1 FROM recoveries WHERE failed_sid=? AND failed_turn=? "
+                          "AND status IN ('preparing','authorized','claimed')",
+                          (session_id, turn)).fetchone():
+                raise ValueError("This failed OpenCode turn already has an active recovery record")
+            if _queue_has_task(successor_task_id):
+                raise ValueError("Successor task ID already appears in the root queue")
+
+        active_worktree_task = _active_task_for_worktree(db, worktree, configured, successor_task_id)
+        if active_worktree_task:
+            raise ValueError(f"Another active task owns the explicit worktree: {active_worktree_task}")
+        queued_worktree_task = _queued_task_for_worktree(db, worktree, configured, successor_task_id)
+        if queued_worktree_task:
+            raise ValueError(f"Another queued task owns the explicit worktree: {queued_worktree_task}")
+
+        verify_failed_turn(session_id, failed_task_id, turn, cwd, slot["model"])
+
+        snapshot = worktree_snapshot(worktree)
+        if (snapshot["branch"] != branch or snapshot["head"] != head
+                or snapshot["worktreeSha256"] != worktree_sha256):
+            raise ValueError("Worktree branch/head/partial-state fingerprint changed")
+
+        if not existing:
+            now = time.time()
+            db.execute("""INSERT INTO recoveries
+                (id,failed_sid,failed_turn,failed_task_id,owner_sid,owner_task_id,
+                 ownership_task_id,cwd,owned_worktree,branch,head,worktree_sha256,
+                 note,status,created,updated)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?)""",
+                       (recovery_id, session_id, turn, failed_task_id, session_id,
+                        successor_task_id, ownership_task_id, cwd, worktree, branch, head,
+                        worktree_sha256, note, now, now))
+            db.execute("INSERT INTO events(kind,body,created) VALUES (?,?,?)",
+                       ("opencode_recovery_prepared", json.dumps(values), now))
+            db.commit()
+    except sqlite3.IntegrityError as error:
+        db.rollback()
+        raise ValueError("An active recovery already owns this worker or worktree") from error
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if queue_lock:
+            fcntl.flock(queue_lock.fileno(), fcntl.LOCK_UN)
+            queue_lock.close()
+        fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+        session_lock.close()
+
+    changed = db.execute("UPDATE recoveries SET status='authorized',updated=? "
+                          "WHERE id=? AND status='preparing'",
+                          (time.time(), recovery_id))
+    db.commit()
+    if changed.rowcount == 1:
+        return {"recoveryId": recovery_id, "status": "authorized", "alreadyRecorded": False}
+    row = db.execute("SELECT status FROM recoveries WHERE id=?", (recovery_id,)).fetchone()
+    if row and row[0] == "authorized":
+        return {"recoveryId": recovery_id, "status": row[0], "alreadyRecorded": True}
+    raise ValueError("Recovery record could not be activated; replay the same request to resume")
+
+
+def recovery_for_task(db, recovery_id, task_id, sid, previous_task_id,
+                      statuses=("authorized",)):
+    row = db.execute("SELECT * FROM recoveries WHERE id=?", (recovery_id,)).fetchone()
+    if not row:
+        return None
+    names = [item[0] for item in db.execute("SELECT * FROM recoveries LIMIT 0").description]
+    record = dict(zip(names, row))
+    if (record["status"] not in statuses or record["owner_sid"] != sid
+            or record["owner_task_id"] != task_id
+            or record["failed_task_id"] != previous_task_id):
+        return None
+    return record
+
+
+def claim_recovery(db, recovery_id, task_id, sid, previous_task_id):
+    record = recovery_for_task(db, recovery_id, task_id, sid, previous_task_id)
+    if not record:
+        return None
+    changed = db.execute("UPDATE recoveries SET status='claimed',updated=? "
+                         "WHERE id=? AND status='authorized'",
+                         (time.time(), recovery_id))
+    if changed.rowcount != 1:
+        return None
+    record["status"] = "claimed"
+    return record
+
+
+# --- retirement / reconciliation -------------------------------------------
+
+_TERMINAL_NATIVE = {"done", "completed", "stopped", "error", "blocked"}
+
+
+def recovery_for_successor(db, task_id, statuses):
+    """The durable recovery row owning this successor task, if any."""
+    placeholders = ",".join("?" * len(statuses))
+    try:
+        row = db.execute(f"SELECT * FROM recoveries WHERE owner_task_id=? "
+                         f"AND status IN ({placeholders})", (task_id, *statuses)).fetchone()
+    except sqlite3.OperationalError:
+        # A legacy store without a recoveries table has no successor reservations.
+        return None
+    if not row:
+        return None
+    names = [item[0] for item in db.execute("SELECT * FROM recoveries LIMIT 0").description]
+    return dict(zip(names, row))
+
+
+def claimed_successor(db, task_id):
+    """The claimed (dispatched) recovery owning this successor task, if any."""
+    return recovery_for_successor(db, task_id, ("claimed",))
+
+
+def _slot_for_session(session_id):
+    slots = [s for s in paths.opencode_slots() if s.get("sessionId") == session_id]
+    if len(slots) != 1:
+        raise ValueError("Recovery target must be one existing OpenCode slot")
+    return slots[0]
+
+
+def verify_stopped_native_execution(slot, successor_task_id):
+    """Prove the worker cannot still be running a managed native turn.
+
+    Returns ``(True, evidence)`` only when the current managed turn is terminal,
+    its recorded process identity/group is gone, and its cleanup was confirmed.
+    Otherwise ``(False, reason)``. Never starts, resumes, or replays a turn.
+    """
+    sid = slot.get("sessionId")
+    pointer = opencode.session_dir(sid) / "current.json"
+    if not pointer.exists():
+        return False, "managed native turn pointer is unavailable for successor task"
+    try:
+        launch = json.loads(pointer.read_text())
+    except (OSError, ValueError):
+        return False, "managed native turn pointer is unreadable"
+    turn = launch.get("turn")
+    if launch.get("sessionId") != sid or launch.get("taskId") != successor_task_id:
+        return False, "managed native turn pointer does not identify the successor task"
+    state_path = opencode.turn_dir(sid, turn) / "state.json" if isinstance(turn, str) else None
+    if state_path is None or not state_path.exists():
+        return False, "managed native turn state is unavailable"
+    try:
+        current = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return False, "managed native turn state is unreadable"
+    if (current.get("sessionId") != sid or current.get("taskId") != successor_task_id):
+        return False, "managed native turn state does not identify the successor task"
+    identity = current.get("processIdentity")
+    if isinstance(identity, dict):
+        if opencode.identity_matches(identity):
+            return False, "managed native process is still live"
+        pgid = identity.get("pgid")
+        if pgid and opencode._group_exists(pgid):
+            return False, "managed native process group is still present"
+    if current.get("state") not in _TERMINAL_NATIVE:
+        return False, f"managed native turn is still {current.get('state')}"
+    if current.get("cleanup") != "confirmed":
+        return False, "managed native turn cleanup is not confirmed"
+    return True, "managed native turn is terminal with confirmed cleanup"
+
+
+def retire_queued_successor(db, task_id, note):
+    """Retire a queued-but-unstarted recovery atomically with its cancellation.
+
+    Only ``preparing``/``authorized`` reservations can be retired: those are the
+    states a task still in ``queued`` can hold. The failed task and turn rows are
+    left untouched and are never replayed. Runs in the caller's transaction.
+    """
+    rows = []
+    try:
+        rows = db.execute("SELECT id FROM recoveries WHERE owner_task_id=? "
+                          "AND status IN ('preparing','authorized')", (task_id,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    retired = []
+    for (recovery_id,) in rows:
+        changed = db.execute("UPDATE recoveries SET status=?,updated=? WHERE id=? "
+                             "AND status IN ('preparing','authorized')",
+                             (RETIRED, time.time(), recovery_id))
+        if changed.rowcount == 1:
+            retired.append(recovery_id)
+    if retired:
+        emit(db, "recovery_retired", taskId=task_id, recoveryIds=retired, note=note,
+             reason="queued successor cancelled before dispatch")
+    return retired
+
+
+def reconcile_successor(db, task_id, note, slot=None, outcome="cancelled"):
+    """Release a claimed successor reservation after a verified native stop.
+
+    The release is refused unless the claimed successor's native execution is
+    proven stopped; this is the single proof used by every release path, including
+    manual ``ops.resolve_task``. Returns ``None`` when no claimed recovery owns the
+    task. The failed task and turn rows are never touched or replayed.
+    """
+    record = claimed_successor(db, task_id)
+    if not record:
+        return None
+    slot = _slot_for_session(record["owner_sid"]) if slot is None else slot
+    # Synchronize with OpenCode send/turn ownership, then inspect the task state
+    # inside a serialized DB transaction. Dispatching means the durable claim
+    # exists but the new turn may not have written current.json yet; an old
+    # terminal pointer must never authorize retiring that live claim.
+    session_lock = opencode._session_lock(opencode.session_dir(record["owner_sid"]))
+    try:
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT state,sid FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task[1] != record["owner_sid"]:
+            raise ValueError("Recovery successor task ownership changed; inspect before reconciling")
+        if task[0] == "dispatching":
+            raise ValueError("Recovery successor is dispatching; wait for restart/uncertainty boundary")
+        if task[0] not in {"sent", "running", "uncertain", "cancelled"}:
+            raise ValueError(f"Recovery successor is {task[0]}; stopped proof is not applicable")
+        stopped, evidence = verify_stopped_native_execution(slot, task_id)
+        if not stopped:
+            raise ValueError("Native execution is not verified stopped: " + evidence)
+        changed = db.execute("UPDATE recoveries SET status=?,updated=? "
+                             "WHERE owner_task_id=? AND status='claimed'",
+                             (RECONCILED, time.time(), task_id))
+        if changed.rowcount != 1:
+            db.rollback()
+            raise ValueError("Recovery state changed; inspect before reconciling")
+        row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row and row[0] not in {"finished", "cancelled"}:
+            db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?",
+                       (outcome, time.time(), task_id))
+        emit(db, "recovery_reconciled", recoveryId=record["id"], taskId=task_id,
+             evidence=evidence, note=note)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+        session_lock.close()
+    return {"taskId": task_id, "recoveryId": record["id"], "reconciled": True,
+            "evidence": evidence}
+
+
+# This is intentionally narrower than native error-turn recovery: it recognizes
+# only the legacy model guard that failed before run_turn could launch OpenCode.
+def reconcile_launch_failure(db, task_id, turn, note):
+    """Audit a proven non-executed launch; preserve the old task and every hold."""
+    if not isinstance(note, str) or not note.strip():
+        raise ValueError("Launch reconciliation requires an operator note")
+    if not isinstance(turn, str) or not opencode._TURN_ID.fullmatch(turn):
+        raise ValueError("Launch reconciliation turn is invalid")
+    if not paths.PAUSE.is_file():
+        raise ValueError("Fleet must remain durably paused")
+    # Hold the same manager lock throughout; a concurrent restart must fail closed.
+    with paths.MANAGER_LOCK.open("rb") as manager_lock:
+        fcntl.flock(manager_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task[2] not in {"finished", "uncertain"}:
+            raise ValueError("Launch task must be finished or uncertain; history is never rewritten")
+        slot = opencode.verify_slot(_slot_for_session(task[0]))
+        if slot.get("dispatchEnabled", False):
+            raise ValueError("Worker must remain dispatch-disabled")
+        sid = slot["sessionId"]
+        session_lock = opencode._session_lock(opencode.session_dir(sid))
+        try:
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone() != task:
+                raise ValueError("Launch task changed during validation")
+            if db.execute("SELECT 1 FROM tasks WHERE sid=? AND state IN "
+                          "('dispatching','sent','running')", (sid,)).fetchone():
+                raise ValueError("Worker has another task in flight")
+            if db.execute("SELECT 1 FROM recoveries WHERE (owner_sid=? OR failed_sid=?) "
+                          "AND status IN ('preparing','authorized','claimed')", (sid, sid)).fetchone():
+                raise ValueError("Active recovery reservations require their own reconciliation")
+            pointer = opencode.session_dir(sid) / "current.json"
+            directory = opencode.turn_dir(sid, turn)
+            request_path = directory / "request.json"
+            launch = json.loads(pointer.read_text())
+            request = json.loads(request_path.read_text())
+            identity = {"taskId": task_id, "sessionId": sid, "turn": turn,
+                        "cwd": slot["cwd"], "model": slot["model"]}
+            if (task[1] != slot["cwd"] or any(
+                    launch.get(k) != v or request.get(k) != v for k, v in identity.items())):
+                raise ValueError("Launch task/session/cwd/model identity mismatch")
+            if any(os.path.lexists(directory / name) for name in ("state.json", "result.json")):
+                raise ValueError("Native turn state/result exists; prelaunch reconciliation refused")
+            pid = launch.get("wrapperPid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise ValueError("Recorded wrapper PID is missing")
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise ValueError("Recorded wrapper PID is still present")
+            if opencode._group_exists(pid):
+                raise ValueError("Recorded wrapper process group is still present")
+            if slot["model"] == opencode.MODEL:
+                raise ValueError("Legacy model rejection cannot prove this launch failure")
+            if (request.get("databasePath") != slot["databasePath"]
+                    or request.get("sessionCwd") != slot["cwd"]):
+                raise ValueError("Native account/database routing differs")
+            opencode.verify_native_session(sid, slot["cwd"], slot["databasePath"])
+            started = launch.get("startedAt")
+            if (not isinstance(started, (int, float)) or isinstance(started, bool)
+                    or not 0 < started <= time.time()):
+                raise ValueError("Launch timestamp is invalid")
+            # Inspect metadata only, never native message bodies or auth records.
+            uri = "file:" + opencode.quote(slot["databasePath"], safe="/") + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=2) as native:
+                native.execute("PRAGMA query_only=ON")
+                count = native.execute("SELECT count(*) FROM session_message WHERE session_id=? "
+                                       "AND (typeof(time_created) NOT IN ('integer','real') OR time_created>=?)",
+                                       (sid, int(started * 1000) - 1000)).fetchone()[0]
+            if count:
+                raise ValueError("Native messages exist at/after launch; no-inference proof unavailable")
+            log = paths.LOGS / "opencode" / sid / turn / "wrapper.log"
+            with log.open("rb") as stream:
+                body = stream.read(32769)
+            suffix = ('raise ValueError("OpenCode request model is not the pinned free model")\n'
+                      'ValueError: OpenCode request model is not the pinned free model')
+            if (len(body) > 32768 or not body.decode().rstrip().endswith(suffix)
+                    or b"Traceback (most recent call last):" not in body):
+                raise ValueError("Wrapper log does not prove the known pre-provider model guard")
+            evidence = dict(identity, launchSha256=hashlib.sha256(pointer.read_bytes()).hexdigest(),
+                            requestSha256=hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                            wrapperLogSha256=hashlib.sha256(body).hexdigest(),
+                            nativeMessagesSinceLaunch=count, wrapperStopped=True,
+                            note=note.strip())
+            # Commit the audit event before making the worker dispatchable. A file
+            # write failure leaves it blocked; an idempotent retry repairs the marker.
+            events = db.execute("SELECT id,body FROM events WHERE kind='opencode_launch_reconciled'").fetchall()
+            existing = next(((i, json.loads(raw)) for i, raw in events
+                             if json.loads(raw).get("taskId") == task_id
+                             and json.loads(raw).get("turn") == turn), None)
+            if existing:
+                if any(existing[1].get(k) != v for k, v in evidence.items() if k != "note"):
+                    raise ValueError("Previously audited launch evidence changed")
+                record, evidence = existing  # Preserve the first operator note and evidence.
+            else:
+                record = emit(db, "opencode_launch_reconciled", **evidence)
+            db.commit()
+            atomic(directory / "launch-reconciled.json", dict(evidence, record=record))
+            return {"taskId": task_id, "sessionId": sid, "turn": turn,
+                    "reconciled": True, "taskStatePreserved": task[2], "record": record,
+                    "evidence": evidence}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+            session_lock.close()

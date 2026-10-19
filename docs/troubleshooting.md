@@ -19,4 +19,95 @@
 - **Hung turn** — Claude turns stop after `claudeTurnTimeoutSeconds` (config, 0 = off); otherwise
   `bin/fleet cancel <task> --note …`.
 - **`uncertain` task** — inspect the worker's transcript; enqueue a new task ID if work is needed.
+- **Held queued task** — an operator paused it with `bin/fleet hold TASK --note …`; it stays queued
+  under the same ID and dispatch skips it. Inspect holds with `bin/fleet status` (`heldTasks`) and
+  resume one with `bin/fleet release TASK --note …`. Both commands are idempotent and refuse a
+  started or terminal task. The hold is durable, so a manager restart keeps it. `release` clears only
+  that task-level hold — a global `bin/fleet pause`, a worker's `dispatchEnabled`, a capacity limit,
+  or an active recovery reservation still gates dispatch, so a released task may stay queued until
+  those clear too.
+- **OpenCode error turn** — do not resolve it with the Claude-only `--worker` command or reset its
+  task. Verify the failed task and cleanup receipt, then snapshot the separate owned checkout with
+  `bin/fleet recovery-snapshot --cwd OWNED_WORKTREE`. The configured native session CWD stays as-is.
+  Authorize a successor only when a finished task for the same worker records the branch and exact
+  owned-worktree path:
+  ```sh
+  bin/fleet recover-opencode --worker SESSION_ID --task FAILED_TASK_ID --turn TURN_ID \
+    --recovery-id RECOVERY_ID --successor-task NEW_TASK_ID --ownership-task OWNER_TASK_ID \
+    --owned-worktree OWNED_WORKTREE --branch BRANCH --head COMMIT_SHA \
+    --worktree-sha256 DIGEST --note 'verified cleanup and preserved partial work'
+  ```
+  Enqueue only the new task, linked to both the failed task and returned recovery ID:
+  `{"id":"NEW_TASK_ID","previousTaskId":"FAILED_TASK_ID","recoveryId":"RECOVERY_ID","rootAuthorized":true,"message":"..."}`.
+  Fleet prepends the recorded owned checkout and branch to every recovery turn's prompt,
+  including a message such as `continue`, and records them in the turn request. Native
+  session CWD remains unchanged. Missing/unreadable checkouts and Git validation errors
+  leave the successor queued with one `needs_attention` event; unrelated queued tasks
+  can still dispatch. Inspect and correct the checkout before attempting recovery again.
+
+  The fingerprint covers branch/HEAD, Git porcelain status, `git diff --binary HEAD`,
+  and non-ignored untracked file contents (symlink targets are hashed without following
+  them). It is a limited change detector, not a backup or complete partial-state capture:
+  ignored files, nested repository/submodule file contents, and intermediate staged
+  versions distinct from the current worktree are not captured. Git may report submodule
+  dirtiness without fingerprinting its contents; repository ignore settings may hide it.
+  Do not infer preservation of these omitted states from a matching digest. Review their
+  relevance separately without reading secrets or recursively hashing dependency trees.
+
+  Recovery refuses active locks, incomplete cleanup, changed worktree state, duplicate owners, and
+  rate-limit/quota errors. It never changes pause state, `dispatchEnabled`, model, accounts, or the
+  failed turn. It retains ownership on the same configured OpenCode session while binding the
+  separate owned Git worktree. Cross-session transfer is not supported. Never rebuild
+  `fleet.sqlite` from `queue.json`; preserve its task/event/receipt history. A successor send becomes
+  single-use at its durable dispatch claim; inspect an `uncertain` successor instead of replaying it.
+
+  **Retire or reconcile a recovery.** Cancelling a still-queued successor with `bin/fleet cancel`
+  atomically retires its authorization, releasing the reservation while preserving the failed task
+  and turn verbatim. A fresh successor may then be authorized for the same failed turn. Once a
+  successor has been dispatched (`claimed`), its reservation is released only after native
+  execution is verified stopped: `bin/fleet reconcile-recovery --task SUCCESSOR --note "..."` for a
+  `sent`/`running`/`cancelled` successor, or `bin/fleet resolve --task SUCCESSOR --as cancelled`
+  for an `uncertain` one. Both use the same proof — the managed turn must be terminal with confirmed
+  cleanup and no live process identity/group — and refuse a bare state flip. Retirement and
+  reconciliation touch only that recovery row and task; global pause, per-worker `dispatchEnabled`,
+  capacity/quota gates, and unrelated recovery reservations stay in force.
 - **Moving `data/`** — `bin/fleet stop`, `scripts/db-check`, then move including no `-wal/-shm`.
+
+## OpenCode wrapper selected stale source before native execution
+
+`FLEET_ROOT` selects durable data/config/logs; `paths.SOURCE_ROOT` and `paths.BIN`
+select the installed source that imported Fleet. Child wrappers use that source's
+entrypoint, even when the data root contains an old `bin/fleet` or source snapshot.
+A missing native `state.json` after the launch grace period is `launchFailure`;
+the manager preserves the terminal `finished` ledger convention and emits
+`review_ready` with `state: blocked`, explicit `outcome: launch_failed`, and the
+launch error. This is a failed wrapper attempt, not successful audit completion.
+A claimed recovery reservation is not marked completed by this launch failure.
+
+For the known legacy model-guard failure, after root reviews and applies this fix,
+an operator may run the reviewed source entrypoint with the intended `FLEET_ROOT`:
+
+```
+FLEET_ROOT=/tmp/opencode-three-fleet-20261018 FLEET_CONFIG=/tmp/opencode-three-fleet-20261018/config/fleet.local.json python3 /Users/amf/Developer/.codex/fleet/bin/fleet reconcile-opencode-launch --task 20261019-go-adea-ci-migration-inventory-e7f19faa --turn 5e62374a-d022-4256-8b69-bee5c0837f68 --note "Root reviewed stale-source rejection before native execution; audit remains incomplete"
+```
+
+This requires durable pause, a stopped manager, a disabled exact worker, a free
+session lock, no active recovery reservation or task in flight, matching task /
+turn / model / native database identity, no native state or result, a dead wrapper
+PID and process group, zero native message metadata at/after launch (including a
+one-second margin), and the bounded traceback ending at the known legacy guard.
+An unknown error, quota failure, existing native messages/state, or uncertain
+process proof blocks reconciliation. It reads no auth data or native message text.
+
+The command commits an audit event before writing an identity-bound
+`launch-reconciled.json`. The worker then reports `stopped`; the original request,
+launch pointer, wrapper log and task row remain unchanged. The old `finished`
+state is preserved as historical evidence, not an audit success. A task already
+`uncertain` stays uncertain and requires an explicit supported operator resolution
+before its checkout can dispatch again. No dispatch/quota/task hold is released.
+
+Never reuse the failed task ID. Root must authorize a new same-session task ID
+linked by `previousTaskId`, preserving its scoped checkout and transfer exclusions.
+Do not use native error-turn recovery for this missing-state case. Session creation,
+roster enablement and manager resume are separate controller actions after review;
+the reconciliation command does none of them. Do not edit SQLite or delete history.

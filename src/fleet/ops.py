@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, opencode, paths, pi
+from . import claude, opencode, paths, pi, recovery
 from .store import database, emit
 from .util import atomic
 
@@ -35,8 +35,14 @@ def resolve_task(db, task_id, outcome, note):
         raise ValueError("Task not found")
     if row[0] != "uncertain":
         raise ValueError(f"Only uncertain tasks can be resolved (task is {row[0]})")
+    sid = row[1]
+    if recovery.claimed_successor(db, task_id):
+        # A claimed recovery successor is released through the same verified
+        # stopped-native-execution proof as explicit reconciliation; never bypassed.
+        result = recovery.reconcile_successor(db, task_id, note, outcome=outcome)
+        return {**result, "state": outcome}
     db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (outcome, time.time(), task_id))
-    record = emit(db, "task_resolved", taskId=task_id, sessionId=row[1], outcome=outcome, note=note)
+    record = emit(db, "task_resolved", taskId=task_id, sessionId=sid, outcome=outcome, note=note)
     db.execute("UPDATE events SET acked=1 WHERE id=?", (record,))
     db.commit()
     return {"taskId": task_id, "state": outcome, "record": record}
@@ -72,9 +78,15 @@ def cancel(db, task_id, note):
         if changed.rowcount != 1:
             db.rollback()
             raise ValueError("Task state changed; inspect before cancelling")
+        # Retire an authorized-but-unstarted recovery authorization in the same
+        # transaction so the reservation can never outlive its cancelled successor.
+        retired = recovery.retire_queued_successor(db, task_id, note)
         emit(db, "task_cancelled", taskId=task_id, sessionId=row[0], note=note)
         db.commit()
-        return {"taskId": task_id, "action": {"queuedCancelled": True}}
+        action = {"queuedCancelled": True}
+        if retired:
+            action["recoveryRetired"] = retired
+        return {"taskId": task_id, "action": action}
     if not row or row[1] not in {"sent", "running"}:
         raise ValueError("Only queued/sent/running tasks can be cancelled")
     sid = row[0]

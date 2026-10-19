@@ -5,6 +5,7 @@ import os
 import time
 
 from . import events, paths
+from .recovery import recovery_for_task, task_recovery_conflict
 from .store import database
 
 
@@ -40,9 +41,24 @@ def enqueue(db, supplied):
             matches = [s for s in slots if s["sessionId"] == sid]
             if len(matches) != 1:
                 raise ValueError("Target is not in current roster")
+            old = by_id.get(task["id"])
             normalized = {"id": task["id"], "sessionId": sid, "message": task["message"],
                           "rootAuthorized": True}
-            old = by_id.get(task["id"])
+            if task.get("previousTaskId"):
+                normalized["previousTaskId"] = task["previousTaskId"]
+            recovery_id = task.get("recoveryId")
+            if recovery_id:
+                statuses = ("authorized", "claimed", "completed") if old else ("authorized",)
+                if not task.get("previousTaskId") or not recovery_for_task(
+                        db, recovery_id, task["id"], sid, task["previousTaskId"], statuses):
+                    raise ValueError("Recovery task does not match an authorized durable handoff")
+                normalized["recoveryId"] = recovery_id
+            elif db.execute("SELECT 1 FROM recoveries WHERE owner_task_id=? LIMIT 1",
+                            (task["id"],)).fetchone():
+                raise ValueError("Task ID is reserved for a durable recovery handoff")
+            conflict = task_recovery_conflict(db, normalized, sid, slots)
+            if conflict:
+                raise ValueError(f"Task conflicts with active recovery {conflict}")
             if old and any(old.get(k) != v for k, v in normalized.items()):
                 raise ValueError("Task ID content conflict")
             if not old:
