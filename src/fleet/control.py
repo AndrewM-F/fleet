@@ -56,7 +56,7 @@ def enqueue(db, supplied):
             elif db.execute("SELECT 1 FROM recoveries WHERE owner_task_id=? LIMIT 1",
                             (task["id"],)).fetchone():
                 raise ValueError("Task ID is reserved for a durable recovery handoff")
-            conflict = task_recovery_conflict(db, normalized, sid)
+            conflict = task_recovery_conflict(db, normalized, sid, slots)
             if conflict:
                 raise ValueError(f"Task conflicts with active recovery {conflict}")
             if old and any(old.get(k) != v for k, v in normalized.items()):

@@ -304,6 +304,81 @@ class RecoveryTests(unittest.TestCase):
                 control.enqueue(self.db, [task])
         self.assertFalse(self.queue.exists())
 
+    def shared_checkout_slot(self):
+        """A second worker whose configured, structured CWD is the owned checkout."""
+        shared = dict(self.slot, sessionId="ses_shared_checkout",
+                      cwd=str(self.cwd.resolve()), sessionCwd=str(self.cwd.resolve()),
+                      databasePath=str(self.root / "shared-native.db"))
+        with sqlite3.connect(shared["databasePath"]):
+            pass
+        self.slot_patch.stop()
+        self.slot_patch = patch.object(paths, "opencode_slots",
+                                       return_value=[self.slot, shared])
+        self.slot_patch.start()
+        self.addCleanup(self.slot_patch.stop)
+        return shared
+
+    def test_shared_checkout_conflict_when_recovery_authorized_first(self):
+        # Admission order 1: recovery owns the checkout, then a "continue" task
+        # from a worker configured at that same checkout must be rejected.
+        shared = self.shared_checkout_slot()
+        self.authorize()
+        task = {"id": "shared-successor", "sessionId": shared["sessionId"],
+                "rootAuthorized": True, "message": "continue"}
+        with patch.object(paths, "all_slots", return_value=[self.slot, shared]):
+            with self.assertRaisesRegex(ValueError, "conflicts with active recovery"):
+                control.enqueue(self.db, [task])
+        self.assertFalse(self.queue.exists())
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM tasks WHERE id='shared-successor'").fetchone()[0], 0)
+
+    def test_shared_checkout_conflict_when_shared_task_enqueued_first(self):
+        # Admission order 2: a "continue" task from a worker configured at the
+        # checkout is queued first, so authorization must refuse exclusive ownership.
+        shared = self.shared_checkout_slot()
+        task = {"id": "shared-successor", "sessionId": shared["sessionId"],
+                "rootAuthorized": True, "message": "continue"}
+        with patch.object(paths, "all_slots", return_value=[self.slot, shared]):
+            control.enqueue(self.db, [task])
+        with self.assertRaisesRegex(ValueError, "Another queued task owns"):
+            self.authorize()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
+
+    def test_shared_checkout_conflict_blocks_queue_import(self):
+        shared = self.shared_checkout_slot()
+        self.authorize()
+        self.queue.write_text(json.dumps({"author": "root", "tasks": [
+            {"id": "shared-import", "sessionId": shared["sessionId"],
+             "rootAuthorized": True, "message": "continue"}]}) + "\n")
+        with self.assertRaisesRegex(ValueError, "conflicts with active recovery"):
+            manager.import_queue(self.db,
+                                 {self.sid: self.slot, shared["sessionId"]: shared},
+                                 self.queue)
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM tasks WHERE id='shared-import'").fetchone()[0], 0)
+
+    def test_shared_checkout_conflict_blocks_recovery_dispatch(self):
+        self.authorize()
+        task = {"id": self.successor, "previousTaskId": self.failed_task,
+                "recoveryId": "recovery-1", "rootAuthorized": True, "message": "continue"}
+        with patch.object(paths, "all_slots", return_value=[self.slot]):
+            control.enqueue(self.db, [task])
+        manager.import_queue(self.db, {self.sid: self.slot}, self.queue)
+        # A competing worker already runs in the owned checkout and says only "continue".
+        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                        ("shared-rival", self.other_sid, str(self.cwd.resolve()),
+                         json.dumps({"message": "continue"}), "running", 0))
+        self.db.commit()
+        sent = []
+        slots = {self.sid: self.slot, self.other_sid: self.other_slot}
+        states = {self.sid: {"state": "error", "cwd": str(self.native_cwd)},
+                  self.other_sid: {"state": "working", "cwd": str(self.cwd.resolve())}}
+        dispatch.dispatch(self.db, slots, states,
+                          lambda *args, **kwargs: sent.append(kwargs["task_id"]))
+        self.assertEqual(sent, [])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "queued")
+
     def test_successor_claim_is_deduplicated_across_manager_restart(self):
         self.authorize()
         task = {"id": self.successor, "previousTaskId": self.failed_task,

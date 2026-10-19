@@ -149,41 +149,104 @@ def _task_message(db, task_id, session_id, cwd):
     return message
 
 
-def _active_task_for_worktree(db, owned_worktree, exclude_task_id=None):
-    rows = db.execute("SELECT id,body FROM tasks WHERE state IN "
+def _resolve(value):
+    """Resolve a path for identity comparison; empty values stay empty."""
+    return str(Path(value).expanduser().resolve()) if value else ""
+
+
+def _configured_cwds(slots=None):
+    """Map every configured session to its structured, resolved CWD.
+
+    Accepts a slot list or a ``{sessionId: slot}`` mapping, as produced by
+    ``paths.all_slots()`` and the manager roster. Falls back to the OpenCode
+    roster so recovery callers that already read it stay consistent.
+    """
+    if slots is None:
+        try:
+            slots = paths.opencode_slots()
+        except (FileNotFoundError, ValueError):
+            slots = []
+    if isinstance(slots, dict):
+        slots = slots.values()
+    result = {}
+    for slot in slots or []:
+        sid, cwd = slot.get("sessionId"), slot.get("cwd")
+        if sid and cwd:
+            result[sid] = _resolve(cwd)
+    return result
+
+
+def _claims_worktree(tree, *, cwd=None, sid=None, message="", configured=None):
+    """Does this task claim ``tree`` through structured or supplemental evidence?
+
+    Structured ownership wins: the task's durable ``tasks.cwd`` column and its
+    target session's configured CWD. A path substring in the free-text message is
+    kept only as conservative supplemental evidence, never as the sole basis.
+    """
+    if cwd and _resolve(cwd) == tree:
+        return True
+    if configured and sid and configured.get(sid) == tree:
+        return True
+    return bool(tree and message and tree in message)
+
+
+def _active_task_for_worktree(db, owned_worktree, configured, exclude_task_id=None):
+    tree = _resolve(owned_worktree)
+    rows = db.execute("SELECT id,sid,cwd,body FROM tasks WHERE state IN "
                       "('queued','dispatching','sent','running','uncertain')").fetchall()
-    for task_id, body in rows:
+    for task_id, sid, cwd, body in rows:
         if task_id == exclude_task_id:
             continue
         try:
             message = json.loads(body).get("message", "")
         except (TypeError, json.JSONDecodeError):
-            continue
-        if isinstance(message, str) and owned_worktree in message:
+            message = ""
+        if not isinstance(message, str):
+            message = ""
+        if _claims_worktree(tree, cwd=cwd, sid=sid, message=message, configured=configured):
             return task_id
     return None
 
 
-def _queued_task_for_worktree(db, owned_worktree, exclude_task_id=None):
+def _queued_task_for_worktree(db, owned_worktree, configured, exclude_task_id=None):
     if not Path(paths.QUEUE).exists():
         return None
     queue = json.loads(Path(paths.QUEUE).read_text())
     if queue.get("author") != "root" or not isinstance(queue.get("tasks"), list):
         raise ValueError("Root task queue is invalid; recovery is blocked")
+    tree = _resolve(owned_worktree)
     for task in queue["tasks"]:
-        if task.get("id") == exclude_task_id:
+        task_id = task.get("id")
+        if task_id == exclude_task_id:
             continue
-        if owned_worktree not in str(task.get("message") or ""):
+        if not _claims_worktree(tree, sid=task.get("sessionId"),
+                                message=str(task.get("message") or ""),
+                                configured=configured):
             continue
-        row = db.execute("SELECT state FROM tasks WHERE id=?", (task.get("id"),)).fetchone()
+        row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or row[0] in {"queued", "dispatching", "sent", "running", "uncertain"}:
-            return task.get("id") or "unknown"
+            return task_id or "unknown"
     return None
 
 
-def validate_owned_worktree(db, record):
+def _validate_recovery_mapping(db, record, configured):
+    """Bind the recovery's native CWD/worker to structured task and roster fields."""
+    row = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?",
+                     (record["ownership_task_id"],)).fetchone()
+    if not row or row[0] != record["owner_sid"] or _resolve(row[1]) != _resolve(record["cwd"]):
+        raise ValueError("Recovery native CWD/worker does not match the ownership task")
+    if row[2] != "finished":
+        raise ValueError("Ownership task must be terminal before recovery")
+    expected = configured.get(record["owner_sid"])
+    if expected and expected != _resolve(record["cwd"]):
+        raise ValueError("Recovery native CWD does not match the configured session cwd")
+
+
+def validate_owned_worktree(db, record, slots=None):
     """Recheck task provenance and exclusivity before dispatching a successor."""
     worktree = record["owned_worktree"]
+    configured = _configured_cwds(slots)
+    _validate_recovery_mapping(db, record, configured)
     message = _task_message(db, record["ownership_task_id"], record["owner_sid"], record["cwd"])
     if worktree not in message or record["branch"] not in message:
         raise ValueError("Owned worktree/branch no longer match the owner task record")
@@ -191,10 +254,10 @@ def validate_owned_worktree(db, record):
     if (snapshot["branch"] != record["branch"] or snapshot["head"] != record["head"]
             or snapshot["worktreeSha256"] != record["worktree_sha256"]):
         raise ValueError("Owned worktree changed after recovery authorization")
-    conflict = _active_task_for_worktree(db, worktree, record["owner_task_id"])
+    conflict = _active_task_for_worktree(db, worktree, configured, record["owner_task_id"])
     if conflict:
         raise ValueError(f"Another active task owns the explicit worktree: {conflict}")
-    conflict = _queued_task_for_worktree(db, worktree, record["owner_task_id"])
+    conflict = _queued_task_for_worktree(db, worktree, configured, record["owner_task_id"])
     if conflict and conflict != record["owner_task_id"]:
         raise ValueError(f"Another queued task owns the explicit worktree: {conflict}")
     other = db.execute("SELECT id FROM recoveries WHERE owned_worktree=? AND id<>? "
@@ -204,20 +267,30 @@ def validate_owned_worktree(db, record):
         raise ValueError(f"Another recovery owns the explicit worktree: {other[0]}")
 
 
-def task_recovery_conflict(db, task, sid):
-    """Return a recovery reserving this native session or explicitly named worktree."""
+def task_recovery_conflict(db, task, sid, slots=None):
+    """Return a recovery reserving this session or a worktree the task claims.
+
+    A task claims a worktree through its structured CWD and its target session's
+    configured CWD, not only through a path string in its message.
+    """
     valid = recovery_for_task(db, task.get("recoveryId"), task.get("id"), sid,
                               task.get("previousTaskId"),
                               statuses=("authorized", "claimed", "completed")) \
         if task.get("recoveryId") else None
     if valid:
         return None
+    configured = _configured_cwds(slots)
+    task_cwd = task.get("cwd")
     message = str(task.get("message") or "")
-    rows = db.execute("SELECT id,owner_sid,owned_worktree FROM recoveries "
+    rows = db.execute("SELECT id,owner_sid,owned_worktree,cwd FROM recoveries "
                       "WHERE status IN ('preparing','authorized','claimed')").fetchall()
-    for recovery_id, owner_sid, worktree in rows:
-        if sid == owner_sid or (worktree and worktree in message):
+    for recovery_id, owner_sid, worktree, native_cwd in rows:
+        if sid == owner_sid:
             return recovery_id
+        for reserved in (worktree, native_cwd):
+            if reserved and _claims_worktree(_resolve(reserved), cwd=task_cwd, sid=sid,
+                                             message=message, configured=configured):
+                return recovery_id
     return None
 
 
@@ -235,14 +308,22 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
         raise ValueError("Recovery identifiers, branch, and note must be non-empty strings")
     if not _SHA256.fullmatch(worktree_sha256 or ""):
         raise ValueError("worktree_sha256 must be a lowercase SHA-256 digest")
-    slots = [s for s in paths.opencode_slots() if s.get("sessionId") == session_id]
+    all_slots = paths.opencode_slots()
+    slots = [s for s in all_slots if s.get("sessionId") == session_id]
     if len(slots) != 1:
         raise ValueError("Recovery target must be one existing OpenCode slot")
     slot = opencode.verify_slot(slots[0])
     if not slot.get("dispatchEnabled", False):
         raise ValueError("OpenCode dispatch is disabled; recovery does not change that hold")
 
-    cwd = str(Path(slot["cwd"]).resolve())
+    # Structured ownership: bind the native CWD/worker to the roster and the
+    # ownership task's durable row before trusting any free-text message.
+    configured = _configured_cwds(all_slots)
+    cwd = _resolve(slot["cwd"])
+    if configured.get(session_id) != cwd:
+        raise ValueError("Recovery native CWD does not match the configured session roster")
+    _validate_recovery_mapping(db, {"ownership_task_id": ownership_task_id,
+                                    "owner_sid": session_id, "cwd": cwd}, configured)
     worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
     ownership_message = _task_message(db, ownership_task_id, session_id, cwd)
     if worktree not in ownership_message or branch not in ownership_message:
@@ -287,10 +368,10 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
             if _queue_has_task(successor_task_id):
                 raise ValueError("Successor task ID already appears in the root queue")
 
-        active_worktree_task = _active_task_for_worktree(db, worktree, successor_task_id)
+        active_worktree_task = _active_task_for_worktree(db, worktree, configured, successor_task_id)
         if active_worktree_task:
             raise ValueError(f"Another active task owns the explicit worktree: {active_worktree_task}")
-        queued_worktree_task = _queued_task_for_worktree(db, worktree, successor_task_id)
+        queued_worktree_task = _queued_task_for_worktree(db, worktree, configured, successor_task_id)
         if queued_worktree_task:
             raise ValueError(f"Another queued task owns the explicit worktree: {queued_worktree_task}")
 

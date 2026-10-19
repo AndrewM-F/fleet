@@ -79,7 +79,7 @@ def import_queue(db, slots, queue=None):
             if pending and pending[0] == "preparing":
                 continue
             raise ValueError("Recovery task does not match an authorized durable handoff")
-        conflict = recovery.task_recovery_conflict(db, task, sid)
+        conflict = recovery.task_recovery_conflict(db, task, sid, slots)
         if conflict:
             raise ValueError(f"Queued task conflicts with active recovery {conflict}")
         db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",

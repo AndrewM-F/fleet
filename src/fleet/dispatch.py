@@ -35,7 +35,7 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             if not record:
                 continue
             try:
-                recovery.validate_owned_worktree(db, record)
+                recovery.validate_owned_worktree(db, record, slots)
             except (ValueError, OSError, subprocess.SubprocessError) as error:
                 already_reported = False
                 for (body,) in db.execute(
