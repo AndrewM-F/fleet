@@ -170,14 +170,14 @@ def adoption_record(db, adoption_id):
     return dict(zip(names, row))
 
 
-def _verify_pointer_identity(session_id, failed_task_id, turn, cwd):
+def _verify_pointer_identity(session_id, failed_task_id, turn, cwd, model):
     pointer = opencode.session_dir(session_id) / "current.json"
     if not pointer.is_file():
         raise ValueError("No managed OpenCode turn exists for this worker")
     launch = json.loads(pointer.read_text())
     if (launch.get("turn") != turn or launch.get("taskId") != failed_task_id
             or launch.get("sessionId") != session_id or launch.get("cwd") != cwd
-            or launch.get("model") != opencode.MODEL):
+            or launch.get("model") != model):
         raise ValueError("Adoption failed turn identity differs from the current managed turn")
 
 
@@ -254,6 +254,9 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
     slots = [s for s in all_slots if s.get("sessionId") == session_id]
     if len(slots) != 1:
         raise ValueError("Adoption target must be one existing OpenCode slot")
+    # The persisted turn is proved against the model configured for this
+    # session, not against a fleet-wide constant.
+    configured_model = opencode.configured_model(slots[0])
     cwd = _resolve(slots[0].get("cwd") or "")
     if not cwd:
         raise ValueError("Adoption target has no configured native cwd")
@@ -286,7 +289,7 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
         raise ValueError("Failed task ownership/cwd does not match the configured worker")
     if failed[2] != "finished":
         raise ValueError("Failed task must remain terminal before adoption")
-    _verify_pointer_identity(session_id, failed_task_id, turn, cwd)
+    _verify_pointer_identity(session_id, failed_task_id, turn, cwd, configured_model)
 
     snapshot = worktree_snapshot(worktree)
     if (snapshot["branch"] != branch or snapshot["head"] != head
@@ -546,7 +549,11 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
     slots = [s for s in all_slots if s.get("sessionId") == session_id]
     if len(slots) != 1:
         raise ValueError("Recovery target must be one existing OpenCode slot")
-    slot = opencode.verify_slot(slots[0])
+    # The failed turn is proved against the model configured for this session
+    # and its persisted launch, turn and error receipts, not against a
+    # fleet-wide constant.
+    configured_model = opencode.configured_model(slots[0])
+    slot = opencode.verify_slot(slots[0], expected_model=configured_model)
     if not slot.get("dispatchEnabled", False):
         raise ValueError("OpenCode dispatch is disabled; recovery does not change that hold")
 
@@ -619,7 +626,7 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
         if queued_worktree_task:
             raise ValueError(f"Another queued task owns the explicit worktree: {queued_worktree_task}")
 
-        verify_failed_turn(session_id, failed_task_id, turn, cwd, opencode.MODEL)
+        verify_failed_turn(session_id, failed_task_id, turn, cwd, configured_model)
 
         snapshot = worktree_snapshot(worktree)
         if (snapshot["branch"] != branch or snapshot["head"] != head

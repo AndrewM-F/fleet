@@ -208,13 +208,37 @@ def verify_native_session(sid, cwd, database_path):
             "sessionCwd": str(actual_cwd)}
 
 
-def verify_slot(slot, cfg=None):
-    """Validate the fixed free model and paths; session identity is checked at launch."""
+def configured_model(slot):
+    """The model configured for one OpenCode worker.
+
+    The roster is the only source of a session's configured model. The
+    cancellation and recovery paths compare the persisted launch and turn
+    receipts against it, so a session configured with a free model other than
+    the fleet default is validated against its own configuration instead of
+    being refused by a global constant.
+    """
+    model = slot.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("OpenCode worker must name its configured model")
+    return model
+
+
+def verify_slot(slot, cfg=None, expected_model=None):
+    """Validate the fixed free model and paths; session identity is checked at launch.
+
+    ``expected_model`` replaces the fleet-wide free-model pin with the model the
+    caller expects this worker to carry. The cancellation and recovery paths
+    pass the model configured for the target session, so their identity is
+    proven by the persisted launch and turn receipts rather than by a global
+    constant. Every other check is unchanged, and without ``expected_model``
+    the fleet-wide pin still applies.
+    """
     sid = slot.get("sessionId")
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode sessionId must be an existing native ses_ ID")
-    if slot.get("model") != MODEL:
-        raise ValueError(f"OpenCode model must be pinned to {MODEL}; paid/provider fallbacks are not allowed")
+    pinned = MODEL if expected_model is None else expected_model
+    if slot.get("model") != pinned:
+        raise ValueError(f"OpenCode model must be pinned to {pinned}; paid/provider fallbacks are not allowed")
     if slot.get("mode") not in (None, "opencode"):
         raise ValueError("OpenCode workers cannot use Claude mode settings")
     cwd = Path(os.path.expanduser(slot.get("cwd", ""))).resolve()
@@ -967,8 +991,10 @@ def cancel(slot):
     sid = slot.get("sessionId")
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode sessionId must be an existing native ses_ ID")
-    if slot.get("model") != MODEL:
-        raise ValueError("OpenCode model identity mismatch")
+    # The persisted receipts are compared against the model configured for this
+    # worker, so a session configured with a free model other than the fleet
+    # default is stopped on its own identity instead of being refused.
+    model = configured_model(slot)
     try:
         cwd = str(Path(os.path.expanduser(slot.get("cwd", ""))).resolve())
     except (OSError, RuntimeError, TypeError) as error:
@@ -979,7 +1005,7 @@ def cancel(slot):
         raise ValueError("No live OpenCode turn to cancel")
     launch = json.loads(pointer.read_text())
     if (launch.get("sessionId") != sid or launch.get("cwd") != cwd
-            or launch.get("model") != MODEL):
+            or launch.get("model") != model):
         raise ValueError("OpenCode managed session/model/cwd identity mismatch")
     turn = launch.get("turn")
     if not isinstance(turn, str) or not _TURN_ID.fullmatch(turn):
@@ -990,7 +1016,7 @@ def cancel(slot):
     current = json.loads(state_path.read_text())
     identity = current.get("processIdentity")
     if (current.get("sessionId") != sid or current.get("cwd") != cwd
-            or current.get("model") != MODEL):
+            or current.get("model") != model):
         raise ValueError("OpenCode turn identity/cwd/model mismatch")
     if current.get("state") != "working" or not identity_matches(identity):
         raise ValueError("OpenCode process identity is not live and confirmed; no signal sent")

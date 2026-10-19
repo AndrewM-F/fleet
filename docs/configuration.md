@@ -29,6 +29,11 @@
   refused. The v2.0.5 JSON stream does not include actual provider/model IDs in its normal step
   events, so receipts leave actual IDs blank unless the transport emits direct model metadata and
   record the pinned CLI model separately.
+  The cancellation and recovery paths compare the persisted launch and turn receipts against the
+  model configured for that target session, so a roster entry that names a different model is
+  validated on its own identity and on its own persisted receipts rather than refused by a
+  fleet-wide constant. Every other session, task, turn, CWD, process and cleanup check, and the
+  refusal of rate-limit and quota failures, is unchanged.
 Changing a running lane's model/provider/cwd makes the manager report it `unavailable` until the
 controller is restarted (`bin/fleet stop` / `start`).
 # Fresh and single-harness installations
