@@ -52,12 +52,15 @@ def _upgrade_recovery_adoptions(db):
     kept as ``ownership_evidence`` and its reference is left empty, so consumption
     fails closed until an operator records a new adoption through the stricter path.
     """
-    columns = [row[1] for row in db.execute("PRAGMA table_info(recovery_adoptions)")]
-    if ({"evidence_reference", "ownership_evidence"} <= set(columns)
-            or "evidence" not in columns):
-        return
+    # Inspect and decide under the write lock. A concurrent opener must observe the
+    # winner's committed schema instead of zipping new rows against stale column names.
     db.execute("BEGIN IMMEDIATE")
     try:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(recovery_adoptions)")]
+        if ({"evidence_reference", "ownership_evidence"} <= set(columns)
+                or "evidence" not in columns):
+            db.commit()
+            return
         legacy = [dict(zip(columns, row)) for row in db.execute(
             "SELECT * FROM recovery_adoptions").fetchall()]
         db.execute("ALTER TABLE recovery_adoptions RENAME TO recovery_adoptions_legacy")

@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -193,6 +194,102 @@ class RecoveryTests(unittest.TestCase):
         # The legacy row has no locator, so it cannot be consumed as strict evidence.
         with self.assertRaisesRegex(ValueError, "evidence reference locator"):
             recovery._validate_adoption(migrated, record, "legacy-adoption")
+
+    def test_concurrent_adoption_migration_preserves_every_value(self):
+        legacy_path = self.root / "concurrent-legacy-adoption.sqlite"
+        old = sqlite3.connect(legacy_path)
+        old.executescript("""
+        CREATE TABLE recoveries (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+        INSERT INTO recoveries VALUES ('recovery-a','authorized');
+        INSERT INTO recoveries VALUES ('recovery-b','claimed');
+        CREATE TABLE recovery_adoptions (
+          id TEXT PRIMARY KEY,
+          owner_task_id TEXT NOT NULL, owner_sid TEXT NOT NULL,
+          failed_sid TEXT NOT NULL, failed_turn TEXT NOT NULL, failed_task_id TEXT NOT NULL,
+          cwd TEXT NOT NULL, owned_worktree TEXT NOT NULL,
+          branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
+          decision TEXT NOT NULL, evidence TEXT NOT NULL, note TEXT NOT NULL,
+          created REAL NOT NULL);
+        INSERT INTO recovery_adoptions VALUES ('adoption-a','owner-a','sid-a','sid-a',
+          'turn-a','failed-a','/cwd-a','/tree-a','branch-a','head-a','digest-a',
+          'decision-a','evidence-a','note-a',1.5);
+        INSERT INTO recovery_adoptions VALUES ('adoption-b','owner-b','sid-b','sid-b',
+          'turn-b','failed-b','/cwd-b','/tree-b','branch-b','head-b','digest-b',
+          'decision-b','evidence-b','note-b',2.5);
+        """)
+        old.commit()
+        old.close()
+
+        first_locked = threading.Event()
+        release_first = threading.Event()
+        second_begin = threading.Event()
+        errors = []
+
+        class CoordinatedConnection:
+            """Pause one opener at the migration's write-lock boundary."""
+
+            def __init__(self, connection, *, after_begin=None, before_begin=None):
+                self.connection = connection
+                self.after_begin = after_begin
+                self.before_begin = before_begin
+
+            def execute(self, sql, *args):
+                if sql.strip().upper() == "BEGIN IMMEDIATE":
+                    if self.before_begin:
+                        self.before_begin.set()
+                    result = self.connection.execute(sql, *args)
+                    if self.after_begin:
+                        self.after_begin.set()
+                        release_first.wait(timeout=10)
+                    return result
+                return self.connection.execute(sql, *args)
+
+            def commit(self):
+                return self.connection.commit()
+
+            def rollback(self):
+                return self.connection.rollback()
+
+        def migrate(connection, **coordination):
+            try:
+                store._upgrade_recovery_adoptions(
+                    CoordinatedConnection(connection, **coordination))
+            except BaseException as error:  # surfaced by the assertion below
+                errors.append(error)
+            finally:
+                connection.close()
+
+        first = sqlite3.connect(legacy_path, timeout=10, check_same_thread=False)
+        first_thread = threading.Thread(
+            target=migrate, args=(first,), kwargs={"after_begin": first_locked})
+        first_thread.start()
+        self.assertTrue(first_locked.wait(5), "first migration did not acquire the write lock")
+        second = sqlite3.connect(legacy_path, timeout=10, check_same_thread=False)
+        second_thread = threading.Thread(
+            target=migrate, args=(second,), kwargs={"before_begin": second_begin})
+        second_thread.start()
+        self.assertTrue(second_begin.wait(5), "second migration did not reach BEGIN IMMEDIATE")
+        release_first.set()
+        first_thread.join(10)
+        second_thread.join(10)
+        self.assertFalse(first_thread.is_alive(), "first migration did not finish")
+        self.assertFalse(second_thread.is_alive(), "second migration did not finish")
+        self.assertEqual(errors, [])
+
+        check = sqlite3.connect(legacy_path)
+        self.addCleanup(check.close)
+        self.assertEqual(check.execute(
+            "SELECT id,evidence_reference,ownership_evidence,decision,note,created "
+            "FROM recovery_adoptions ORDER BY id").fetchall(), [
+                ("adoption-a", "", "evidence-a", "decision-a", "note-a", 1.5),
+                ("adoption-b", "", "evidence-b", "decision-b", "note-b", 2.5),
+            ])
+        self.assertEqual(check.execute(
+            "SELECT id,status FROM recoveries ORDER BY id").fetchall(),
+            [("recovery-a", "authorized"), ("recovery-b", "claimed")])
+        self.assertIsNone(check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='recovery_adoptions_legacy'").fetchone())
 
     def test_legacy_recovery_migration_rolls_back_as_one_transaction(self):
         legacy_path = self.root / "interrupted-legacy-fleet.sqlite"
