@@ -781,6 +781,27 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE kind='task_uncertain'")
                          .fetchone()[0], 1)
 
+    def test_blocked_successor_with_uncertain_cleanup_keeps_claim(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="running")
+        self.write_successor_turn("blocked")
+        turn_dir = paths.OPENCODE / self.sid / "turns/turn_successor"
+        for name in ("state.json", "result.json"):
+            path = turn_dir / name
+            payload = json.loads(path.read_text())
+            payload["cleanup"] = "uncertain"
+            path.write_text(json.dumps(payload))
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]):
+            manager.observe(self.db, self.sid, {"state": "blocked", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "uncertain")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE kind='task_uncertain'")
+                         .fetchone()[0], 1)
+
     def test_stopped_proof_checks_retained_result_and_process_group(self):
         self.write_successor_turn("done")
         result_path = paths.OPENCODE / self.sid / "turns/turn_successor/result.json"
