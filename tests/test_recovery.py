@@ -593,15 +593,19 @@ class RecoveryTests(unittest.TestCase):
             slots = {self.sid: self.slot, self.other_sid: self.other_slot}
             states = {self.sid: {"state": "error", "cwd": str(self.native_cwd)},
                       self.other_sid: {"state": "idle", "cwd": str(self.other_native_cwd)}}
-            dispatch.dispatch(self.db, slots, states,
-                              lambda *args, **kwargs: sent.append(kwargs["task_id"]))
+            # The dispatcher reloads the roster inside the shared model lock, so
+            # the current configuration has to describe both workers.
+            with patch.object(paths, "opencode_slots", return_value=[self.slot, self.other_slot]):
+                dispatch.dispatch(self.db, slots, states,
+                                  lambda *args, **kwargs: sent.append(kwargs["task_id"]))
             self.assertEqual(sent, ["later-task"])
             self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                              (self.successor,)).fetchone()[0], "queued")
             self.assertEqual(self.db.execute("SELECT status FROM recoveries").fetchone()[0],
                              "authorized")
             # Re-observation reports once and never claims/sends the invalid successor.
-            dispatch.dispatch(self.db, slots, states, lambda *args, **kwargs: self.fail("resent"))
+            with patch.object(paths, "opencode_slots", return_value=[self.slot, self.other_slot]):
+                dispatch.dispatch(self.db, slots, states, lambda *args, **kwargs: self.fail("resent"))
             events = self.db.execute("SELECT body FROM events WHERE kind='needs_attention'").fetchall()
             self.assertEqual(len(events), 1)
             self.assertEqual(json.loads(events[0][0])["taskId"], self.successor)

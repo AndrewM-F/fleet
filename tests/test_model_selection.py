@@ -481,6 +481,102 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertEqual(self.db.execute(
             "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
 
+    # -- the fail-closed reload --------------------------------------------
+    def test_a_removed_worker_is_never_launched_from_a_cached_roster(self):
+        # The worker was retired from the configuration after the roster was
+        # loaded. The claim is refused, the task stays queued and the sender is
+        # never called.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        cfg = self.config()
+        cfg["opencode"] = [entry for entry in cfg["opencode"]
+                           if entry["sessionId"] != sid]
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+        # The refusal is recorded once, so the stall is never silent.
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM events WHERE kind='needs_attention'").fetchone()[0], 1)
+
+    def test_an_unreadable_configuration_leaves_the_task_queued(self):
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        self.config_path.unlink()
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM events WHERE kind='needs_attention'").fetchone()[0], 1)
+
+    def test_a_malformed_configuration_leaves_the_task_queued(self):
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        self.config_path.write_text("{ this is not json")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+
+    def test_an_ambiguous_configuration_leaves_the_task_queued(self):
+        # The configuration describes the same session twice.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        cfg = self.config()
+        cfg["opencode"].append(dict(cfg["opencode"][0]))
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+
+    def test_the_reload_refuses_a_missing_unreadable_malformed_or_ambiguous_configuration(self):
+        sid = self.sids[0]
+        slot = dict(self.slot(sid))
+        pristine = self.config()
+
+        def write(entries):
+            cfg = dict(pristine)
+            cfg["opencode"] = entries
+            self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+        self.assertEqual(model_selection.current_slot(slot)["model"], MINIMAX)
+        # A worker that is no longer configured.
+        write([entry for entry in pristine["opencode"] if entry["sessionId"] != sid])
+        with self.assertRaisesRegex(ValueError, "one existing configured OpenCode session"):
+            model_selection.current_slot(slot)
+        # A configuration that describes the worker twice.
+        write(pristine["opencode"] + [dict([entry for entry in pristine["opencode"]
+                                            if entry["sessionId"] == sid][0])])
+        with self.assertRaisesRegex(ValueError, "one existing configured OpenCode session"):
+            model_selection.current_slot(slot)
+        # A configuration that cannot be read.
+        self.config_path.unlink()
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            model_selection.current_slot(slot)
+        # A configuration that cannot be parsed.
+        self.config_path.write_text("{ this is not json")
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            model_selection.current_slot(slot)
+
     # -- nothing else is touched ------------------------------------------
     def test_selection_clears_no_hold_and_keeps_every_other_field(self):
         self.add_task("t-held")

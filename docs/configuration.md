@@ -58,7 +58,12 @@ switching an active worker never makes its running turn uncancellable. A selecti
 dispatch claim share one lock, so a task is never claimed under one model and launched
 under another, and the dispatcher re-reads the configuration inside that lock, so a
 selection that lands after the roster was loaded is still the model the claim and the
-launch use. The selection clears no hold,
+launch use. That reload is fail-closed: the configuration must be readable and must
+describe the worker exactly once. An unreadable or malformed configuration, a worker
+that was removed from the roster, and an ambiguous configuration are all refusals, so a
+retired worker is never launched from a cached roster, an outdated model is never
+launched from a configuration that could not be read, and the task stays queued with
+the refusal recorded. The selection clears no hold,
 dispatch flag, queue, account, session id or working directory, and it never contacts a
 provider.
 

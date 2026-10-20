@@ -10,6 +10,17 @@ from . import holds, model_selection, recovery
 from .store import BUSY, emit
 
 
+def _report_refusal(db, task_id, sid, error):
+    """Record a refusal once, so a task that cannot be claimed is never silent."""
+    for (body,) in db.execute("SELECT body FROM events WHERE kind='needs_attention'").fetchall():
+        try:
+            if json.loads(body).get("taskId") == task_id:
+                return
+        except (TypeError, json.JSONDecodeError):
+            continue
+    emit(db, "needs_attention", taskId=task_id, sessionId=sid, error=str(error))
+
+
 def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
     if paused:
         return
@@ -81,11 +92,15 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
                 # The roster was loaded before this claim, so a selection that
                 # landed since then is not in it. The configuration is reloaded
                 # and validated inside the shared lock, so the claim and the
-                # launch use the model that is current now.
+                # launch use the model that is current now. The reload is
+                # fail-closed: an unreadable configuration, a removed worker
+                # or an ambiguous one is a refusal, never a fallback to the
+                # cached roster.
                 try:
                     launch_slot = model_selection.current_slot(slot)
-                except (ValueError, OSError):
-                    continue  # The worker is no longer the configured one; leave the task queued.
+                except (ValueError, OSError) as error:
+                    _report_refusal(db, task_id, sid, error)
+                    continue  # Leave the task queued; the sender is never called.
                 if not launch_slot.get("dispatchEnabled", False):
                     continue
                 try:

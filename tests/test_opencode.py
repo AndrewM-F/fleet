@@ -99,6 +99,17 @@ class OpenCodeAdapterTests(unittest.TestCase):
         exe = patch.object(paths, "executable", return_value="/usr/bin/opencode")
         exe.start()
         self.addCleanup(exe.stop)
+        # The dispatcher reloads the roster inside the shared model lock, so the
+        # current configuration has to describe this worker. An explicit
+        # configuration is still read the way the runtime reads it.
+        def opencode_slots(cfg=None):
+            if cfg is None:
+                return [self.slot]
+            return [dict(raw, provider="opencode") for raw in cfg.get("opencode", [])]
+
+        roster = patch.object(paths, "opencode_slots", side_effect=opencode_slots)
+        roster.start()
+        self.addCleanup(roster.stop)
         self.identity = {"pid": 43001, "pgid": 43001, "start": [100, 200],
                          "executable": "/usr/bin/opencode"}
 
@@ -420,8 +431,9 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(self.db.execute("SELECT state FROM tasks").fetchone()[0], "queued")
         slots[self.sid]["dispatchEnabled"] = True
-        dispatch.dispatch(self.db, slots, states,
-                          lambda *args, **kwargs: sent.append((args, kwargs)))
+        with patch.object(paths, "opencode_slots", return_value=[slots[self.sid]]):
+            dispatch.dispatch(self.db, slots, states,
+                              lambda *args, **kwargs: sent.append((args, kwargs)))
         self.assertEqual(sent[0][0], (slots[self.sid], "tiny task"))
         # The launch carries the model the task was claimed under.
         self.assertEqual(sent[0][1], {"task_id": "t1", "model": opencode.MODEL})

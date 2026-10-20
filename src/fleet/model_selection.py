@@ -89,21 +89,25 @@ def current_slot(slot):
 
     The dispatcher reloads the roster inside the shared model lock, so a
     selection that lands after the roster was loaded is still seen before the
-    claim. The roster snapshot is kept when the configuration cannot be read
-    or does not describe this worker, so dispatch never stops because a
-    configuration could not be read; a worker whose working directory changed
-    under the dispatcher is refused rather than launched elsewhere.
+    claim. The reload is fail-closed: the configuration must be readable and
+    must describe this worker exactly once. An unreadable or malformed
+    configuration, a worker that was removed from the roster, and an ambiguous
+    configuration are all refusals. A retired worker is therefore never
+    launched from a cached roster, and an outdated model is never launched
+    from a configuration that could not be read.
     """
+    sid = slot.get("sessionId")
     try:
         entries = paths.opencode_slots()
-    except (OSError, ValueError):
-        return slot
-    for entry in entries:
-        if entry.get("sessionId") == slot.get("sessionId"):
-            if str(Path(entry.get("cwd", "")).resolve()) != str(Path(slot.get("cwd", "")).resolve()):
-                raise ValueError("OpenCode worker cwd changed since the roster was loaded")
-            return entry
-    return slot
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        raise ValueError("OpenCode configuration could not be read: " + str(error)) from error
+    matches = [entry for entry in entries if entry.get("sessionId") == sid]
+    if len(matches) != 1:
+        raise ValueError("Worker must be one existing configured OpenCode session")
+    entry = matches[0]
+    if str(Path(entry.get("cwd", "")).resolve()) != str(Path(slot.get("cwd", "")).resolve()):
+        raise ValueError("OpenCode worker cwd changed since the roster was loaded")
+    return entry
 
 
 def busy_workers(db, cfg=None):

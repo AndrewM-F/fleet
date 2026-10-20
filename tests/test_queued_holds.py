@@ -41,6 +41,11 @@ class QueuedHoldTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # The dispatcher reloads the roster inside the shared model lock, so the
+        # current configuration has to describe this worker.
+        roster = patch.object(paths, "opencode_slots", return_value=[self.slot])
+        roster.start()
+        self.addCleanup(roster.stop)
 
     def add_task(self, task_id, state="queued", sid="worker"):
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
