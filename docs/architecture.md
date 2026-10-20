@@ -19,9 +19,11 @@
   immutable `recovery_adoptions` record when history predates the exact path/branch convention, or
   a durable direct-turn ownership receipt in `data/recovery/` when the original native turn
   predates the task ledger entirely and no task row exists). A direct-turn receipt records the
-  original session, the canonical owned worktree, the branch and the initial head, and is proved
-  against the native session row (its directory, configured model, succeeded idle outcome and
-  completed assistant output) and the unchanged checkout before authorization; its path and digest
+  original session, the canonical owned worktree, the branch, the initial head, and the exact
+  original user and successful idle message IDs. Those IDs bind a completed assistant to one
+  native turn before the failed managed turn; the mutable session-wide idle outcome cannot
+  substitute for that proof. The native session directory/model and unchanged checkout are also
+  checked before authorization; its path and digest
   are stored with the recovery and re-proved before the successor dispatches. It never creates,
   edits or fabricates a Fleet task.
   Native session CWD stays

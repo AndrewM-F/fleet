@@ -273,9 +273,12 @@ class HeldRecoverySuccessorTests(unittest.TestCase):
                   "cwd": str(self.native.resolve()), "model": opencode.MODEL}
         (session / "current.json").write_text(json.dumps(launch))
         state = dict(launch, state="error", cleanup="confirmed", error="failed", finishedAt=100)
-        result = dict(taskId=self.failed, sessionId=self.sid, cwd=str(self.native.resolve()),
+        result = dict(turn=self.turn, taskId=self.failed, sessionId=self.sid,
+                      cwd=str(self.native.resolve()), expectedModel=opencode.MODEL,
                       state="error", cleanup="confirmed", error="failed", toolFailures=[],
-                      finishedAt=100)
+                      finishedAt=100, managedProcessIdentity={
+                          "pid": 9999999, "pgid": 9999999, "start": [1],
+                          "executable": "/usr/bin/opencode"})
         (turn_dir / "state.json").write_text(json.dumps(state))
         (turn_dir / "result.json").write_text(json.dumps(result))
 

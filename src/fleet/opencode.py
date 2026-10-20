@@ -777,7 +777,7 @@ def run_turn(request_path):
     logs = Path(request["logDir"])
     logs.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
-    status = {"sessionId": sid, "cwd": cwd, "model": model, "provider": "opencode",
+    status = {"turn": turn, "sessionId": sid, "cwd": cwd, "model": model, "provider": "opencode",
               "taskId": request["taskId"], "state": "launching", "progress": 0,
               "startedAt": time.time(), "pid": os.getpid()}
     _write_status(state_path, status)

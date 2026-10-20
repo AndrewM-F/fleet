@@ -55,12 +55,14 @@
   ```sh
   cat > "$FLEET_ROOT/data/recovery/direct-turn-<id>.json" <<'JSON'
   {
-    "schemaVersion": "pi-direct-turn-ownership/v1",
+    "schemaVersion": "pi-direct-turn-ownership/v2",
     "originalSession": "ses_...",
     "ownedWorktree": "/absolute/path/to/the/owned/worktree",
     "branch": "branch-name",
     "initialHead": "full commit sha the direct turn started from",
     "startedAt": 1792480175,
+    "originalUserMessageId": "msg_...",
+    "completionIdleMessageId": "msg_...",
     "note": "substantive operator statement about that direct turn"
   }
   JSON
@@ -68,7 +70,9 @@
   ```
   The receipt is proved before anything is authorized: its session must be the recovering worker,
   the native session row must show that session in the recorded worktree with the configured model,
-  a succeeded idle outcome and completed assistant output, the recorded branch must be the
+  and those exact native message IDs must bound the original user turn, its final completed
+  assistant, and its successful idle marker before the failed managed turn. A later session-wide
+  idle outcome or assistant message cannot prove the original turn. The recorded branch must be the
   checkout's branch, the recorded initial head must be an ancestor of the current head, and the
   current snapshot must be unchanged. The receipt's path and digest are recorded with the recovery
   and re-proved before the successor dispatches, so a receipt that is later edited is refused. A

@@ -170,9 +170,12 @@ class RecoveryLaunchPathTests(unittest.TestCase):
         if state_extra:
             turn_state.update(state_extra)
         (turn_dir / "state.json").write_text(json.dumps(turn_state))
-        result = dict(taskId=self.failed_task, sessionId=self.sid,
+        result = dict(turn=self.turn, taskId=self.failed_task, sessionId=self.sid,
+                      expectedModel=model,
                       cwd=str(self.native_cwd.resolve()), state=state, cleanup=cleanup,
-                      error=error, toolFailures=[], finishedAt=100)
+                      error=error, toolFailures=[], finishedAt=100,
+                      managedProcessIdentity={"pid": 9999999, "pgid": 9999999,
+                                              "start": [1], "executable": "/usr/bin/opencode"})
         if tool_failures is not None:
             result["toolFailures"] = tool_failures
         if process_identity is not None:
@@ -298,6 +301,16 @@ class RecoveryLaunchPathTests(unittest.TestCase):
 
         result, popen = self.run_turn(request_path)
         self.assertEqual(result["state"], "done")
+        retained = json.loads((request_path.parent / "result.json").read_text())
+        state = json.loads((request_path.parent / "state.json").read_text())
+        self.assertEqual(state["turn"], request_path.parent.name)
+        self.assertNotIn("processIdentity", state)
+        self.assertEqual(set(retained["managedProcessIdentity"]),
+                         {"pid", "pgid", "start", "executable"})
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            stopped, _ = recovery.verify_stopped_native_execution(self.slot, self.successor)
+        self.assertTrue(stopped)
         self.assertEqual(result["actualProvider"], CONFIGURED_PROVIDER)
         self.assertEqual(result["actualModel"], CONFIGURED_MODEL_ID)
         args = popen.call_args.args[0]
@@ -434,7 +447,8 @@ class RecoveryLaunchPathTests(unittest.TestCase):
     # -- negatives --------------------------------------------------------
     def test_a_live_native_process_group_blocks_the_recovery(self):
         self.prepare_failure(model=CONFIGURED_MODEL,
-                            process_identity={"pid": 4242, "pgid": 4242})
+                            process_identity={"pid": 4242, "pgid": 4242, "start": [1],
+                                              "executable": "/usr/bin/opencode"})
         with patch.object(opencode, "_group_exists", return_value=True):
             with self.assertRaisesRegex(ValueError, "process group is still live"):
                 self.authorize()

@@ -90,9 +90,12 @@ class RecoveryTests(unittest.TestCase):
         state = dict(launch, state="error", cleanup="confirmed",
                      error="OpenCode turn did not produce a verified native completion",
                      finishedAt=100)
-        result = dict(taskId=task_id, sessionId=sid, cwd=str(cwd),
+        result = dict(turn=turn, taskId=task_id, sessionId=sid, cwd=str(cwd),
+                      expectedModel=opencode.MODEL,
                       state="error", cleanup="confirmed", error=state["error"], toolFailures=[],
-                      finishedAt=100)
+                      finishedAt=100, managedProcessIdentity={
+                          "pid": 9999999, "pgid": 9999999, "start": [1],
+                          "executable": "/usr/bin/opencode"})
         (turn_dir / "state.json").write_text(json.dumps(state))
         (turn_dir / "result.json").write_text(json.dumps(result))
 
@@ -728,7 +731,8 @@ class RecoveryTests(unittest.TestCase):
     def test_live_recorded_native_process_blocks_recovery(self):
         result_path = paths.OPENCODE / self.sid / "turns" / self.turn / "result.json"
         result = json.loads(result_path.read_text())
-        result["managedProcessIdentity"] = {"pid": 123, "pgid": 123}
+        result["managedProcessIdentity"] = {"pid": 123, "pgid": 123, "start": [1],
+                                            "executable": "/usr/bin/opencode"}
         result_path.write_text(json.dumps(result))
         with patch.object(opencode, "identity_matches", return_value=True):
             with self.assertRaisesRegex(ValueError, "process group is still live"):
@@ -747,12 +751,71 @@ class RecoveryTests(unittest.TestCase):
                           lambda *args, **kwargs: None)
         manager.observe(self.db, self.sid, {"state": "working", "cwd": str(self.native_cwd),
                                             "progress": 1}, now=10)
-        manager.observe(self.db, self.sid, {"state": "done", "cwd": str(self.native_cwd),
-                                            "progress": 2}, now=20)
+        self.write_successor_turn("done")
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]), \
+                patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            manager.observe(self.db, self.sid, {"state": "done", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "finished")
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "completed")
+
+    def test_terminal_successor_without_retained_process_identity_keeps_claim(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="running")
+        self.write_successor_turn("done")
+        result_path = paths.OPENCODE / self.sid / "turns/turn_successor/result.json"
+        result = json.loads(result_path.read_text())
+        result.pop("managedProcessIdentity")
+        result_path.write_text(json.dumps(result))
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]):
+            manager.observe(self.db, self.sid, {"state": "done", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "uncertain")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE kind='task_uncertain'")
+                         .fetchone()[0], 1)
+
+    def test_stopped_proof_checks_retained_result_and_process_group(self):
+        self.write_successor_turn("done")
+        result_path = paths.OPENCODE / self.sid / "turns/turn_successor/result.json"
+        original = json.loads(result_path.read_text())
+        for changed in ({"managedProcessIdentity": None}, {"cleanup": "uncertain"},
+                        {"taskId": "another-task"}, {"finishedAt": 101}):
+            with self.subTest(changed=changed):
+                result_path.write_text(json.dumps(dict(original, **changed)))
+                stopped, _ = recovery.verify_stopped_native_execution(self.slot, self.successor)
+                self.assertFalse(stopped)
+        result_path.write_text(json.dumps(original))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            stopped, reason = recovery.verify_stopped_native_execution(self.slot,
+                                                                         self.successor)
+        self.assertFalse(stopped)
+        self.assertIn("still live", reason)
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=True):
+            stopped, reason = recovery.verify_stopped_native_execution(self.slot,
+                                                                         self.successor)
+        self.assertFalse(stopped)
+        self.assertIn("group is still present", reason)
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            stopped, _ = recovery.verify_stopped_native_execution(self.slot, self.successor)
+        self.assertTrue(stopped)
+
+    def test_failed_turn_without_full_retained_identity_cannot_be_authorized(self):
+        result_path = paths.OPENCODE / self.sid / "turns" / self.turn / "result.json"
+        result = json.loads(result_path.read_text())
+        result["managedProcessIdentity"] = {"pid": 9999999, "pgid": 9999999}
+        result_path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, "no complete native process identity"):
+            self.authorize()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
 
     # --- retirement / reconciliation --------------------------------------
     def enqueue_successor(self):
@@ -776,6 +839,15 @@ class RecoveryTests(unittest.TestCase):
             payload["processIdentity"] = identity
         if state in {"stopped", "error", "done", "completed", "blocked"}:
             payload["cleanup"] = "confirmed"
+            payload["finishedAt"] = 100
+            retained = identity if identity is not None else {
+                "pid": 4242, "pgid": 4242, "start": [1, 2],
+                "executable": "/usr/bin/opencode"}
+            (turn_dir / "result.json").write_text(json.dumps({
+                "turn": turn, "taskId": self.successor, "sessionId": self.sid,
+                "cwd": str(self.native_cwd), "expectedModel": opencode.MODEL,
+                "state": state, "cleanup": "confirmed", "finishedAt": 100,
+                "managedProcessIdentity": retained}))
         (turn_dir / "state.json").write_text(json.dumps(payload))
         (paths.OPENCODE / self.sid / "current.json").write_text(json.dumps(
             {"turn": turn, "taskId": self.successor, "sessionId": self.sid,
@@ -841,8 +913,10 @@ class RecoveryTests(unittest.TestCase):
                                          (self.successor,)).fetchone()[0], "uncertain")
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
-        self.write_successor_turn("stopped")   # no live identity, cleanup confirmed
-        resolved = ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
+        self.write_successor_turn("stopped")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            resolved = ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
         self.assertEqual(resolved["state"], "cancelled")
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "cancelled")
@@ -861,7 +935,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
         self.write_successor_turn("stopped")
-        result = recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            result = recovery.reconcile_successor(self.db, self.successor, "operator evidence")
         self.assertTrue(result["reconciled"])
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "reconciled")
@@ -939,8 +1015,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
 
-        result = recovery.reconcile_successor(
-            self.db, self.successor, "verified stopped successor")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            result = recovery.reconcile_successor(
+                self.db, self.successor, "verified stopped successor")
         self.assertTrue(result["reconciled"])
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "cancelled")

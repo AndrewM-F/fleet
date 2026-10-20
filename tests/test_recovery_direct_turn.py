@@ -22,10 +22,9 @@ class DirectTurnOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.native_cwd = self.root / "native-worker"
-        self.native_cwd.mkdir()
         self.worktree = self.root / "owned-worktree"
         self.worktree.mkdir()
+        self.native_cwd = self.worktree  # the existing native session stays in its own CWD
         subprocess.run(["git", "init", "-q", "-b", "lane/direct", str(self.worktree)], check=True)
         subprocess.run(["git", "-C", str(self.worktree), "config", "user.email", "fleet@test"],
                        check=True)
@@ -46,6 +45,8 @@ class DirectTurnOwnershipTests(unittest.TestCase):
         self.failed_task = "failed-direct-task"
         self.successor = "successor-direct-task"
         self.started_at = 1792480175
+        self.user_message = "msg_directuser1"
+        self.idle_message = "msg_directidle1"
         self.native_db = self.root / "native.db"
         with sqlite3.connect(self.native_db) as native:
             native.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, project_id TEXT, "
@@ -57,8 +58,18 @@ class DirectTurnOwnershipTests(unittest.TestCase):
             native.execute("CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, "
                            "seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
             native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
-                           ("m1", self.sid, "assistant", 1, self.started_at * 1000,
-                            self.started_at * 1000, "{}"))
+                           (self.user_message, self.sid, "user", 1,
+                            self.started_at * 1000, self.started_at * 1000, "{}"))
+            native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           ("msg_directassistant1", self.sid, "assistant", 2,
+                            self.started_at * 1000 + 1000, self.started_at * 1000 + 3000,
+                            json.dumps({"finish": "stop", "time": {"completed":
+                                        self.started_at * 1000 + 3000}, "model": {
+                                        "id": "minimax-m3.1-flash-free", "providerID": "opencode-go"}})))
+            native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           (self.idle_message, self.sid, "idle", 3,
+                            self.started_at * 1000 + 5000, self.started_at * 1000 + 5000,
+                            json.dumps({"outcome": "succeeded"})))
         self.slot = {"sessionId": self.sid, "cwd": str(self.native_cwd),
                      "sessionCwd": str(self.native_cwd), "databasePath": str(self.native_db),
                      "model": MODEL, "provider": "opencode", "dispatchEnabled": True}
@@ -103,12 +114,14 @@ class DirectTurnOwnershipTests(unittest.TestCase):
         (session / "current.json").write_text(json.dumps(launch))
         state = dict(launch, state="error", cleanup="confirmed",
                      error="OpenCode turn did not produce a verified native completion",
-                     finishedAt=100)
-        result = dict(taskId=self.failed_task, sessionId=self.sid, cwd=launch["cwd"],
+                     startedAt=self.started_at + 10, finishedAt=self.started_at + 20)
+        result = dict(turn=self.turn, taskId=self.failed_task, sessionId=self.sid, cwd=launch["cwd"],
+                      expectedModel=MODEL,
                       state="error", cleanup="confirmed", error=state["error"], toolFailures=[],
-                      finishedAt=100)
-        if identity:
-            result["managedProcessIdentity"] = identity
+                      finishedAt=self.started_at + 20,
+                      managedProcessIdentity=identity or {"pid": 9999999, "pgid": 9999999,
+                                                         "start": [1],
+                                                         "executable": "/usr/bin/opencode"})
         (turn_dir / "state.json").write_text(json.dumps(state))
         (turn_dir / "result.json").write_text(json.dumps(result))
 
@@ -116,7 +129,8 @@ class DirectTurnOwnershipTests(unittest.TestCase):
         document = {"schemaVersion": recovery.DIRECT_TURN_RECEIPT_VERSION,
                     "originalSession": self.sid, "ownedWorktree": str(self.worktree.resolve()),
                     "branch": "lane/direct", "initialHead": self.initial_head,
-                    "startedAt": self.started_at, "note": NOTE}
+                    "startedAt": self.started_at, "originalUserMessageId": self.user_message,
+                    "completionIdleMessageId": self.idle_message, "note": NOTE}
         document.update(overrides)
         self.receipt.write_text(json.dumps(document, indent=2) + "\n")
         return document
@@ -158,7 +172,8 @@ class DirectTurnOwnershipTests(unittest.TestCase):
         self.assertEqual(event["direct_turn_receipt"], str(self.receipt.resolve()))
         self.assertEqual(event["direct_turn_evidence"]["nativeSession"], self.sid)
         self.assertEqual(event["direct_turn_evidence"]["nativeIdleOutcome"], "succeeded")
-        self.assertEqual(event["direct_turn_evidence"]["nativeAssistantMessages"], 1)
+        self.assertEqual(event["direct_turn_evidence"]["nativeUserMessage"], self.user_message)
+        self.assertEqual(event["direct_turn_evidence"]["nativeIdleMessage"], self.idle_message)
 
     def test_wrong_original_session_is_refused(self):
         self.write_receipt(originalSession=self.other_sid)
@@ -230,15 +245,67 @@ class DirectTurnOwnershipTests(unittest.TestCase):
 
     def test_native_session_without_a_completed_turn_is_refused(self):
         with sqlite3.connect(self.native_db) as native:
-            native.execute("UPDATE session_v2 SET idle_outcome='aborted' WHERE id=?", (self.sid,))
+            native.execute("UPDATE session_message SET data=? WHERE id=?",
+                           (json.dumps({"outcome": "aborted"}), self.idle_message))
         with self.assertRaisesRegex(ValueError, "did not complete successfully"):
             self.authorize()
         self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
 
+    def test_later_success_cannot_prove_the_original_failed_turn(self):
+        # The session-wide outcome is succeeded, but the original turn ended
+        # aborted. A later success must not be counted as its completion.
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("UPDATE session_message SET data=? WHERE id=?",
+                           (json.dumps({"outcome": "aborted"}), self.idle_message))
+            native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           ("msg_lateruser1", self.sid, "user", 4,
+                            self.started_at * 1000 + 6000,
+                            self.started_at * 1000 + 6000, "{}"))
+            native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           ("msg_laterassistant1", self.sid, "assistant", 5,
+                            self.started_at * 1000 + 7000,
+                            self.started_at * 1000 + 8000,
+                            json.dumps({"finish": "stop", "time": {"completed":
+                                        self.started_at * 1000 + 8000}, "model": {
+                                        "id": "minimax-m3.1-flash-free", "providerID": "opencode-go"}})))
+            native.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                           ("msg_lateridle1", self.sid, "idle", 6,
+                            self.started_at * 1000 + 9000,
+                            self.started_at * 1000 + 9000,
+                            json.dumps({"outcome": "succeeded"})))
+        self.write_receipt(completionIdleMessageId="msg_lateridle1")
+        with self.assertRaisesRegex(ValueError, "spans another turn"):
+            self.authorize()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
+
+    def test_completion_after_failed_managed_turn_is_not_original_provenance(self):
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("UPDATE session_message SET time_created=?,time_updated=? "
+                           "WHERE id=?", (self.started_at * 1000 + 11000,
+                                          self.started_at * 1000 + 11000,
+                                          self.idle_message))
+        with self.assertRaisesRegex(ValueError, "earlier native turn"):
+            self.authorize()
+
+    def test_receipt_requires_exact_native_message_ids(self):
+        self.write_receipt(originalUserMessageId="msg_wronguser1")
+        with self.assertRaisesRegex(ValueError, "earlier native turn"):
+            self.authorize()
+
+    def test_legacy_unbound_receipt_is_refused(self):
+        document = self.write_receipt(schemaVersion="pi-direct-turn-ownership/v1")
+        document.pop("originalUserMessageId")
+        document.pop("completionIdleMessageId")
+        self.receipt.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            self.authorize()
+
     def test_native_session_in_another_directory_is_refused(self):
+        other = self.root / "other-native-directory"
+        other.mkdir()
         with sqlite3.connect(self.native_db) as native:
             native.execute("UPDATE session_v2 SET directory=? WHERE id=?",
-                           (str(self.native_cwd.resolve()), self.sid))
+                           (str(other.resolve()), self.sid))
         with self.assertRaisesRegex(ValueError, "differs from the native session directory"):
             self.authorize()
         self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)

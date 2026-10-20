@@ -42,6 +42,17 @@ _RATE_LIMIT = re.compile(
 )
 
 
+def _full_process_identity(value):
+    """A retained native child identity must bind PID reuse, group and executable."""
+    return (isinstance(value, dict)
+            and all(isinstance(value.get(key), int) and not isinstance(value[key], bool)
+                    and value[key] > 0 for key in ("pid", "pgid"))
+            and isinstance(value.get("start"), list) and bool(value["start"])
+            and all(isinstance(part, int) and not isinstance(part, bool)
+                    for part in value["start"])
+            and isinstance(value.get("executable"), str) and bool(value["executable"]))
+
+
 def worktree_snapshot(cwd):
     """Fingerprint branch/head, Git status/diff, and non-ignored untracked files.
 
@@ -107,11 +118,12 @@ def verify_failed_turn(session_id, failed_task_id, turn, cwd, model):
                 and state.get("model") == model and state.get("state") == "error"
                 and state.get("cleanup") == "confirmed"
                 and isinstance(state.get("finishedAt"), (int, float))
-                and result.get("turn", turn) == turn
+                and result.get("turn") == turn
                 and result.get("taskId") == failed_task_id
                 and result.get("sessionId") == session_id and result.get("cwd") == cwd
+                and result.get("expectedModel") == model
                 and result.get("state") == "error" and result.get("cleanup") == "confirmed"
-                and isinstance(result.get("finishedAt"), (int, float)))
+                and result.get("finishedAt") == state.get("finishedAt"))
     if not identity:
         raise ValueError("OpenCode error result identity or cleanup is not verified")
     failures = result.get("toolFailures") or []
@@ -123,13 +135,14 @@ def verify_failed_turn(session_id, failed_task_id, turn, cwd, model):
     if _RATE_LIMIT.search(failure_text):
         raise ValueError("Rate-limit/quota failures cannot be recovered by this operation")
     process_identity = result.get("managedProcessIdentity")
-    if process_identity is not None:
-        if not isinstance(process_identity, dict) or not process_identity.get("pid") \
-                or not process_identity.get("pgid"):
-            raise ValueError("OpenCode error receipt has an invalid native process identity")
-        if (opencode.identity_matches(process_identity)
-                or opencode._group_exists(process_identity["pgid"])):
-            raise ValueError("OpenCode native process group is still live")
+    if not _full_process_identity(process_identity):
+        raise ValueError("OpenCode error receipt has no complete native process identity")
+    if state.get("processIdentity") is not None \
+            and state["processIdentity"] != process_identity:
+        raise ValueError("OpenCode error state and result process identities differ")
+    if (opencode.identity_matches(process_identity)
+            or opencode._group_exists(process_identity["pgid"])):
+        raise ValueError("OpenCode native process group is still live")
     return launch, state, result
 
 
@@ -357,9 +370,10 @@ def _validate_adoption(db, record, adoption_id):
     return adoption
 
 
-DIRECT_TURN_RECEIPT_VERSION = "pi-direct-turn-ownership/v1"
+DIRECT_TURN_RECEIPT_VERSION = "pi-direct-turn-ownership/v2"
 _DIRECT_TURN_RECEIPT_FIELDS = ("schemaVersion", "originalSession", "ownedWorktree",
-                               "branch", "initialHead", "startedAt", "note")
+                               "branch", "initialHead", "startedAt",
+                               "originalUserMessageId", "completionIdleMessageId", "note")
 
 
 def _direct_turn_receipt(path):
@@ -404,6 +418,9 @@ def _direct_turn_receipt(path):
     started = document["startedAt"]
     if isinstance(started, bool) or not isinstance(started, (int, float)) or started <= 0:
         raise ValueError("Direct-turn ownership receipt start time is invalid")
+    for field in ("originalUserMessageId", "completionIdleMessageId"):
+        if not isinstance(document[field], str) or not re.fullmatch(r"msg_[A-Za-z0-9]+", document[field]):
+            raise ValueError("Direct-turn ownership receipt has an invalid native message ID")
     _substantive_ownership_evidence(document["note"], document["ownedWorktree"])
     return resolved, document, hashlib.sha256(resolved.read_bytes()).hexdigest()
 
@@ -424,13 +441,24 @@ def _head_descends_from(worktree, initial_head):
     raise ValueError("Owned worktree ancestry could not be verified")
 
 
-def _direct_turn_native_evidence(receipt, session_id, worktree, model, database_path):
+def _direct_turn_native_evidence(receipt, session_id, worktree, model, database_path,
+                                 failed_turn, failed_task_id):
     """Prove the recorded session ran a completed direct turn in the owned worktree.
 
-    Only metadata is read: the native session identity row, its recorded idle
-    outcome and the count of assistant messages. No message body, credential or
-    auth record is inspected.
+    Bind one original user message to its own successful idle marker and final
+    completed assistant, before the failed managed turn. A later turn's mutable
+    session-wide idle outcome cannot prove this earlier turn's completion.
     """
+    failed_path = opencode.turn_dir(session_id, failed_turn) / "state.json"
+    try:
+        failed = json.loads(failed_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError("Failed managed turn start is unavailable") from error
+    if (not isinstance(failed, dict) or failed.get("sessionId") != session_id
+            or failed.get("taskId") != failed_task_id
+            or not isinstance(failed.get("startedAt"), (int, float))):
+        raise ValueError("Failed managed turn start does not match the direct-turn receipt")
+    failed_started_ms = int(failed["startedAt"] * 1000)
     db_path = Path(database_path).expanduser().resolve()
     if not db_path.is_file():
         raise ValueError("Direct-turn native session database is unavailable")
@@ -445,10 +473,28 @@ def _direct_turn_native_evidence(receipt, session_id, worktree, model, database_
             if not row:
                 raise ValueError("Direct-turn receipt names a session with no native session row")
             directory, native_model, idle_outcome, created, updated = row
-            started = int(receipt["startedAt"] * 1000) - 1000
-            completed = connection.execute(
-                "SELECT count(*) FROM session_message WHERE session_id=? AND type='assistant' "
-                "AND time_created>=?", (session_id, started)).fetchone()[0]
+            messages = connection.execute(
+                "SELECT id,type,seq,time_created,data FROM session_message "
+                "WHERE session_id=? AND id IN (?,?)",
+                (session_id, receipt["originalUserMessageId"],
+                 receipt["completionIdleMessageId"])).fetchall()
+            by_id = {item[0]: item for item in messages}
+            user = by_id.get(receipt["originalUserMessageId"])
+            idle = by_id.get(receipt["completionIdleMessageId"])
+            if (not user or not idle or user[1] != "user" or idle[1] != "idle"
+                    or not isinstance(user[2], int) or not isinstance(idle[2], int)
+                    or user[2] >= idle[2]
+                    or abs(user[3] - int(receipt["startedAt"] * 1000)) > 10_000
+                    or not user[3] < idle[3] < failed_started_ms):
+                raise ValueError("Direct-turn receipt does not identify an earlier native turn")
+            boundaries = connection.execute(
+                "SELECT type FROM session_message WHERE session_id=? AND seq>=? AND seq<=? "
+                "AND type IN ('user','idle') ORDER BY seq", (session_id, user[2], idle[2])
+            ).fetchall()
+            final = connection.execute(
+                "SELECT id,time_created,data FROM session_message WHERE session_id=? "
+                "AND type='assistant' AND seq>? AND seq<? ORDER BY seq DESC LIMIT 1",
+                (session_id, user[2], idle[2])).fetchone()
         finally:
             connection.close()
     except sqlite3.Error as error:
@@ -461,13 +507,30 @@ def _direct_turn_native_evidence(receipt, session_id, worktree, model, database_
     if not native_name or native_name != configured_name \
             or (native_provider and native_provider != configured_provider):
         raise ValueError("Direct-turn receipt session model differs from the configured model")
-    if idle_outcome != "succeeded":
+    if boundaries != [("user",), ("idle",)] or not final:
+        raise ValueError("Direct-turn receipt spans another turn or has no assistant output")
+    try:
+        idle_data = json.loads(idle[4])
+        final_data = json.loads(final[2])
+    except (TypeError, ValueError) as error:
+        raise ValueError("Direct-turn native completion metadata is unreadable") from error
+    if not isinstance(idle_data, dict) or not isinstance(final_data, dict):
+        raise ValueError("Direct-turn native completion metadata is invalid")
+    final_model = final_data.get("model")
+    final_time = final_data.get("time")
+    if not isinstance(final_model, dict) or not isinstance(final_time, dict):
+        raise ValueError("Direct-turn final assistant identity is invalid")
+    completed_at = final_time.get("completed")
+    if (idle_data.get("outcome") != "succeeded" or final_data.get("finish") != "stop"
+            or not isinstance(completed_at, (int, float))
+            or not user[3] < final[1] <= completed_at <= idle[3]
+            or final_model.get("id") != configured_name
+            or final_model.get("providerID") != configured_provider):
         raise ValueError("Native direct turn did not complete successfully")
-    if not completed:
-        raise ValueError("Native direct turn has no completed assistant output")
     return {"nativeSession": session_id, "nativeDirectory": native_directory,
-            "nativeModel": native_model, "nativeIdleOutcome": idle_outcome,
-            "nativeAssistantMessages": completed, "nativeSessionCreated": created,
+            "nativeModel": native_model, "nativeIdleOutcome": idle_data["outcome"],
+            "nativeUserMessage": user[0], "nativeIdleMessage": idle[0],
+            "nativeFinalAssistant": final[0], "nativeSessionCreated": created,
             "nativeSessionUpdated": updated}
 
 
@@ -496,7 +559,8 @@ def _validate_direct_turn(record, slots=None):
     if not _head_descends_from(record["owned_worktree"], receipt["initialHead"]):
         raise ValueError("Direct-turn receipt initial head is not an ancestor of the current head")
     _direct_turn_native_evidence(receipt, sid, record["owned_worktree"], configured_model,
-                                 verified["databasePath"])
+                                 verified["databasePath"], record["failed_turn"],
+                                 record["failed_task_id"])
     return receipt
 
 
@@ -744,7 +808,8 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
             raise ValueError("Direct-turn receipt initial head is not an ancestor of the "
                              "current head")
         direct_turn_evidence = _direct_turn_native_evidence(
-            receipt, session_id, worktree, configured_model, slot["databasePath"])
+            receipt, session_id, worktree, configured_model, slot["databasePath"],
+            turn, failed_task_id)
         direct_turn_path = str(receipt_path)
         direct_turn_digest = receipt_digest
         ownership_task_id = ""
@@ -943,27 +1008,43 @@ def verify_stopped_native_execution(slot, successor_task_id):
     turn = launch.get("turn")
     if launch.get("sessionId") != sid or launch.get("taskId") != successor_task_id:
         return False, "managed native turn pointer does not identify the successor task"
-    state_path = opencode.turn_dir(sid, turn) / "state.json" if isinstance(turn, str) else None
-    if state_path is None or not state_path.exists():
-        return False, "managed native turn state is unavailable"
+    if not isinstance(turn, str) or not turn:
+        return False, "managed native turn identifier is unavailable"
+    turn_root = opencode.turn_dir(sid, turn)
+    state_path, result_path = turn_root / "state.json", turn_root / "result.json"
+    if not state_path.is_file() or not result_path.is_file():
+        return False, "managed native turn state or result is unavailable"
     try:
         current = json.loads(state_path.read_text())
+        result = json.loads(result_path.read_text())
     except (OSError, ValueError):
-        return False, "managed native turn state is unreadable"
-    if (current.get("sessionId") != sid or current.get("taskId") != successor_task_id):
-        return False, "managed native turn state does not identify the successor task"
-    identity = current.get("processIdentity")
-    if isinstance(identity, dict):
-        if opencode.identity_matches(identity):
-            return False, "managed native process is still live"
-        pgid = identity.get("pgid")
-        if pgid and opencode._group_exists(pgid):
-            return False, "managed native process group is still present"
+        return False, "managed native turn state or result is unreadable"
+    if not isinstance(current, dict) or not isinstance(result, dict):
+        return False, "managed native turn state or result is invalid"
+    if (any(source.get("sessionId") != sid or source.get("taskId") != successor_task_id
+            or source.get("turn") != turn or source.get("cwd") != launch.get("cwd")
+            for source in (current, result))
+            or current.get("model") != launch.get("model")
+            or result.get("expectedModel") != launch.get("model")
+            or result.get("state") != current.get("state")
+            or result.get("finishedAt") != current.get("finishedAt")):
+        return False, "managed native turn receipts do not match the successor launch"
     if current.get("state") not in _TERMINAL_NATIVE:
         return False, f"managed native turn is still {current.get('state')}"
-    if current.get("cleanup") != "confirmed":
+    if (current.get("cleanup") != "confirmed" or result.get("cleanup") != "confirmed"
+            or not isinstance(current.get("finishedAt"), (int, float))):
         return False, "managed native turn cleanup is not confirmed"
-    return True, "managed native turn is terminal with confirmed cleanup"
+    identity = result.get("managedProcessIdentity")
+    if not _full_process_identity(identity):
+        return False, "managed native process identity is missing or invalid"
+    retained = current.get("processIdentity")
+    if retained is not None and retained != identity:
+        return False, "managed native process identities disagree"
+    if opencode.identity_matches(identity):
+        return False, "managed native process is still live"
+    if opencode._group_exists(identity["pgid"]):
+        return False, "managed native process group is still present"
+    return True, "managed native turn and recorded process group are stopped with confirmed cleanup"
 
 
 def retire_queued_successor(db, task_id, note):

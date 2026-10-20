@@ -54,7 +54,8 @@ command prints JSON on stdout and exits non-zero on failure.
   original session, the canonical owned worktree, the branch, the initial head, the turn's start
   time and an operator statement. It is proved before authorization: the receipt's session must be
   the recovering worker, the native session row must show that session in the recorded worktree
-  with the configured model and a succeeded idle outcome and completed assistant output, the
+  with the configured model and the receipt's exact original user and successful idle message IDs,
+  with a completed final assistant for that same turn before the failed managed turn, the
   recorded branch must be the checkout's branch, the recorded initial head must be an ancestor of
   the current head, and the current snapshot must be unchanged. The receipt's path and digest are
   recorded with the recovery, and the same proof is rechecked before a successor dispatches. A
