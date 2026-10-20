@@ -102,9 +102,15 @@ retired root: the command reads `<root>/data/opencode/<session>/turns/<turn>/` a
 root's other data. It requires the retained `request.json`, `state.json`, `result.json` and the
 session's `current.json` pointer to identify the same task, turn, session and cwd; the native state
 and result to be terminal `done` with exit code 0 and confirmed cleanup; the recorded native
-process identity and wrapper PID to be gone; the session's dispatch lock to be free; the worker to
-be one this fleet no longer manages; and no other task to own that working directory. A missing,
-unreadable, uncertain or inconsistent receipt is a refusal, and the ledger is left unchanged.
+process identity and wrapper PID to be provably gone; the worker to be one this fleet no longer
+manages; and no other task to own that working directory. An unknown is never read as "nothing
+there": a missing, invalid or unreadable roster refuses, a missing, unreadable or corrupt
+other-root ledger refuses, and a receipt that records no process identity refuses unless it
+explicitly records that no process ever started. The session's dispatch lock is held from the first
+validation through the ledger commit, and the roster and the competing ownership are rechecked
+inside that transaction, so a native launch or a task that claims the working directory in between
+is refused instead of raced. A missing, unreadable, uncertain or inconsistent receipt is a refusal,
+and the ledger is left unchanged.
 
 The command records one `opencode_completed_reconciled` event with the receipt digests and moves
 the row to `finished`. The task body, the retained receipt, every hold, the global pause, the

@@ -1,4 +1,5 @@
 """Guarded reconciliation of a stale running row whose managed turn completed."""
+import fcntl
 import io
 import json
 import os
@@ -49,13 +50,19 @@ class CompletionReconciliationTests(unittest.TestCase):
         }))
         self.db = store.database(self.live / "data" / "fleet.sqlite")
         self.addCleanup(self.db.close)
+        # A retired root keeps its own ledger. It is read to prove that no other
+        # root still owns the task, so it must exist and be readable.
+        (self.receipts / "data").mkdir(parents=True, exist_ok=True)
+        self.retired_db = store.database(self.receipts / "data" / "fleet.sqlite")
+        self.addCleanup(self.retired_db.close)
         self.turn_dir = (self.receipts / "data" / "opencode" / SESSION / "turns" / TURN)
         self.turn_dir.mkdir(parents=True)
         self.session_dir = self.turn_dir.parent.parent
+        self.lock_path = self.session_dir / "dispatch.lock"
         self.pointer = self.session_dir / "current.json"
         self.pointer.write_text(json.dumps(self.identity({"model": MODEL, "startedAt": 1,
-                                                     "wrapperPid": 86549})))
-        (self.session_dir / "dispatch.lock").write_bytes(b"")
+                                                          "wrapperPid": 86549})))
+        self.lock_path.write_bytes(b"")
         self.request = self.turn_dir / "request.json"
         self.state = self.turn_dir / "state.json"
         self.result = self.turn_dir / "result.json"
@@ -118,6 +125,11 @@ class CompletionReconciliationTests(unittest.TestCase):
 
     def events(self, kind=completion._EVENT_KIND):
         return self.db.execute("SELECT id,body FROM events WHERE kind=?", (kind,)).fetchall()
+
+    def assertLedgerUnchanged(self):
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
+                         ("running",))
+        self.assertEqual(self.events(), [])
 
     def test_verified_completed_row_is_closed_and_audited(self):
         before = self.ledger()
@@ -194,23 +206,19 @@ class CompletionReconciliationTests(unittest.TestCase):
         with patch.object(opencode, "identity_matches", return_value=True):
             with self.assertRaisesRegex(ValueError, "still live"):
                 self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
-        self.assertEqual(self.events(), [])
+        self.assertLedgerUnchanged()
 
     def test_live_native_process_group_refuses(self):
         with patch.object(opencode, "_group_exists", return_value=True):
             with self.assertRaisesRegex(ValueError, "group is still present"):
                 self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+        self.assertLedgerUnchanged()
 
     def test_live_wrapper_process_refuses(self):
         with patch.object(os, "kill", return_value=None):
             with self.assertRaisesRegex(ValueError, "wrapper PID is still present"):
                 self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+        self.assertLedgerUnchanged()
 
     def test_uncertain_or_failed_outcome_refuses(self):
         cases = [
@@ -228,9 +236,7 @@ class CompletionReconciliationTests(unittest.TestCase):
                 self.write_receipt(state=self.identity(document))
                 with self.assertRaisesRegex(ValueError, message):
                     self.reconcile()
-                self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                                 ("running",))
-        self.assertEqual(self.events(), [])
+                self.assertLedgerUnchanged()
 
     def test_mismatched_task_turn_session_or_cwd_refuses(self):
         cases = [
@@ -244,9 +250,7 @@ class CompletionReconciliationTests(unittest.TestCase):
                 self.write_receipt(**overrides)
                 with self.assertRaisesRegex(ValueError, message):
                     self.reconcile()
-                self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                                 ("running",))
-                self.assertEqual(self.events(), [])
+                self.assertLedgerUnchanged()
         self.write_receipt()
 
     def test_missing_or_unreadable_receipt_refuses(self):
@@ -264,9 +268,7 @@ class CompletionReconciliationTests(unittest.TestCase):
         self.pointer.write_text("{not json")
         with self.assertRaisesRegex(ValueError, "is unreadable"):
             self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
-        self.assertEqual(self.events(), [])
+        self.assertLedgerUnchanged()
 
     def test_competing_task_for_the_same_cwd_refuses(self):
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
@@ -275,9 +277,7 @@ class CompletionReconciliationTests(unittest.TestCase):
         self.db.commit()
         with self.assertRaisesRegex(ValueError, "owns this working directory"):
             self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
-        self.assertEqual(self.events(), [])
+        self.assertLedgerUnchanged()
 
     def test_another_non_terminal_task_for_the_same_worker_refuses(self):
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
@@ -286,16 +286,14 @@ class CompletionReconciliationTests(unittest.TestCase):
         self.db.commit()
         with self.assertRaisesRegex(ValueError, "another non-terminal task"):
             self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+        self.assertLedgerUnchanged()
 
     def test_worker_still_managed_by_this_fleet_refuses(self):
         with patch.object(paths, "opencode_slots", return_value=[
                 {"sessionId": SESSION, "cwd": str(self.cwd), "model": MODEL}]):
             with self.assertRaisesRegex(ValueError, "still managed by this fleet"):
                 self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+        self.assertLedgerUnchanged()
 
     def test_uncertain_ledger_row_is_never_reconciled(self):
         self.db.execute("UPDATE tasks SET state='uncertain' WHERE id=?", (TASK,))
@@ -304,6 +302,7 @@ class CompletionReconciliationTests(unittest.TestCase):
             self.reconcile()
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
                          ("uncertain",))
+        self.assertEqual(self.events(), [])
 
     def test_terminal_ledger_row_is_never_reconciled(self):
         self.db.execute("UPDATE tasks SET state='finished' WHERE id=?", (TASK,))
@@ -312,26 +311,119 @@ class CompletionReconciliationTests(unittest.TestCase):
             self.reconcile()
         self.assertEqual(self.events(), [])
 
-    def test_active_session_lock_refuses(self):
-        import fcntl
-        handle = (self.session_dir / "dispatch.lock").open("rb")
+    def test_unreadable_or_malformed_roster_configuration_refuses(self):
+        missing = self.root / "no-such-config.json"
+        malformed = self.root / "malformed-config.json"
+        malformed.write_text("{not json")
+        invalid = self.root / "invalid-config.json"
+        invalid.write_text(json.dumps(["not", "a", "roster"]))
+        for path, message in ((missing, "missing or unreadable"),
+                              (malformed, "missing or unreadable"),
+                              (invalid, "is invalid")):
+            with self.subTest(path=path.name):
+                with patch.object(paths, "CONFIG", path):
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.reconcile()
+                self.assertLedgerUnchanged()
+
+    def test_missing_or_unreadable_retired_root_ledger_refuses(self):
+        retired = self.receipts / "data" / "fleet.sqlite"
+        retired.unlink()
+        with self.assertRaisesRegex(ValueError, "ledger is missing"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+        # A corrupt ledger: the write-ahead pages are removed with the open
+        # connection, so the reader really sees an unreadable database.
+        self.retired_db.close()
+        for suffix in ("-wal", "-shm"):
+            Path(str(retired) + suffix).unlink(missing_ok=True)
+        retired.write_bytes(b"this is not a database")
+        with self.assertRaisesRegex(ValueError, "ledger is unreadable"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+        retired.unlink()
+        other = store.database(retired)
+        self.addCleanup(other.close)
+        other.execute("DROP TABLE tasks")
+        other.commit()
+        with self.assertRaisesRegex(ValueError, "ledger is unreadable"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+
+    def test_another_root_still_owning_the_task_refuses(self):
+        self.retired_db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                                 (TASK, SESSION, str(self.cwd), "{}", "running", 1))
+        self.retired_db.commit()
+        with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+
+    def test_missing_process_identity_refuses(self):
+        result = self.identity({
+            "state": "done", "exitCode": 0, "cleanup": "confirmed",
+            "finishedAt": 1792471653.5, "terminalReason": "stop"})
+        self.result.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, "records no process identity"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+
+    def test_missing_wrapper_pid_refuses(self):
+        pointer = self.identity({"model": MODEL, "startedAt": 1})
+        self.pointer.write_text(json.dumps(pointer))
+        with self.assertRaisesRegex(ValueError, "wrapper PID is missing"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+
+    def test_explicit_no_process_started_receipt_is_accepted(self):
+        result = self.identity({
+            "state": "done", "exitCode": 0, "cleanup": "confirmed",
+            "finishedAt": 1792471653.5, "terminalReason": "stop",
+            "managedProcessIdentity": None})
+        self.result.write_text(json.dumps(result))
+        self.pointer.write_text(json.dumps(self.identity({"model": MODEL, "startedAt": 1})))
+        outcome = self.reconcile()
+        self.assertTrue(outcome["reconciled"])
+        self.assertEqual(outcome["evidence"]["processIdentity"], "not-started")
+        self.assertIsNone(outcome["evidence"]["wrapperPid"])
+
+    def test_a_launch_holding_the_session_lock_refuses(self):
+        handle = self.lock_path.open("rb")
         self.addCleanup(handle.close)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with self.assertRaisesRegex(ValueError, "managed turn is active"):
             self.reconcile()
-        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+        self.assertLedgerUnchanged()
 
-    def test_another_root_still_owning_the_task_refuses(self):
-        other = store.database(self.receipts / "data" / "fleet.sqlite")
-        self.addCleanup(other.close)
-        other.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
-                      (TASK, SESSION, str(self.cwd), "{}", "running", 1))
-        other.commit()
-        with self.assertRaisesRegex(ValueError, "Another Fleet root still owns this task"):
+    def test_a_task_claiming_the_cwd_between_validation_and_commit_refuses(self):
+        competing = [("competing", str(self.cwd), OTHER_SESSION)]
+        with patch.object(completion, "_conflict_rows",
+                          side_effect=[[], competing]) as rows:
+            with self.assertRaisesRegex(ValueError, "owns this working directory"):
+                self.reconcile()
+            self.assertEqual(rows.call_count, 2)
+        self.assertLedgerUnchanged()
+
+    def test_the_session_lock_is_held_through_the_commit(self):
+        observed = {}
+
+        def audited(db, kind, **body):
+            handle = self.lock_path.open("rb")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                observed["held"] = True
+            else:
+                observed["held"] = False
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+            return store.emit(db, kind, **body)
+
+        with patch.object(completion, "emit", side_effect=audited):
             self.reconcile()
+        self.assertTrue(observed.get("held"))
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,)).fetchone(),
-                         ("running",))
+                         ("finished",))
 
     def test_invalid_arguments_are_refused(self):
         with self.assertRaisesRegex(ValueError, "operator note"):

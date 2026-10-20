@@ -33,12 +33,19 @@
   `running` forever, because only that worker could close it. The surviving row keeps the same-cwd
   dispatch exclusivity, so nothing else can use that working directory. `reconcile-completed` closes
   exactly that row: it requires the exact task/turn/worker/session/cwd identity, the retained native
-  receipt (terminal `done`, exit 0, cleanup confirmed), a dead native process identity and wrapper
-  PID, a free session lock, a worker this fleet no longer manages, and no competing task for the
-  same cwd. It writes one audit event carrying the receipt digests and moves the row to `finished`;
-  the task body, the retained receipt, every hold, the pause, the dispatch flags, the model and the
-  account stay untouched. A missing, uncertain or inconsistent receipt is a refusal, an `uncertain`
-  row still needs `resolve`, and the dispatch exclusion rule itself is unchanged.
+  receipt (terminal `done`, exit 0, cleanup confirmed), a recorded native process identity and
+  wrapper PID that are provably gone, a worker this fleet no longer manages, and no competing task
+  for the same cwd. An unknown is never read as "nothing there": a missing, invalid or unreadable
+  roster refuses, a missing, unreadable or corrupt other-root ledger refuses, and a receipt without a
+  process identity refuses unless it explicitly records that no process ever started. The session's
+  dispatch lock is held from the first validation through the ledger commit, and the roster and the
+  competing ownership are rechecked inside the transaction that closes the row, so a new native
+  launch or a task that claims the working directory in between is refused instead of raced. It
+  writes one audit event carrying the receipt digests and moves the row to `finished`; the task body,
+  the retained receipt, every hold, the pause, the dispatch flags, the model and the account stay
+  untouched, and the same-cwd dispatch exclusion rule is unchanged. A missing, uncertain or
+  inconsistent receipt is a refusal, an `uncertain` row still needs `resolve`, and the dispatch
+  exclusion rule itself is unchanged.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.
