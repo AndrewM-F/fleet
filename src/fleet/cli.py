@@ -262,6 +262,10 @@ def cmd_recovery_snapshot(args):
 
 
 def cmd_recover_opencode(args):
+    sources = [bool(args.ownership_task), bool(args.adoption_id), bool(args.direct_turn_receipt)]
+    if sum(sources) != 1:
+        raise SystemExit("Choose exactly one ownership source: --ownership-task, "
+                         "--adoption-id or --direct-turn-receipt")
     out(recovery.authorize_opencode(database(), session_id=args.worker,
                                     failed_task_id=args.task, turn=args.turn,
                                     recovery_id=args.recovery_id,
@@ -270,7 +274,8 @@ def cmd_recover_opencode(args):
                                     owned_worktree=args.owned_worktree,
                                     branch=args.branch, head=args.head,
                                     worktree_sha256=args.worktree_sha256, note=args.note,
-                                    adoption_id=args.adoption_id))
+                                    adoption_id=args.adoption_id,
+                                    direct_turn_receipt=args.direct_turn_receipt))
 
 
 def cmd_adopt_ownership(args):
@@ -394,7 +399,7 @@ def main(argv=None):
     p.add_argument("--turn", required=True, help="failed managed OpenCode turn UUID")
     p.add_argument("--recovery-id", required=True)
     p.add_argument("--successor-task", required=True)
-    p.add_argument("--ownership-task", required=True,
+    p.add_argument("--ownership-task", default="",
                    help="finished Fleet task that records the owner branch and worktree")
     p.add_argument("--owned-worktree", required=True,
                    help="exact owner Git worktree; the native session CWD remains unchanged")
@@ -403,6 +408,8 @@ def main(argv=None):
     p.add_argument("--worktree-sha256", required=True)
     p.add_argument("--adoption-id", default="",
                    help="immutable ownership adoption recorded by adopt-ownership")
+    p.add_argument("--direct-turn-receipt", default="",
+                   help="durable direct-turn ownership receipt when no owner task exists")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
     p = sub.add_parser("adopt-ownership",

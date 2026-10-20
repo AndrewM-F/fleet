@@ -152,7 +152,8 @@ def _queue_has_task(task_id):
 def _same_record(row, values):
     fields = ("id", "failed_sid", "failed_turn", "failed_task_id", "owner_sid",
               "owner_task_id", "ownership_task_id", "cwd", "owned_worktree",
-              "branch", "head", "worktree_sha256", "adoption_id", "note")
+              "branch", "head", "worktree_sha256", "adoption_id",
+              "direct_turn_receipt", "direct_turn_sha256", "note")
     return all(row[key] == values[key] for key in fields)
 
 
@@ -356,6 +357,149 @@ def _validate_adoption(db, record, adoption_id):
     return adoption
 
 
+DIRECT_TURN_RECEIPT_VERSION = "pi-direct-turn-ownership/v1"
+_DIRECT_TURN_RECEIPT_FIELDS = ("schemaVersion", "originalSession", "ownedWorktree",
+                               "branch", "initialHead", "startedAt", "note")
+
+
+def _direct_turn_receipt(path):
+    """Read and validate one direct-turn ownership receipt.
+
+    A genuine native turn that predates the Fleet task ledger has no owner task
+    row, so the operator records that turn's ownership in a durable receipt
+    inside the fleet's own recovery directory. The receipt is the ownership
+    source; it proves nothing by itself and is checked against the native
+    session and the current checkout before any successor is authorized.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("Direct-turn ownership receipt path is required")
+    receipt_path = Path(path).expanduser()
+    if not receipt_path.is_absolute():
+        raise ValueError("Direct-turn ownership receipt path must be absolute")
+    root = Path(paths.RECOVERY).expanduser().resolve()
+    resolved = receipt_path.resolve()
+    if root not in resolved.parents:
+        raise ValueError("Direct-turn ownership receipt must live in the fleet recovery directory")
+    if not resolved.is_file():
+        raise ValueError("Direct-turn ownership receipt is missing")
+    try:
+        document = json.loads(resolved.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Direct-turn ownership receipt is unreadable") from error
+    if not isinstance(document, dict):
+        raise ValueError("Direct-turn ownership receipt is not an object")
+    if set(document) != set(_DIRECT_TURN_RECEIPT_FIELDS):
+        raise ValueError("Direct-turn ownership receipt has unexpected fields")
+    if document["schemaVersion"] != DIRECT_TURN_RECEIPT_VERSION:
+        raise ValueError("Direct-turn ownership receipt version is not supported")
+    if not isinstance(document["originalSession"], str) \
+            or not opencode._SESSION_ID.fullmatch(document["originalSession"]):
+        raise ValueError("Direct-turn ownership receipt names an invalid original session")
+    if not isinstance(document["ownedWorktree"], str) or not document["ownedWorktree"].strip():
+        raise ValueError("Direct-turn ownership receipt has no owned worktree")
+    if not isinstance(document["branch"], str) or not document["branch"].strip():
+        raise ValueError("Direct-turn ownership receipt has no branch")
+    if not _HEAD.fullmatch(document["initialHead"] or ""):
+        raise ValueError("Direct-turn ownership receipt initial head must be a full commit SHA")
+    started = document["startedAt"]
+    if isinstance(started, bool) or not isinstance(started, (int, float)) or started <= 0:
+        raise ValueError("Direct-turn ownership receipt start time is invalid")
+    _substantive_ownership_evidence(document["note"], document["ownedWorktree"])
+    return resolved, document, hashlib.sha256(resolved.read_bytes()).hexdigest()
+
+
+def _head_descends_from(worktree, initial_head):
+    """Does the checkout descend from the recorded initial head?
+
+    A head that is not a commit of this checkout cannot be an ancestor of it,
+    and the check fails closed in that case too.
+    """
+    result = subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor",
+                             initial_head, "HEAD"], check=False, capture_output=True,
+                            stdin=subprocess.DEVNULL)
+    if result.returncode == 0:
+        return True
+    if result.returncode in (1, 128):
+        return False
+    raise ValueError("Owned worktree ancestry could not be verified")
+
+
+def _direct_turn_native_evidence(receipt, session_id, worktree, model, database_path):
+    """Prove the recorded session ran a completed direct turn in the owned worktree.
+
+    Only metadata is read: the native session identity row, its recorded idle
+    outcome and the count of assistant messages. No message body, credential or
+    auth record is inspected.
+    """
+    db_path = Path(database_path).expanduser().resolve()
+    if not db_path.is_file():
+        raise ValueError("Direct-turn native session database is unavailable")
+    uri = "file:" + opencode.quote(str(db_path), safe="/") + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            row = connection.execute(
+                "SELECT directory,model,idle_outcome,time_created,time_updated "
+                "FROM session_v2 WHERE id=?", (session_id,)).fetchone()
+            if not row:
+                raise ValueError("Direct-turn receipt names a session with no native session row")
+            directory, native_model, idle_outcome, created, updated = row
+            started = int(receipt["startedAt"] * 1000) - 1000
+            completed = connection.execute(
+                "SELECT count(*) FROM session_message WHERE session_id=? AND type='assistant' "
+                "AND time_created>=?", (session_id, started)).fetchone()[0]
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise ValueError("Direct-turn native session database could not be read safely") from error
+    native_directory = str(Path(str(directory)).expanduser().resolve())
+    if native_directory != worktree:
+        raise ValueError("Direct-turn receipt worktree differs from the native session directory")
+    native_provider, native_name = opencode._native_model_parts(native_model)
+    configured_provider, _, configured_name = str(model).partition("/")
+    if not native_name or native_name != configured_name \
+            or (native_provider and native_provider != configured_provider):
+        raise ValueError("Direct-turn receipt session model differs from the configured model")
+    if idle_outcome != "succeeded":
+        raise ValueError("Native direct turn did not complete successfully")
+    if not completed:
+        raise ValueError("Native direct turn has no completed assistant output")
+    return {"nativeSession": session_id, "nativeDirectory": native_directory,
+            "nativeModel": native_model, "nativeIdleOutcome": idle_outcome,
+            "nativeAssistantMessages": completed, "nativeSessionCreated": created,
+            "nativeSessionUpdated": updated}
+
+
+def _validate_direct_turn(record, slots=None):
+    """Re-prove a direct-turn ownership receipt before a successor dispatches."""
+    sid = record["owner_sid"]
+    roster = slots
+    if roster is None:
+        roster = paths.opencode_slots()
+    if isinstance(roster, dict):
+        roster = list(roster.values())
+    slot = next((item for item in roster or () if item.get("sessionId") == sid), None)
+    if slot is None:
+        raise ValueError("Direct-turn recovery session is not a configured OpenCode worker")
+    configured_model = opencode.approved_free_model(slot)
+    verified = opencode.verify_slot(slot, expected_model=configured_model)
+    receipt_path, receipt, digest = _direct_turn_receipt(record["direct_turn_receipt"])
+    if digest != record["direct_turn_sha256"]:
+        raise ValueError("Direct-turn ownership receipt changed after recovery authorization")
+    if receipt["originalSession"] != sid:
+        raise ValueError("Direct-turn receipt names a different original session")
+    if _resolve(receipt["ownedWorktree"]) != record["owned_worktree"]:
+        raise ValueError("Direct-turn receipt worktree differs from the recorded owned worktree")
+    if receipt["branch"].strip() != record["branch"].strip():
+        raise ValueError("Direct-turn receipt branch differs from the recorded branch")
+    if not _head_descends_from(record["owned_worktree"], receipt["initialHead"]):
+        raise ValueError("Direct-turn receipt initial head is not an ancestor of the current head")
+    _direct_turn_native_evidence(receipt, sid, record["owned_worktree"], configured_model,
+                                 verified["databasePath"])
+    return receipt
+
+
 def _task_message(db, task_id, session_id, cwd):
     row = db.execute("SELECT sid,cwd,state,body FROM tasks WHERE id=?", (task_id,)).fetchone()
     if not row or row[0] != session_id or str(Path(row[1]).resolve()) != cwd:
@@ -468,15 +612,21 @@ def validate_owned_worktree(db, record, slots=None):
     """Recheck task provenance and exclusivity before dispatching a successor."""
     worktree = record["owned_worktree"]
     configured = _configured_cwds(slots)
-    _validate_recovery_mapping(db, record, configured)
-    message = _task_message(db, record["ownership_task_id"], record["owner_sid"], record["cwd"])
     adoption = None
-    adoption_id = record.get("adoption_id") or ""
-    if adoption_id:
-        # The immutable adoption, not free text, is the provenance for this checkout.
-        adoption = _validate_adoption(db, record, adoption_id)
-    elif worktree not in message or record["branch"] not in message:
-        raise ValueError("Owned worktree/branch no longer match the owner task record")
+    if record.get("direct_turn_receipt"):
+        # The immutable direct-turn receipt, not free text and not a task row, is
+        # the provenance for this checkout. It is re-proved against the native
+        # session and the current checkout before the successor may dispatch.
+        _validate_direct_turn(record, slots)
+    else:
+        _validate_recovery_mapping(db, record, configured)
+        message = _task_message(db, record["ownership_task_id"], record["owner_sid"], record["cwd"])
+        adoption_id = record.get("adoption_id") or ""
+        if adoption_id:
+            # The immutable adoption, not free text, is the provenance for this checkout.
+            adoption = _validate_adoption(db, record, adoption_id)
+        elif worktree not in message or record["branch"] not in message:
+            raise ValueError("Owned worktree/branch no longer match the owner task record")
     snapshot = worktree_snapshot(worktree)
     if (snapshot["branch"] != record["branch"] or snapshot["head"] != record["head"]
             or snapshot["worktreeSha256"] != record["worktree_sha256"]):
@@ -527,7 +677,8 @@ def task_recovery_conflict(db, task, sid, slots=None):
 
 def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
                        successor_task_id, ownership_task_id, owned_worktree,
-                       branch, head, worktree_sha256, note, adoption_id=""):
+                       branch, head, worktree_sha256, note, adoption_id="",
+                       direct_turn_receipt=""):
     """Record a verified error-turn handoff without editing task or turn history.
 
     The successor remains root-queued work. This operation only creates its
@@ -535,10 +686,19 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
 
     Provenance is the owner task's free-text message unless ``adoption_id`` names an
     immutable ownership adoption, which substitutes structured evidence for history
-    that predates the exact worktree/branch convention.
+    that predates the exact worktree/branch convention. A genuine native turn that
+    predates the task ledger has no owner task row at all; ``direct_turn_receipt``
+    names the durable receipt that records that turn's ownership, and the receipt is
+    proved against the native session and the current checkout instead.
     """
+    direct_turn = isinstance(direct_turn_receipt, str) and bool(direct_turn_receipt.strip())
+    if direct_turn and (ownership_task_id.strip() or adoption_id.strip()):
+        raise ValueError("Choose exactly one ownership source: owner task, adoption or "
+                         "direct-turn receipt")
     fields = (session_id, failed_task_id, turn, recovery_id, successor_task_id,
-              ownership_task_id, owned_worktree, branch, head, note)
+              owned_worktree, branch, head, note)
+    if not direct_turn:
+        fields += (ownership_task_id,)
     if any(not isinstance(value, str) or not value.strip() for value in fields):
         raise ValueError("Recovery identifiers, branch, and note must be non-empty strings")
     if not isinstance(adoption_id, str):
@@ -563,20 +723,45 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
     cwd = _resolve(slot["cwd"])
     if configured.get(session_id) != cwd:
         raise ValueError("Recovery native CWD does not match the configured session roster")
-    _validate_recovery_mapping(db, {"ownership_task_id": ownership_task_id,
-                                    "owner_sid": session_id, "cwd": cwd}, configured)
-    worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
-    ownership_message = _task_message(db, ownership_task_id, session_id, cwd)
     adoption = None
-    if adoption_id:
-        adoption = _validate_adoption(
-            db, {"ownership_task_id": ownership_task_id, "owner_sid": session_id,
-                 "failed_sid": session_id, "failed_turn": turn,
-                 "failed_task_id": failed_task_id, "cwd": cwd,
-                 "owned_worktree": worktree, "branch": branch, "head": head,
-                 "worktree_sha256": worktree_sha256}, adoption_id)
-    elif worktree not in ownership_message or branch not in ownership_message:
-        raise ValueError("Owned worktree and branch are not recorded by this worker's owner task")
+    direct_turn_path = ""
+    direct_turn_digest = ""
+    direct_turn_evidence = {}
+    if direct_turn:
+        # A genuine direct turn has no owner task row. Its durable receipt is the
+        # ownership source, proved against the native completed turn and the
+        # current checkout before anything is recorded.
+        worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
+        receipt_path, receipt, receipt_digest = _direct_turn_receipt(direct_turn_receipt)
+        if receipt["originalSession"] != session_id:
+            raise ValueError("Direct-turn receipt names a different original session")
+        if _resolve(receipt["ownedWorktree"]) != worktree:
+            raise ValueError("Direct-turn receipt worktree differs from the recorded "
+                             "owned worktree")
+        if receipt["branch"].strip() != branch.strip():
+            raise ValueError("Direct-turn receipt branch differs from the recorded branch")
+        if not _head_descends_from(worktree, receipt["initialHead"]):
+            raise ValueError("Direct-turn receipt initial head is not an ancestor of the "
+                             "current head")
+        direct_turn_evidence = _direct_turn_native_evidence(
+            receipt, session_id, worktree, configured_model, slot["databasePath"])
+        direct_turn_path = str(receipt_path)
+        direct_turn_digest = receipt_digest
+        ownership_task_id = ""
+    else:
+        _validate_recovery_mapping(db, {"ownership_task_id": ownership_task_id,
+                                        "owner_sid": session_id, "cwd": cwd}, configured)
+        worktree = str(Path(owned_worktree).expanduser().resolve(strict=True))
+        ownership_message = _task_message(db, ownership_task_id, session_id, cwd)
+        if adoption_id:
+            adoption = _validate_adoption(
+                db, {"ownership_task_id": ownership_task_id, "owner_sid": session_id,
+                     "failed_sid": session_id, "failed_turn": turn,
+                     "failed_task_id": failed_task_id, "cwd": cwd,
+                     "owned_worktree": worktree, "branch": branch, "head": head,
+                     "worktree_sha256": worktree_sha256}, adoption_id)
+        elif worktree not in ownership_message or branch not in ownership_message:
+            raise ValueError("Owned worktree and branch are not recorded by this worker's owner task")
     task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (failed_task_id,)).fetchone()
     if not task or task[0] != session_id or str(Path(task[1]).resolve()) != cwd:
         raise ValueError("Failed task ownership/cwd does not match the configured worker")
@@ -594,7 +779,11 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
               "owner_task_id": successor_task_id, "ownership_task_id": ownership_task_id,
               "cwd": cwd, "owned_worktree": worktree, "branch": branch,
               "head": head, "worktree_sha256": worktree_sha256,
-              "adoption_id": adoption_id, "note": note}
+              "adoption_id": adoption_id,
+              "direct_turn_receipt": direct_turn_path,
+              "direct_turn_sha256": direct_turn_digest,
+              "direct_turn_evidence": direct_turn_evidence,
+              "note": note}
 
     # Hold both queue and session locks while establishing the recovery record.
     # Dispatch cannot see an authorized record until the verified old lock is released.
@@ -643,11 +832,12 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
             db.execute("""INSERT INTO recoveries
                 (id,failed_sid,failed_turn,failed_task_id,owner_sid,owner_task_id,
                  ownership_task_id,cwd,owned_worktree,branch,head,worktree_sha256,
-                 adoption_id,note,status,created,updated)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?)""",
+                 adoption_id,direct_turn_receipt,direct_turn_sha256,note,status,created,updated)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'preparing',?,?)""",
                        (recovery_id, session_id, turn, failed_task_id, session_id,
                         successor_task_id, ownership_task_id, cwd, worktree, branch, head,
-                        worktree_sha256, adoption_id, note, now, now))
+                        worktree_sha256, adoption_id, direct_turn_path, direct_turn_digest,
+                        note, now, now))
             db.execute("INSERT INTO events(kind,body,created) VALUES (?,?,?)",
                        ("opencode_recovery_prepared", json.dumps(values), now))
             db.commit()

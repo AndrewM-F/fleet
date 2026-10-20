@@ -49,6 +49,33 @@
     --ownership-evidence 'quoted ownership excerpt or substantive statement' --note '...'
   bin/fleet recover-opencode ... --adoption-id ADOPTION_ID
   ```
+  A genuine native turn that predates the Fleet task ledger has no owner task row at all, so
+  neither an owner task nor an adoption can express its ownership. Record the turn's ownership in
+  a durable receipt inside the fleet's own recovery directory, then use it as the ownership source:
+  ```sh
+  cat > "$FLEET_ROOT/data/recovery/direct-turn-<id>.json" <<'JSON'
+  {
+    "schemaVersion": "pi-direct-turn-ownership/v1",
+    "originalSession": "ses_...",
+    "ownedWorktree": "/absolute/path/to/the/owned/worktree",
+    "branch": "branch-name",
+    "initialHead": "full commit sha the direct turn started from",
+    "startedAt": 1792480175,
+    "note": "substantive operator statement about that direct turn"
+  }
+  JSON
+  bin/fleet recover-opencode ... --direct-turn-receipt "$FLEET_ROOT/data/recovery/direct-turn-<id>.json"
+  ```
+  The receipt is proved before anything is authorized: its session must be the recovering worker,
+  the native session row must show that session in the recorded worktree with the configured model,
+  a succeeded idle outcome and completed assistant output, the recorded branch must be the
+  checkout's branch, the recorded initial head must be an ancestor of the current head, and the
+  current snapshot must be unchanged. The receipt's path and digest are recorded with the recovery
+  and re-proved before the successor dispatches, so a receipt that is later edited is refused. A
+  missing, foreign, tampered or contradictory receipt is a refusal; no Fleet task is created,
+  edited or fabricated for the ownership. Exactly one ownership source is accepted: an owner task,
+  an adoption, or a direct-turn receipt.
+
   Adoption requires a finished owner task on the same session and native CWD, the canonical
   checkout, branch, full HEAD SHA, current digest, an explicit decision, a distinct evidence
   reference, and substantive ownership evidence. The reference is only a locator: the operator

@@ -18,13 +18,16 @@ CREATE TABLE IF NOT EXISTS recoveries (
   owned_worktree TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL, head TEXT NOT NULL, worktree_sha256 TEXT NOT NULL,
   adoption_id TEXT NOT NULL DEFAULT '',
+  direct_turn_receipt TEXT NOT NULL DEFAULT '',
+  direct_turn_sha256 TEXT NOT NULL DEFAULT '',
   note TEXT NOT NULL, status TEXT NOT NULL,
   created REAL NOT NULL, updated REAL NOT NULL,
   UNIQUE(owner_task_id));
 """
 _RECOVERIES_COLUMNS = ("id", "failed_sid", "failed_turn", "failed_task_id", "owner_sid",
                        "owner_task_id", "ownership_task_id", "cwd", "owned_worktree",
-                       "branch", "head", "worktree_sha256", "adoption_id", "note", "status",
+                       "branch", "head", "worktree_sha256", "adoption_id",
+                       "direct_turn_receipt", "direct_turn_sha256", "note", "status",
                        "created", "updated")
 # Append-only ownership evidence for recoveries whose original owner task predates the
 # exact worktree/branch convention. Rows are never updated or deleted.
@@ -146,6 +149,10 @@ def database(path=None):
         db.execute("ALTER TABLE recoveries ADD COLUMN owned_worktree TEXT NOT NULL DEFAULT ''")
     if "adoption_id" not in recovery_columns:
         db.execute("ALTER TABLE recoveries ADD COLUMN adoption_id TEXT NOT NULL DEFAULT ''")
+    if "direct_turn_receipt" not in recovery_columns:
+        db.execute("ALTER TABLE recoveries ADD COLUMN direct_turn_receipt TEXT NOT NULL DEFAULT ''")
+    if "direct_turn_sha256" not in recovery_columns:
+        db.execute("ALTER TABLE recoveries ADD COLUMN direct_turn_sha256 TEXT NOT NULL DEFAULT ''")
     db.executescript("""
     CREATE UNIQUE INDEX IF NOT EXISTS recoveries_active_owner
       ON recoveries(owner_sid) WHERE status IN ('preparing','authorized','claimed');

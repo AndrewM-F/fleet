@@ -15,8 +15,15 @@
   and recovery reservations are untouched.
 - **OpenCode recovery**: a failed task and native turn stay terminal. An operator may authorize one
   new task only after the exact error/cleanup receipt, free session lock, and an explicit owned
-  worktree path proven by a finished task for the same session (its free-text message, or an
-  immutable `recovery_adoptions` record when history predates the exact path/branch convention).
+  worktree path proven by a finished task for the same session (its free-text message, an
+  immutable `recovery_adoptions` record when history predates the exact path/branch convention, or
+  a durable direct-turn ownership receipt in `data/recovery/` when the original native turn
+  predates the task ledger entirely and no task row exists). A direct-turn receipt records the
+  original session, the canonical owned worktree, the branch and the initial head, and is proved
+  against the native session row (its directory, configured model, succeeded idle outcome and
+  completed assistant output) and the unchanged checkout before authorization; its path and digest
+  are stored with the recovery and re-proved before the successor dispatches. It never creates,
+  edits or fabricates a Fleet task.
   Native session CWD stays
   unchanged; branch/head and tracked/untracked fingerprint are checked at authorization, dispatch,
   and send. SQLite records the immutable failure-to-successor/worktree owner link before it becomes

@@ -47,6 +47,19 @@ command prints JSON on stdout and exits non-zero on failure.
   verify; it is not proof by itself. `--ownership-evidence` must be the substantive ownership
   excerpt or statement, not the same locator and not a bare URL, checksum, or path. Adoption alone
   never queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor,
+  A genuine native turn that predates the Fleet task ledger has no owner task row at all. For
+  that case `bin/fleet recover-opencode --direct-turn-receipt PATH` is the ownership source
+  instead of `--ownership-task` or `--adoption-id`; exactly one ownership source is accepted. The
+  receipt is a durable JSON file in the fleet's own `data/recovery/` directory that records the
+  original session, the canonical owned worktree, the branch, the initial head, the turn's start
+  time and an operator statement. It is proved before authorization: the receipt's session must be
+  the recovering worker, the native session row must show that session in the recorded worktree
+  with the configured model and a succeeded idle outcome and completed assistant output, the
+  recorded branch must be the checkout's branch, the recorded initial head must be an ancestor of
+  the current head, and the current snapshot must be unchanged. The receipt's path and digest are
+  recorded with the recovery, and the same proof is rechecked before a successor dispatches. A
+  missing, tampered, foreign or contradictory receipt is a refusal, and no Fleet task is created,
+  edited or fabricated for the ownership.
   and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
   authorization and dispatch revalidate the same record and fail closed if it is missing or the
   checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
