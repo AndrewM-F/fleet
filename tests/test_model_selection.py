@@ -310,7 +310,33 @@ class ModelSelectionTests(unittest.TestCase):
         for worker in report["workers"]:
             self.assertEqual(worker["configuredModel"], MINIMAX)
             self.assertEqual(worker["nativeIdentityModel"], MINIMAX)
-            self.assertEqual(worker["nativeDirectory"], self.cwds[worker["sessionId"]])
+            # The reported native directory is the canonical one, exactly as
+            # verify_native_session reports it: a path alias is the same
+            # directory, so the comparison follows the path.
+            self.assertEqual(worker["nativeDirectory"],
+                             str(Path(self.cwds[worker["sessionId"]]).resolve()))
+
+    def test_a_symlinked_cwd_is_the_same_directory(self):
+        """A path alias names the same directory, and is not a mismatch."""
+        sid = self.sids[0]
+        alias = self.root / "alias"
+        alias.symlink_to(self.cwds[sid])
+        cfg = self.config()
+        for entry in cfg["opencode"]:
+            if entry["sessionId"] == sid:
+                entry["cwd"] = str(alias)
+                entry["sessionCwd"] = str(alias)
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        report = model_selection.inspect(self.db)
+        worker = next(w for w in report["workers"] if w["sessionId"] == sid)
+        self.assertIsNone(worker["nativeError"])
+        self.assertEqual(worker["nativeDirectory"],
+                         str(Path(self.cwds[sid]).resolve()))
+        result = model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["deferredUntilIdle"], [])
+        self.assertEqual(self.slot(sid)["model"], DEEPSEEK)
+        self.assertEqual(self.slot(sid)["cwd"], str(alias))
 
     def test_a_model_without_a_target_is_refused(self):
         before = self.config_path.read_text()
