@@ -23,10 +23,40 @@ command prints JSON on stdout and exits non-zero on failure.
 - `bin/fleet resolve --events 1,2 | --task ID --as finished|cancelled | --worker SID --note "..."`
   — record an operator decision (ack events, close an uncertain task, mark a failed Claude turn
   reviewed so the worker can take work again). Notes are stored as events.
+- `bin/fleet recovery-snapshot --cwd PATH` / `bin/fleet recover-opencode ...` — fingerprint and
+  authorize a one-use successor for an errored OpenCode turn. Recovery requires exact failed task,
+  turn, owner task, explicit owned worktree, branch, commit, and worktree digest; verified cleanup;
+  and a free session lock. It keeps the native session CWD unchanged and records the separately
+  verified owned worktree. It preserves the failed task/turn and database history; never rebuild
+  `fleet.sqlite` from the queue. It does not clear pause/dispatch holds or alter the pinned model.
+  The successor must be a new root-authorized task linked by `previousTaskId` and the returned
+  `recoveryId`. Never retry the old task ID. Rate-limit/quota errors are not recoverable through
+  this command. Recovery is same-session only; do not infer or implement cross-session transfer.
+  `bin/fleet cancel` of a queued, unstarted successor atomically retires its authorization, so the
+  reservation never outlives a cancelled successor; the failed task/turn stay preserved and a fresh
+  successor may then be authorized for the same failed turn. A dispatched (`claimed`) successor's
+  reservation is released only by `bin/fleet reconcile-recovery --task ID --note "..."` (or
+  `resolve --task` for an `uncertain` successor) after native execution is verified stopped.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
+- `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one
+  **unstarted queued** task without cancelling it or changing its ID. The hold, its reason, and the
+  audit trail are durable in `fleet.sqlite`, so a manager restart preserves them and dispatch never
+  consumes a held task. Repeat operations are idempotent. Holding or releasing a started
+  (`dispatching`/`sent`/`running`) or terminal task is refused. `release` clears only this
+  task-level hold: it never clears the global pause, a per-provider/worker `dispatchEnabled` hold,
+  a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
+- `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
+  report or set the approved OpenCode provider/model for managed workers. The model must
+  be one of the explicitly approved free models; the legacy default is unchanged. The
+  configuration is the desired model for the next productive turn: the native session row
+  keeps its own historical model and is never written, and no provider is contacted. A
+  worker that is active or uncertain keeps the model its in-flight turn was launched with.
+  A selection and a dispatch claim share one lock, so a task is never claimed under one
+  model and launched under another. The selection clears no hold, dispatch flag, queue,
+  account, session id or working directory.
 
 ## Rules
 1. Never create, replace or duplicate worker sessions; identities live in
