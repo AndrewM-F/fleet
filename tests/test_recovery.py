@@ -72,7 +72,8 @@ class RecoveryTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.slot_patch = patch.object(paths, "opencode_slots", return_value=[self.slot])
+        self.slot_patch = patch.object(paths, "opencode_slots",
+                                       return_value=[self.slot, self.other_slot])
         self.slot_patch.start()
         self.addCleanup(self.slot_patch.stop)
         self.exec_patch = patch.object(paths, "executable", return_value="/usr/bin/opencode")
@@ -1455,6 +1456,24 @@ class RecoveryTests(unittest.TestCase):
                          owner_before)
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "retired")
+
+    def test_minimax_recovery_verifies_selected_model_and_rejects_provider_switch(self):
+        model = "opencode-go/minimax-m3.1-flash-free"
+        self.slot["model"] = model
+        session = paths.OPENCODE / self.sid
+        for path in (session / "current.json", session / "turns" / self.turn / "state.json"):
+            data = json.loads(path.read_text())
+            data["model"] = model
+            path.write_text(json.dumps(data))
+        result_path = session / "turns" / self.turn / "result.json"
+        result = json.loads(result_path.read_text())
+        result["expectedModel"] = model
+        result_path.write_text(json.dumps(result))
+        self.slot["model"] = "opencode/minimax-m3.1-flash-free"
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.authorize()
+        self.slot["model"] = model
+        self.assertEqual(self.authorize()["status"], "authorized")
 
 
 if __name__ == "__main__":

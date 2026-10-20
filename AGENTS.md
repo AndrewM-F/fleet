@@ -47,6 +47,10 @@ command prints JSON on stdout and exits non-zero on failure.
   verify; it is not proof by itself. `--ownership-evidence` must be the substantive ownership
   excerpt or statement, not the same locator and not a bare URL, checksum, or path. Adoption alone
   never queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor,
+  and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
+  authorization and dispatch revalidate the same record and fail closed if it is missing or the
+  checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
+  or any other field is rejected; an exact replay remains idempotent across restart.
   A genuine native turn that predates the Fleet task ledger has no owner task row at all. For
   that case `bin/fleet recover-opencode --direct-turn-receipt PATH` is the ownership source
   instead of `--ownership-task` or `--adoption-id`; exactly one ownership source is accepted. The
@@ -61,10 +65,6 @@ command prints JSON on stdout and exits non-zero on failure.
   recorded with the recovery, and the same proof is rechecked before a successor dispatches. A
   missing, tampered, foreign or contradictory receipt is a refusal, and no Fleet task is created,
   edited or fabricated for the ownership.
-  and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
-  authorization and dispatch revalidate the same record and fail closed if it is missing or the
-  checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
-  or any other field is rejected; an exact replay remains idempotent across restart.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one
@@ -76,6 +76,22 @@ command prints JSON on stdout and exits non-zero on failure.
   a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
+- `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
+  report or set the approved OpenCode provider/model for managed workers. The model must
+  be one of the explicitly approved free models; the legacy default is unchanged. The
+  configuration is the desired model for the next productive turn: the native session row
+  keeps its own historical model and is never written, and no provider is contacted. A
+  worker that is active or uncertain keeps the model its in-flight turn was launched with;
+  that expectation is immutable, so repeated selections cannot strand the turn and a
+  cancellation binds to it rather than to the next-turn model.
+  A selection and a dispatch claim share one lock, so a task is never claimed under one
+  model and launched under another; the dispatcher re-reads the configuration inside that
+  lock, so a selection that lands after the roster was loaded is still the model the
+  claim and the launch use. That reload is fail-closed: an unreadable or malformed
+  configuration, a removed worker and an ambiguous configuration are refusals, so a
+  retired worker is never launched from a cached roster and the task stays queued.
+  The selection clears no hold, dispatch flag, queue,
+  account, session id or working directory.
 
 ## Rules
 1. Never create, replace or duplicate worker sessions; identities live in

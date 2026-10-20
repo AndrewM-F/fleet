@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, holds, manager, opencode, ops, paths, pi, recovery
+from . import claude, control, events, holds, manager, model_selection, opencode, ops, paths, pi, recovery
 from .store import BUSY, database
 
 
@@ -285,6 +285,31 @@ def cmd_recover_opencode(args):
                                     direct_turn_receipt=args.direct_turn_receipt))
 
 
+def cmd_reconcile_opencode_launch(args):
+    try:
+        out(recovery.reconcile_launch_failure(database(), args.task, args.turn, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_opencode_model(args):
+    """Report or set the approved model for managed OpenCode workers."""
+    if args.inspect:
+        # Inspection never writes and never reaches a provider.
+        out(model_selection.inspect(database()))
+        return
+    if not args.model:
+        out(model_selection.inspect(database()))
+        return
+    if args.worker and args.all:
+        raise SystemExit("Choose one worker or all of them")
+    if not args.worker and not args.all:
+        raise SystemExit("Choose --worker SESSION or --all")
+    out(model_selection.apply(None, args.model, args.worker, dry_run=args.dry_run,
+                              db=database()))
+
+
 def cmd_adopt_ownership(args):
     try:
         out(recovery.adopt_ownership(database(), adoption_id=args.adoption_id,
@@ -419,6 +444,11 @@ def main(argv=None):
                    help="durable direct-turn ownership receipt when no owner task exists")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
+    p = sub.add_parser("reconcile-opencode-launch", help="audit a proven pre-provider launch failure")
+    p.add_argument("--task", required=True)
+    p.add_argument("--turn", required=True)
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_reconcile_opencode_launch)
     p = sub.add_parser("adopt-ownership",
                        help="append immutable ownership evidence for a recovery successor")
     p.add_argument("--id", dest="adoption_id", required=True)
@@ -443,6 +473,14 @@ def main(argv=None):
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")
     p.add_argument("--note", required=True, help="operator evidence that native execution stopped")
     p.set_defaults(fn=cmd_reconcile_recovery)
+    p = sub.add_parser("opencode-model",
+                       help="inspect or set the approved OpenCode provider/model for a worker")
+    p.add_argument("--model", help="approved provider/model to run for the next productive turn")
+    p.add_argument("--worker", help="one existing OpenCode session id")
+    p.add_argument("--all", action="store_true", help="every configured OpenCode worker")
+    p.add_argument("--inspect", action="store_true", help="report the current model state only")
+    p.add_argument("--dry-run", action="store_true", help="report the change without writing it")
+    p.set_defaults(fn=cmd_opencode_model)
     p = sub.add_parser("hold", help="hold an unstarted queued task without cancelling it")
     p.add_argument("task")
     p.add_argument("--note", required=True, help="operator reason kept with the hold")

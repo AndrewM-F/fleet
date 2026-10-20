@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import dispatch, manager, opencode, paths, store  # noqa: E402
+from fleet import dispatch, holds, manager, opencode, paths, store  # noqa: E402
 
 
 def json_pipe(events):
@@ -99,6 +99,17 @@ class OpenCodeAdapterTests(unittest.TestCase):
         exe = patch.object(paths, "executable", return_value="/usr/bin/opencode")
         exe.start()
         self.addCleanup(exe.stop)
+        # The dispatcher reloads the roster inside the shared model lock, so the
+        # current configuration has to describe this worker. An explicit
+        # configuration is still read the way the runtime reads it.
+        def opencode_slots(cfg=None):
+            if cfg is None:
+                return [self.slot]
+            return [dict(raw, provider="opencode") for raw in cfg.get("opencode", [])]
+
+        roster = patch.object(paths, "opencode_slots", side_effect=opencode_slots)
+        roster.start()
+        self.addCleanup(roster.stop)
         self.identity = {"pid": 43001, "pgid": 43001, "start": [100, 200],
                          "executable": "/usr/bin/opencode"}
 
@@ -224,6 +235,165 @@ class OpenCodeAdapterTests(unittest.TestCase):
             result = opencode.run_turn(request_path)
         return result, popen, terminate
 
+    def model_request(self, model):
+        request_path = self.request()
+        request = json.loads(request_path.read_text())
+        request["model"] = model
+        request_path.write_text(json.dumps(request))
+        # The native session records the model and provider it runs. A session
+        # that ran a different model would have a different native row, so the
+        # row follows the model under test.
+        provider, _, name = model.partition("/")
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("UPDATE session_v2 SET model=? WHERE id=?",
+                       (json.dumps({"id": name, "providerID": provider}), self.sid))
+        return request_path
+
+    def minimax_events(self, provider=None):
+        metadata = {} if provider is None else {
+            "providerID": provider, "modelID": "minimax-m3.1-flash-free"}
+        return [
+            self.event("step_start", {"sessionID": self.sid, "messageID": "msg_mini",
+                                      "type": "step-start", **metadata}),
+            self.event("text", {"sessionID": self.sid, "messageID": "msg_mini",
+                                "type": "text", "text": "OK"}),
+            self.event("step_finish", {"sessionID": self.sid, "messageID": "msg_mini",
+                                       "type": "step-finish", "reason": "stop"}),
+        ]
+
+    def test_approved_exact_model_ids_pin_runtime_and_keep_transport_routing(self):
+        for model in (opencode.MODEL, "opencode/minimax-m3.1-flash-free",
+                      "opencode-go/minimax-m3.1-flash-free"):
+            with self.subTest(model=model):
+                slot = dict(self.slot, model=model)
+                self.assertEqual(opencode.verify_slot(slot)["model"], model)
+                request = {"model": model, "turnRoot": str(self.cwd / model),
+                           "databasePath": str(self.native_db), "executable": "/usr/bin/opencode"}
+                env = opencode._runtime_environment(request)
+                config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+                self.assertEqual(config["model"], model)
+                self.assertEqual(config["small_model"], model)
+                self.assertEqual(config["enabled_providers"], [model.split("/")[0]])
+                self.assertEqual(env["OPENCODE_DB"], str(self.native_db.resolve()))
+                self.assertEqual(paths.opencode_slots({"opencode": [slot]})[0]["provider"], "opencode")
+
+    def test_unapproved_model_ids_fail_before_any_process_or_runtime_setup(self):
+        request_path = self.request()
+        request = json.loads(request_path.read_text())
+        for model in ("opencode-go/deepseek-v4.1-flash-free", "other/minimax-m3.1-flash-free",
+                      "opencode/minimax-m3.1-flash", "opencode-go/minimax-m3.1-flash-free/extra",
+                      "opencode-go/minimax-m3.1-flash-free ", "minimax-m3.1-flash-free", "", None, []):
+            with self.subTest(model=model), patch.object(opencode.subprocess, "Popen") as popen:
+                with self.assertRaises(ValueError):
+                    opencode.verify_slot(dict(self.slot, model=model))
+                request["model"] = model
+                request_path.write_text(json.dumps(request))
+                with self.assertRaises(ValueError):
+                    opencode.run_turn(request_path)
+                with self.assertRaises(ValueError):
+                    opencode._runtime_environment(dict(request, turnRoot=str(request_path.parent)))
+                popen.assert_not_called()
+
+    def assert_minimax_success(self, provider):
+        model = provider + "/minimax-m3.1-flash-free"
+        request_path = self.model_request(model)
+        result, popen, _ = self.run_events(request_path, self.minimax_events(),
+            completion={"provider": provider, "model": "minimax-m3.1-flash-free"})
+        self.assertEqual(result["state"], "done")
+        self.assertEqual(result["requestedProvider"], provider)
+        self.assertEqual(result["actualProvider"], provider)
+        self.assertEqual(result["requestedModel"], model)
+        args = popen.call_args.args[0]
+        self.assertEqual(args[args.index("--model") + 1], model)
+        config = json.loads(popen.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["enabled_providers"], [provider])
+        self.assertEqual(config["small_model"], model)
+        self.assertEqual(popen.call_count, 1)
+
+    def test_minimax_opencode_verified_native_success(self):
+        self.assert_minimax_success("opencode")
+
+    def test_minimax_go_verified_native_success(self):
+        self.assert_minimax_success("opencode-go")
+
+    def test_minimax_go_rejects_opencode_stream_fallback(self):
+        request_path = self.model_request("opencode-go/minimax-m3.1-flash-free")
+        result, popen, terminate = self.run_events(request_path, self.minimax_events("opencode"))
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("provider mismatch", result["error"])
+        self.assertEqual(popen.call_count, 1)
+        terminate.assert_called_once()
+
+    def test_minimax_opencode_rejects_go_persisted_fallback(self):
+        request_path = self.model_request("opencode/minimax-m3.1-flash-free")
+        result, popen, _ = self.run_events(request_path, self.minimax_events(),
+            completion={"provider": "opencode-go", "model": "minimax-m3.1-flash-free"})
+        self.assertNotEqual(result["state"], "done")
+        self.assertIn("provider/model mismatch", result["error"])
+        self.assertEqual(popen.call_count, 1)
+
+    def test_minimax_quota_error_does_not_retry_or_fall_back(self):
+        request_path = self.model_request("opencode-go/minimax-m3.1-flash-free")
+        events = [self.event("error", error={"message": "HTTP 429: quota exceeded"})]
+        result, popen, _ = self.run_events(request_path, events)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("quota exceeded", result["error"])
+        self.assertEqual(popen.call_count, 1)
+        config = json.loads(popen.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["enabled_providers"], ["opencode-go"])
+        self.add_task()
+        with patch.object(opencode, "send") as send:
+            slot = dict(self.slot, model="opencode-go/minimax-m3.1-flash-free")
+            dispatch.dispatch(self.db, {self.sid: slot}, {self.sid: result}, dispatch.send)
+        send.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT sid,state FROM tasks").fetchone(), (self.sid, "queued"))
+
+    def test_minimax_selection_never_clears_pause_or_provider_model_task_holds(self):
+        self.add_task()
+        holds.hold(self.db, "t1", "opencode/deepseek-v4.1-flash-free quota hold")
+        pause = self.cwd / "dispatch.paused"
+        pause.write_text("paused")
+        before = list(self.db.iterdump())
+        disabled = dict(self.slot, model="opencode-go/minimax-m3.1-flash-free", dispatchEnabled=False)
+        self.assertFalse(opencode.verify_slot(disabled)["dispatchEnabled"])
+        states = {self.sid: {"state": "idle", "cwd": str(self.cwd)}}
+        with patch.object(paths, "PAUSE", pause), patch.object(opencode, "send") as send:
+            dispatch.dispatch(self.db, {self.sid: disabled}, states, dispatch.send, paused=True)
+            dispatch.dispatch(self.db, {self.sid: disabled}, states, dispatch.send)
+            # Even enabling this worker does not clear the old model's task reservation/hold.
+            dispatch.dispatch(self.db, {self.sid: dict(disabled, dispatchEnabled=True)}, states,
+                              dispatch.send, max_concurrent=3)
+        send.assert_not_called()
+        self.assertEqual(list(self.db.iterdump()), before)
+        self.assertEqual(pause.read_text(), "paused")
+        self.assertFalse(disabled["dispatchEnabled"])
+
+    def test_minimax_cancel_binds_to_the_in_flight_launch_model(self):
+        model = "opencode-go/minimax-m3.1-flash-free"
+        turn = "minimax-cancel"
+        directory = self.data / self.sid / "turns" / turn
+        directory.mkdir(parents=True)
+        identity = {"sessionId": self.sid, "cwd": str(self.cwd.resolve()), "model": model}
+        (directory.parent.parent / "current.json").write_text(json.dumps(dict(identity, turn=turn)))
+        (directory / "state.json").write_text(json.dumps(dict(identity, state="working",
+                                                             processIdentity=self.identity)))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            # The configured model is the desired model for the next turn. A
+            # running turn keeps the model it was launched with, so switching
+            # the worker does not make its legitimate turn uncancellable.
+            self.assertEqual(
+                opencode.cancel(dict(self.slot, model="opencode/minimax-m3.1-flash-free"))["turn"], turn)
+            self.assertTrue((directory / "cancel.json").exists())
+            # A turn whose own records disagree is still refused, and no signal
+            # is sent.
+            (directory / "cancel.json").unlink()
+            (directory / "state.json").write_text(json.dumps(dict(
+                identity, state="working", model="opencode/minimax-m3.1-flash-free",
+                processIdentity=self.identity)))
+            with self.assertRaisesRegex(ValueError, "identity/cwd/model mismatch"):
+                opencode.cancel(dict(self.slot, model=model))
+            self.assertFalse((directory / "cancel.json").exists())
+
     def test_slot_verifies_paths_model_and_live_identity_without_attestation_flags(self):
         # Stale verification booleans are not trusted or required; launch repeats the DB check.
         slot = dict(self.slot, nativeSessionVerified=False, auxiliaryModelsVerified=False)
@@ -261,10 +431,12 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(self.db.execute("SELECT state FROM tasks").fetchone()[0], "queued")
         slots[self.sid]["dispatchEnabled"] = True
-        dispatch.dispatch(self.db, slots, states,
-                          lambda *args, **kwargs: sent.append((args, kwargs)))
+        with patch.object(paths, "opencode_slots", return_value=[slots[self.sid]]):
+            dispatch.dispatch(self.db, slots, states,
+                              lambda *args, **kwargs: sent.append((args, kwargs)))
         self.assertEqual(sent[0][0], (slots[self.sid], "tiny task"))
-        self.assertEqual(sent[0][1], {"task_id": "t1"})
+        # The launch carries the model the task was claimed under.
+        self.assertEqual(sent[0][1], {"task_id": "t1", "model": opencode.MODEL})
 
     def test_opencode_print_mode_never_routes_through_claude(self):
         slot = dict(self.slot, mode="print")

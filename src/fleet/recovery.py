@@ -11,6 +11,7 @@ import time
 
 from . import opencode, paths
 from .store import emit
+from .util import atomic
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HEAD = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1123,3 +1124,113 @@ def reconcile_successor(db, task_id, note, slot=None, outcome="cancelled"):
         session_lock.close()
     return {"taskId": task_id, "recoveryId": record["id"], "reconciled": True,
             "evidence": evidence}
+
+
+def reconcile_launch_failure(db, task_id, turn, note):
+    """Audit a proven non-executed launch; preserve the old task and every hold."""
+    if not isinstance(note, str) or not note.strip():
+        raise ValueError("Launch reconciliation requires an operator note")
+    if not isinstance(turn, str) or not opencode._TURN_ID.fullmatch(turn):
+        raise ValueError("Launch reconciliation turn is invalid")
+    if not paths.PAUSE.is_file():
+        raise ValueError("Fleet must remain durably paused")
+    # Hold the same manager lock throughout; a concurrent restart must fail closed.
+    with paths.MANAGER_LOCK.open("rb") as manager_lock:
+        fcntl.flock(manager_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task[2] not in {"finished", "uncertain"}:
+            raise ValueError("Launch task must be finished or uncertain; history is never rewritten")
+        slot = opencode.verify_slot(_slot_for_session(task[0]))
+        if slot.get("dispatchEnabled", False):
+            raise ValueError("Worker must remain dispatch-disabled")
+        sid = slot["sessionId"]
+        session_lock = opencode._session_lock(opencode.session_dir(sid))
+        try:
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone() != task:
+                raise ValueError("Launch task changed during validation")
+            if db.execute("SELECT 1 FROM tasks WHERE sid=? AND state IN "
+                          "('dispatching','sent','running')", (sid,)).fetchone():
+                raise ValueError("Worker has another task in flight")
+            if db.execute("SELECT 1 FROM recoveries WHERE (owner_sid=? OR failed_sid=?) "
+                          "AND status IN ('preparing','authorized','claimed')", (sid, sid)).fetchone():
+                raise ValueError("Active recovery reservations require their own reconciliation")
+            pointer = opencode.session_dir(sid) / "current.json"
+            directory = opencode.turn_dir(sid, turn)
+            request_path = directory / "request.json"
+            launch = json.loads(pointer.read_text())
+            request = json.loads(request_path.read_text())
+            identity = {"taskId": task_id, "sessionId": sid, "turn": turn,
+                        "cwd": slot["cwd"], "model": slot["model"]}
+            if (task[1] != slot["cwd"] or any(
+                    launch.get(k) != v or request.get(k) != v for k, v in identity.items())):
+                raise ValueError("Launch task/session/cwd/model identity mismatch")
+            if any(os.path.lexists(directory / name) for name in ("state.json", "result.json")):
+                raise ValueError("Native turn state/result exists; prelaunch reconciliation refused")
+            pid = launch.get("wrapperPid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise ValueError("Recorded wrapper PID is missing")
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise ValueError("Recorded wrapper PID is still present")
+            if opencode._group_exists(pid):
+                raise ValueError("Recorded wrapper process group is still present")
+            if slot["model"] == opencode.MODEL:
+                raise ValueError("Legacy model rejection cannot prove this launch failure")
+            if (request.get("databasePath") != slot["databasePath"]
+                    or request.get("sessionCwd") != slot["cwd"]):
+                raise ValueError("Native account/database routing differs")
+            opencode.verify_native_session(sid, slot["cwd"], slot["databasePath"])
+            started = launch.get("startedAt")
+            if (not isinstance(started, (int, float)) or isinstance(started, bool)
+                    or not 0 < started <= time.time()):
+                raise ValueError("Launch timestamp is invalid")
+            # Inspect metadata only, never native message bodies or auth records.
+            uri = "file:" + opencode.quote(slot["databasePath"], safe="/") + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=2) as native:
+                native.execute("PRAGMA query_only=ON")
+                count = native.execute("SELECT count(*) FROM session_message WHERE session_id=? "
+                                       "AND (typeof(time_created) NOT IN ('integer','real') OR time_created>=?)",
+                                       (sid, int(started * 1000) - 1000)).fetchone()[0]
+            if count:
+                raise ValueError("Native messages exist at/after launch; no-inference proof unavailable")
+            log = paths.LOGS / "opencode" / sid / turn / "wrapper.log"
+            with log.open("rb") as stream:
+                body = stream.read(32769)
+            suffix = ('raise ValueError("OpenCode request model is not the pinned free model")\n'
+                      'ValueError: OpenCode request model is not the pinned free model')
+            if (len(body) > 32768 or not body.decode().rstrip().endswith(suffix)
+                    or b"Traceback (most recent call last):" not in body):
+                raise ValueError("Wrapper log does not prove the known pre-provider model guard")
+            evidence = dict(identity, launchSha256=hashlib.sha256(pointer.read_bytes()).hexdigest(),
+                            requestSha256=hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                            wrapperLogSha256=hashlib.sha256(body).hexdigest(),
+                            nativeMessagesSinceLaunch=count, wrapperStopped=True,
+                            note=note.strip())
+            # Commit the audit event before making the worker dispatchable. A file
+            # write failure leaves it blocked; an idempotent retry repairs the marker.
+            events = db.execute("SELECT id,body FROM events WHERE kind='opencode_launch_reconciled'").fetchall()
+            existing = next(((i, json.loads(raw)) for i, raw in events
+                             if json.loads(raw).get("taskId") == task_id
+                             and json.loads(raw).get("turn") == turn), None)
+            if existing:
+                if any(existing[1].get(k) != v for k, v in evidence.items() if k != "note"):
+                    raise ValueError("Previously audited launch evidence changed")
+                record, evidence = existing  # Preserve the first operator note and evidence.
+            else:
+                record = emit(db, "opencode_launch_reconciled", **evidence)
+            db.commit()
+            atomic(directory / "launch-reconciled.json", dict(evidence, record=record))
+            return {"taskId": task_id, "sessionId": sid, "turn": turn,
+                    "reconciled": True, "taskStatePreserved": task[2], "record": record,
+                    "evidence": evidence}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            fcntl.flock(session_lock.fileno(), fcntl.LOCK_UN)
+            session_lock.close()

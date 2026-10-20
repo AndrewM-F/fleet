@@ -33,6 +33,7 @@ DEFAULT_PROVIDER = "opencode"
 DEFAULT_MODEL_ID = "deepseek-v4.1-flash-free"
 # A model that is neither approved nor free.
 PAID_MODEL = "opencode/paid-premium-model"
+REAL_POPEN = subprocess.Popen
 
 
 def json_pipe(events):
@@ -427,7 +428,7 @@ class RecoveryLaunchPathTests(unittest.TestCase):
         request_path.write_text(json.dumps(request))
         self.prepare_launch(request_path)
         with patch.object(opencode.subprocess, "Popen") as popen:
-            with self.assertRaisesRegex(ValueError, "not an approved free model"):
+            with self.assertRaisesRegex(ValueError, "approved free model"):
                 opencode.run_turn(request_path)
         popen.assert_not_called()
 
@@ -540,6 +541,85 @@ class RecoveryLaunchPathTests(unittest.TestCase):
         self.assertIn(opencode.MODEL, opencode.APPROVED_FREE_MODELS)
         self.assertEqual(opencode.APPROVED_FREE_MODELS[0], opencode.MODEL)
         self.assertIn(CONFIGURED_MODEL, opencode.APPROVED_FREE_MODELS)
+
+    def test_a_native_completion_naming_another_model_is_refused(self):
+        self.prepare_failure(model=CONFIGURED_MODEL)
+        self.authorize()
+        self.queue_successor()
+        self.dispatch_successor()
+        request_path = self.written_request()
+        # The native completion is the native evidence: it must report the model
+        # the request asked for, so a completion that names another model is a
+        # fallback and never a success.
+        with patch.object(opencode, "process_identity", side_effect=lambda pid: {
+                "pid": int(pid), "pgid": int(pid), "start": [1],
+                "executable": "/usr/bin/opencode"}), \
+                patch.object(opencode, "_terminate_owned_group",
+                             return_value={"confirmed": True, "uncertain": False}):
+            result, _ = self.run_turn(request_path, model="some-other-model")
+        self.assertNotEqual(result["state"], "done")
+
+    def test_a_native_session_recording_another_provider_cannot_launch(self):
+        # Same model id, different provider. The native identity carries both,
+        # so the provider must match as well as the model id.
+        self.prepare_failure(model=CONFIGURED_MODEL)
+        self.authorize()
+        self.queue_successor()
+        self.dispatch_successor()
+        request_path = self.written_request()
+        self.prepare_launch(request_path)
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("UPDATE session_v2 SET model=? WHERE id=?",
+                       (json.dumps({"id": CONFIGURED_MODEL_ID, "providerID": "opencode"}),
+                        self.sid))
+        with patch.object(opencode.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "differs from the native session model"):
+                opencode.run_turn(request_path)
+        popen.assert_not_called()
+
+    def test_a_request_naming_another_approved_model_cannot_launch(self):
+        # The native session records the model and provider it runs. A request
+        # that names a different approved model is still a mismatch against that
+        # native identity and is refused before any turn starts.
+        self.prepare_failure(model=CONFIGURED_MODEL)
+        self.authorize()
+        self.queue_successor()
+        self.dispatch_successor()
+        request_path = self.written_request()
+        request = json.loads(request_path.read_text())
+        request["model"] = DEFAULT_MODEL
+        request_path.write_text(json.dumps(request))
+        self.prepare_launch(request_path)
+        with patch.object(opencode.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "differs from the native session model"):
+                opencode.run_turn(request_path)
+        popen.assert_not_called()
+
+    def test_a_slot_whose_configured_model_differs_from_the_native_session_is_refused(self):
+        # The configured model and provider of the target slot must match the
+        # current native session identity, so a slot that drifted is refused at
+        # the managed launch rather than starting a turn.
+        self.prepare_failure(model=CONFIGURED_MODEL)
+        self.authorize()
+        self.queue_successor()
+        record = recovery.claim_recovery(self.db, "recovery-launch", self.successor,
+                                         self.sid, self.failed_task)
+        self.db.commit()
+        self.assertIsNotNone(record)
+        with sqlite3.connect(self.native_db) as db:
+            db.execute("UPDATE session_v2 SET model=? WHERE id=?",
+                       (json.dumps({"id": CONFIGURED_MODEL_ID, "providerID": "opencode"}),
+                        self.sid))
+        def git_then_fake(*args, **kwargs):
+            if args and args[0] and args[0][0] == "git":
+                return REAL_POPEN(*args, **kwargs)
+            return Mock(pid=1234)
+
+        with patch.object(opencode.subprocess, "Popen", side_effect=git_then_fake) as popen:
+            with self.assertRaisesRegex(ValueError, "differs from the native session model"):
+                opencode.send(self.slot, "continue", self.successor, record)
+        self.assertEqual([call for call in popen.call_args_list
+                          if call.args and call.args[0] and call.args[0][0] != "git"], [])
 
 
 if __name__ == "__main__":

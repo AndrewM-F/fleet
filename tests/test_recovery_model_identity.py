@@ -202,7 +202,7 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
         cases = {
             "launch sessionId": {"launch": {"sessionId": self.other_sid}},
             "launch cwd": {"launch": {"cwd": str(self.other_cwd.resolve())}},
-            "launch model": {"model": OTHER_MODEL},
+            "launch model unapproved": {"model": "opencode/paid-model"},
             "turn model": {"model": CONFIGURED_MODEL, "state_extra": {"model": OTHER_MODEL}},
             "turn sessionId": {"state_extra": {"sessionId": self.other_sid}},
             "turn cwd": {"state_extra": {"cwd": str(self.other_cwd.resolve())}},
@@ -213,6 +213,7 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
                 state_extra = override.pop("state_extra", None)
                 launch = override.pop("launch", None)
                 turn_dir = self.write_working_turn(model=model, state_extra=state_extra)
+                (turn_dir / "cancel.json").unlink(missing_ok=True)
                 if launch is not None:
                     session = self.data / "opencode" / self.sid
                     receipt = {"turn": self.turn, "taskId": self.task_id,
@@ -231,12 +232,13 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
                 opencode.cancel(self.slot)
         self.assertFalse((turn_dir / "cancel.json").exists())
 
-    def test_cancellation_requires_a_configured_model(self):
+    def test_cancellation_uses_the_inflight_model_after_the_next_selection_changes(self):
         self.write_working_turn()
-        with self.assertRaisesRegex(ValueError, "must name its configured model"):
-            opencode.cancel(dict(self.slot, model=""))
-        with self.assertRaisesRegex(ValueError, "must name its configured model"):
-            opencode.cancel(dict(self.slot, model=None))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            result = opencode.cancel(dict(self.slot, model=OTHER_MODEL))
+        self.assertEqual(result["turn"], self.turn)
+        self.assertTrue((self.data / "opencode" / self.sid / "turns" / self.turn /
+                         "cancel.json").exists())
 
     # -- rate limit and quota --------------------------------------------
     def test_rate_limit_and_quota_failures_remain_rejected(self):

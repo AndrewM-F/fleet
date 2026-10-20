@@ -126,3 +126,42 @@
   reconciliation touch only that recovery row and task; global pause, per-worker `dispatchEnabled`,
   capacity/quota gates, and unrelated recovery reservations stay in force.
 - **Moving `data/`** — `bin/fleet stop`, `scripts/db-check`, then move including no `-wal/-shm`.
+
+## OpenCode wrapper selected stale source before native execution
+
+`FLEET_ROOT` selects durable data/config/logs; `paths.SOURCE_ROOT` and `paths.BIN`
+select the installed source that imported Fleet. Child wrappers use that source's
+entrypoint, even when the data root contains an old `bin/fleet` or source snapshot.
+A missing native `state.json` after the launch grace period is `launchFailure`;
+the manager preserves the terminal `finished` ledger convention and emits
+`review_ready` with `state: blocked`, explicit `outcome: launch_failed`, and the
+launch error. This is a failed wrapper attempt, not successful audit completion.
+A claimed recovery reservation is not marked completed by this launch failure.
+
+For the known legacy model-guard failure, after root reviews and applies this fix,
+an operator may run the reviewed source entrypoint with the intended `FLEET_ROOT`:
+
+```
+FLEET_ROOT=/tmp/opencode-three-fleet-20261018 FLEET_CONFIG=/tmp/opencode-three-fleet-20261018/config/fleet.local.json python3 /Users/amf/Developer/.codex/fleet/bin/fleet reconcile-opencode-launch --task 20261019-go-adea-ci-migration-inventory-e7f19faa --turn 5e62374a-d022-4256-8b69-bee5c0837f68 --note "Root reviewed stale-source rejection before native execution; audit remains incomplete"
+```
+
+This requires durable pause, a stopped manager, a disabled exact worker, a free
+session lock, no active recovery reservation or task in flight, matching task /
+turn / model / native database identity, no native state or result, a dead wrapper
+PID and process group, zero native message metadata at/after launch (including a
+one-second margin), and the bounded traceback ending at the known legacy guard.
+An unknown error, quota failure, existing native messages/state, or uncertain
+process proof blocks reconciliation. It reads no auth data or native message text.
+
+The command commits an audit event before writing an identity-bound
+`launch-reconciled.json`. The worker then reports `stopped`; the original request,
+launch pointer, wrapper log and task row remain unchanged. The old `finished`
+state is preserved as historical evidence, not an audit success. A task already
+`uncertain` stays uncertain and requires an explicit supported operator resolution
+before its checkout can dispatch again. No dispatch/quota/task hold is released.
+
+Never reuse the failed task ID. Root must authorize a new same-session task ID
+linked by `previousTaskId`, preserving its scoped checkout and transfer exclusions.
+Do not use native error-turn recovery for this missing-state case. Session creation,
+roster enablement and manager resume are separate controller actions after review;
+the reconciliation command does none of them. Do not edit SQLite or delete history.

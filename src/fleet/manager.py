@@ -93,7 +93,12 @@ def observe(db, sid, state, now=None):
             else:
                 db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=?",
                            (now, task_id))
-            emit(db, "review_ready", taskId=task_id, sessionId=sid, state=state["state"])
+            launch_failed = (state.get("provider") == "opencode"
+                             and state.get("launchFailure") is True)
+            outcome = ({"outcome": "launch_failed", "error": state.get("error")}
+                       if launch_failed else {})
+            emit(db, "review_ready", taskId=task_id, sessionId=sid,
+                 state=state["state"], **outcome)
         elif phase == "sent" and now - updated > 90:
             db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?", (now, task_id))
             emit(db, "task_unconsumed", taskId=task_id, sessionId=sid)
