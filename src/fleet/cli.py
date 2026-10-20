@@ -266,11 +266,18 @@ def cmd_recover_opencode(args):
     if sum(sources) != 1:
         raise SystemExit("Choose exactly one ownership source: --ownership-task, "
                          "--adoption-id or --direct-turn-receipt")
-    out(recovery.authorize_opencode(database(), session_id=args.worker,
+    db = database()
+    ownership_task_id = args.ownership_task
+    if args.adoption_id:
+        adoption = recovery.adoption_record(db, args.adoption_id)
+        if not adoption:
+            raise ValueError("Recovery adoption record is missing")
+        ownership_task_id = adoption["owner_task_id"]
+    out(recovery.authorize_opencode(db, session_id=args.worker,
                                     failed_task_id=args.task, turn=args.turn,
                                     recovery_id=args.recovery_id,
                                     successor_task_id=args.successor_task,
-                                    ownership_task_id=args.ownership_task,
+                                    ownership_task_id=ownership_task_id,
                                     owned_worktree=args.owned_worktree,
                                     branch=args.branch, head=args.head,
                                     worktree_sha256=args.worktree_sha256, note=args.note,
