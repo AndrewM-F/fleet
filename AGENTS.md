@@ -65,6 +65,22 @@ command prints JSON on stdout and exits non-zero on failure.
   recorded with the recovery, and the same proof is rechecked before a successor dispatches. A
   missing, tampered, foreign or contradictory receipt is a refusal, and no Fleet task is created,
   edited or fabricated for the ownership.
+- `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."`
+  — close one stale `running`/`sent` row whose managed OpenCode turn provably completed. It
+  requires the exact task, turn, worker, session and cwd identity, the retained native completion
+  receipt (terminal `done`, exit 0, cleanup confirmed), a full recorded native process identity and
+  a recorded wrapper PID that are both provably gone, a worker this fleet no longer manages, and no
+  competing task for that cwd. An unknown is a refusal: a missing, invalid or unreadable roster, a
+  missing, unreadable or corrupt other-root ledger, a receipt without a process identity, and a
+  null identity beside a successful completion all refuse. Ownership in another root is matched by
+  task id, by session and by canonical cwd, and that root's ledger is fenced with its own write
+  lock from the verified query through the current-ledger commit, because a transaction on the
+  current ledger does not fence a separate database. The session dispatch lock is held through the
+  commit. It records one auditable event with the receipt
+  digests, preserves the task body and the retained receipt, and never releases a hold, a pause, a
+  dispatch flag, a model or an account. It is not a generic release: an `uncertain` row still needs
+  `bin/fleet resolve`, a live turn still needs `bin/fleet cancel`, and dispatch exclusion is
+  unchanged.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one

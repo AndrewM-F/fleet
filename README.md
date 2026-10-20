@@ -29,6 +29,7 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet completions collect\|wait\|ack` | relay events + receipts (was `fleet-events.py`) |
 | `bin/fleet resolve …` / `cancel TASK` | operator decisions, abort a running turn |
 | `bin/fleet hold TASK` / `release TASK` | durably pause/resume one unstarted queued task (never a cancel; never clears pause/dispatch/profile/recovery holds) |
+| `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."` | close a stale `running` row whose managed OpenCode turn provably completed |
 | `bin/fleet recovery-snapshot --cwd PATH` / `recover-opencode …` | fingerprint a checkout and authorize one verified OpenCode successor |
 | `bin/fleet adopt-ownership …` / `recover-opencode --adoption-id ID` | append immutable ownership evidence for an owner task whose history predates the exact checkout/branch convention; the reference locates a source the operator must verify and the evidence field must contain substantive prose, not a bare URL or checksum |
 | `bin/fleet recover-opencode --direct-turn-receipt PATH` | ownership source for a genuine native turn that predates the task ledger: a durable receipt in `data/recovery/` recording the original session, canonical worktree, branch and initial head, proved against the native completed turn and the unchanged checkout |
