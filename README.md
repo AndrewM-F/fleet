@@ -29,6 +29,7 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet completions collect\|wait\|ack` | relay events + receipts (was `fleet-events.py`) |
 | `bin/fleet resolve …` / `cancel TASK` | operator decisions, abort a running turn |
 | `bin/fleet hold TASK` / `release TASK` | durably pause/resume one unstarted queued task (never a cancel; never clears pause/dispatch/profile/recovery holds) |
+| `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."` | close a stale `running` row whose managed OpenCode turn provably completed |
 | `bin/fleet recovery-snapshot --cwd PATH` / `recover-opencode …` | fingerprint a checkout and authorize one verified OpenCode successor |
 | `bin/fleet reconcile-recovery --task ID` | release a claimed recovery reservation after verified native stop |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |

@@ -10,7 +10,8 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, holds, manager, model_selection, opencode, ops, paths, pi, recovery
+from . import (claude, completion, control, events, holds, manager, model_selection, opencode,
+               ops, paths, pi, recovery)
 from .store import BUSY, database
 
 
@@ -288,6 +289,15 @@ def cmd_reconcile_recovery(args):
         sys.exit(1)
 
 
+def cmd_reconcile_completed(args):
+    try:
+        out(completion.reconcile_completed(database(), args.task, args.turn, args.worker,
+                                           args.receipt_root, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
 def cmd_opencode_model(args):
     """Report or set the approved model for managed OpenCode workers."""
     if args.inspect:
@@ -420,6 +430,15 @@ def main(argv=None):
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")
     p.add_argument("--note", required=True, help="operator evidence that native execution stopped")
     p.set_defaults(fn=cmd_reconcile_recovery)
+    p = sub.add_parser("reconcile-completed",
+                       help="close a stale running row whose managed OpenCode turn completed")
+    p.add_argument("--task", required=True, help="exact stale task id")
+    p.add_argument("--turn", required=True, help="exact managed OpenCode turn id")
+    p.add_argument("--worker", required=True, help="exact worker session id that ran the turn")
+    p.add_argument("--receipt-root", required=True,
+                   help="Fleet root that retains the turn receipt, such as a retired root")
+    p.add_argument("--note", required=True, help="operator evidence for the reconciliation")
+    p.set_defaults(fn=cmd_reconcile_completed)
     p = sub.add_parser("opencode-model",
                        help="inspect or set the approved OpenCode provider/model for a worker")
     p.add_argument("--model", help="approved provider/model to run for the next productive turn")
