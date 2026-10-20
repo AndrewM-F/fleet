@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -443,6 +444,25 @@ class CompletionReconciliationTests(unittest.TestCase):
         connection.commit()
         connection.close()
         self.assertEqual(self.retired_db.execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
+
+    def test_same_physical_ledger_reuses_transaction_and_ignores_only_current_row(self):
+        # The receipt root may be the current Fleet root. The target's own
+        # running row is valid, and an unrelated unrostered row is preserved.
+        alias_root = self.root / "same-ledger-alias"
+        (alias_root / "data").mkdir(parents=True)
+        (alias_root / "data" / "fleet.sqlite").symlink_to(
+            self.live / "data" / "fleet.sqlite")
+        shutil.copytree(self.session_dir, alias_root / "data" / "opencode" / SESSION)
+        self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                        ("unrelated", "ses_unrostered", str(self.root / "elsewhere"), "{}",
+                         "running", 1))
+        self.db.commit()
+        result = self.reconcile(receipt_root=str(alias_root))
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?", (TASK,))
+                         .fetchone(), ("finished",))
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id='unrelated'")
+                         .fetchone(), ("running",))
 
     def test_missing_process_identity_refuses(self):
         result = self.identity({

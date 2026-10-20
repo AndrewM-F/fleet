@@ -217,7 +217,7 @@ class _RetainedLedgerFence:
 
 
 @contextlib.contextmanager
-def _retained_ownership_fence(db_path, task_id, session_id, resolved_cwd):
+def _retained_ownership_fence(db, db_path, task_id, session_id, resolved_cwd):
     """Fence the retained ledger's writers and prove it owns no work here.
 
     Ownership is matched by task id, by session and by canonical working
@@ -225,15 +225,42 @@ def _retained_ownership_fence(db_path, task_id, session_id, resolved_cwd):
     or the same working directory owns the same work and blocks the
     reconciliation just as the same task id would.
     """
-    fence = _RetainedLedgerFence(db_path).open()
+    retained_path = Path(db_path).expanduser().resolve()
+    current_path = db.execute("PRAGMA database_list").fetchone()[2]
+    if not current_path or not retained_path.is_file():
+        raise ValueError("Retired root ledger is missing; ownership cannot be verified")
+    same_ledger = os.path.samefile(retained_path, current_path)
+    # A second connection to the same physical database would try to take our
+    # own write lock. Reuse the current transaction and exclude only the exact
+    # stale row that this operation is about to close.
+    if same_ledger:
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        connection = db
+        fence = None
+    else:
+        fence = _RetainedLedgerFence(retained_path).open()
+        connection = fence.connection
     try:
-        for other_id, other_sid, other_cwd, other_state in fence.active_rows():
+        try:
+            rows = connection.execute(
+                "SELECT id,sid,cwd,state FROM tasks WHERE state IN "
+                "('dispatching','sent','running','uncertain')").fetchall()
+        except sqlite3.Error as error:
+            raise ValueError("Retired root ledger is unreadable; "
+                             "ownership cannot be verified") from error
+        for other_id, other_sid, other_cwd, other_state in rows:
+            if same_ledger and other_id == task_id:
+                continue
             if other_id == task_id or other_sid == session_id \
                     or (resolved_cwd and _resolve(other_cwd) == resolved_cwd):
                 raise ValueError("Another Fleet root still owns the task")
-        yield fence
+        yield same_ledger
     finally:
-        fence.close()
+        if fence is not None:
+            fence.close()
+        elif db.in_transaction:
+            db.rollback()
 
 
 def _assert_stopped_native(result, state_document, pointer):
@@ -359,8 +386,8 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
     # The retained root's ledger is fenced with its own write lock before the
     # last ownership query and held through the current-ledger commit, so no
     # claim can be written into that root while this reconciliation closes.
-    with _retained_ownership_fence(root / "data" / "fleet.sqlite", task_id, session_id,
-                                    resolved_cwd):
+    with _retained_ownership_fence(db, root / "data" / "fleet.sqlite", task_id, session_id,
+                                   resolved_cwd) as same_ledger:
         session_directory = receipt_session_dir(root, session_id)
         # From here the session's dispatch lock is held, so no managed launch can
         # start for this session while the completion is verified and committed.
@@ -445,8 +472,9 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
             if state not in _STALE_STATES:
                 raise ValueError(f"Task is {state}; only a stale running or sent row can be reconciled")
 
-            db.commit()
-            db.execute("BEGIN IMMEDIATE")
+            if not same_ledger:
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
             try:
                 current = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if not current or current[0] != sid or current[1] != cwd or current[2] != state:
