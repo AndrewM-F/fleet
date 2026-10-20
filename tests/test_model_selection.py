@@ -3,6 +3,8 @@
 Every provider and model here is a fixture. The tests never reach a provider, never
 write an OpenCode database, never start a native session, and never change a hold.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import dispatch, model_selection, opencode, paths, store  # noqa: E402
+from fleet import cli, dispatch, model_selection, opencode, paths, store  # noqa: E402
 
 MINIMAX = "opencode-go/minimax-m3.1-flash-free"
 DEEPSEEK = "opencode/deepseek-v4.1-flash-free"
@@ -293,6 +295,38 @@ class ModelSelectionTests(unittest.TestCase):
         slot = dict(self.slot(self.sids[0]))
         with self.assertRaises(ValueError):
             opencode.send(slot, "work", "t1", model=MINIMAX)
+
+    # -- the command surface ----------------------------------------------
+    def test_inspect_reports_and_never_writes(self):
+        before = self.config_path.read_text()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.main(["opencode-model", "--inspect", "--model", DEEPSEEK])
+        self.assertEqual(self.config_path.read_text(), before)
+        report = json.loads(buffer.getvalue())
+        self.assertEqual(len(report["workers"]), 5)
+        self.assertEqual(report["legacyDefaultModel"], opencode.MODEL)
+        self.assertEqual(report["approvedModels"], list(opencode.APPROVED_MODELS))
+        for worker in report["workers"]:
+            self.assertEqual(worker["configuredModel"], MINIMAX)
+            self.assertEqual(worker["nativeIdentityModel"], MINIMAX)
+            self.assertEqual(worker["nativeDirectory"], self.cwds[worker["sessionId"]])
+
+    def test_a_model_without_a_target_is_refused(self):
+        before = self.config_path.read_text()
+        with self.assertRaises(SystemExit):
+            cli.main(["opencode-model", "--model", DEEPSEEK])
+        self.assertEqual(self.config_path.read_text(), before)
+
+    def test_dry_run_through_the_command_changes_nothing(self):
+        before = self.config_path.read_text()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.main(["opencode-model", "--model", DEEPSEEK, "--all", "--dry-run"])
+        self.assertEqual(self.config_path.read_text(), before)
+        result = json.loads(buffer.getvalue())
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["dryRun"])
 
     # -- nothing else is touched ------------------------------------------
     def test_selection_clears_no_hold_and_keeps_every_other_field(self):

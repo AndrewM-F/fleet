@@ -290,10 +290,13 @@ def cmd_reconcile_recovery(args):
 
 def cmd_opencode_model(args):
     """Report or set the approved model for managed OpenCode workers."""
-    if args.inspect or not args.model:
+    if args.inspect:
+        # Inspection never writes and never reaches a provider.
         out(model_selection.inspect(database()))
-        if not args.model:
-            return
+        return
+    if not args.model:
+        out(model_selection.inspect(database()))
+        return
     if args.worker and args.all:
         raise SystemExit("Choose one worker or all of them")
     if not args.worker and not args.all:

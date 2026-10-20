@@ -18,6 +18,7 @@ from pathlib import Path
 import time
 
 from . import opencode, paths
+from .store import database
 
 # The legacy default stays the default. The approved set is never widened or
 # narrowed here: it is exactly the set the runtime already accepts.
@@ -120,10 +121,17 @@ def native_identity(slot):
 def inspect(db=None, cfg=None):
     """Report every configured OpenCode worker's model state. Read-only."""
     cfg = paths.config() if cfg is None else cfg
-    if db is None:
-        from .store import database
-
+    owned = db is None
+    if owned:
         db = database()
+    try:
+        return _inspect(db, cfg)
+    finally:
+        if owned:
+            db.close()
+
+
+def _inspect(db, cfg):
     busy = busy_workers(db, cfg)
     workers = []
     for entry in _opencode_entries(cfg):
@@ -195,10 +203,17 @@ def apply(cfg, model, session_id=None, dry_run=False, db=None):
     state is written, no provider is contacted, and no hold, dispatch flag, session
     id, working directory, account or queue is touched.
     """
-    if db is None:
-        from .store import database
-
+    owned = db is None
+    if owned:
         db = database()
+    try:
+        return _apply(db, model, session_id, dry_run)
+    finally:
+        if owned:
+            db.close()
+
+
+def _apply(db, model, session_id, dry_run):
     with model_lock():
         cfg = paths.config()
         planned = plan(cfg, model, session_id, db)
@@ -219,9 +234,7 @@ def apply(cfg, model, session_id=None, dry_run=False, db=None):
             }
             updated = True
         if updated:
-            tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
-            tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-            os.replace(tmp, paths.CONFIG)
+            paths.write_config(cfg)
         deferred = [change["sessionId"] for change in planned["changes"] if change.get("busy")]
         return {"applied": updated, "dryRun": False, **planned,
                 "deferredUntilIdle": deferred}

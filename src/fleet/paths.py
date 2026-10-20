@@ -26,6 +26,13 @@ def config(path=None):
     return json.loads(Path(path or CONFIG).read_text())
 
 
+def write_config(cfg):
+    """Write the configuration atomically: a reader never sees a partial file."""
+    tmp = CONFIG.with_name(CONFIG.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, CONFIG)
+
+
 def _expand(value):
     return os.path.expanduser(value) if isinstance(value, str) else value
 

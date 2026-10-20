@@ -120,9 +120,7 @@ def cancel(db, task_id, note):
 # --- roster ----------------------------------------------------------------
 
 def _write_config(cfg):
-    tmp = paths.CONFIG.with_name(paths.CONFIG.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-    os.replace(tmp, paths.CONFIG)
+    paths.write_config(cfg)
 
 
 def _check_cwd(cfg, cwd):
