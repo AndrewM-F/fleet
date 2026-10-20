@@ -53,9 +53,16 @@ command prints JSON on stdout and exits non-zero on failure.
   be one of the explicitly approved free models; the legacy default is unchanged. The
   configuration is the desired model for the next productive turn: the native session row
   keeps its own historical model and is never written, and no provider is contacted. A
-  worker that is active or uncertain keeps the model its in-flight turn was launched with.
+  worker that is active or uncertain keeps the model its in-flight turn was launched with;
+  that expectation is immutable, so repeated selections cannot strand the turn and a
+  cancellation binds to it rather than to the next-turn model.
   A selection and a dispatch claim share one lock, so a task is never claimed under one
-  model and launched under another. The selection clears no hold, dispatch flag, queue,
+  model and launched under another; the dispatcher re-reads the configuration inside that
+  lock, so a selection that lands after the roster was loaded is still the model the
+  claim and the launch use. That reload is fail-closed: an unreadable or malformed
+  configuration, a removed worker and an ambiguous configuration are refusals, so a
+  retired worker is never launched from a cached roster and the task stays queued.
+  The selection clears no hold, dispatch flag, queue,
   account, session id or working directory.
 
 ## Rules

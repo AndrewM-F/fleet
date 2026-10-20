@@ -284,7 +284,7 @@ def selection_of(slot):
     return selection
 
 
-def allowed_models(slot):
+def allowed_models(slot, in_flight=None):
     """The models a live turn for this worker may legitimately carry.
 
     The configured model is the desired model for the next productive turn.
@@ -293,6 +293,11 @@ def allowed_models(slot):
     one, while the transition is still open. The native historical identity
     is deliberately not in this set: it is the session's own record and is
     checked separately.
+
+    ``in_flight`` is the model of the turn that is actually running, taken from
+    that turn's own immutable launch record. It is kept apart from the mutable
+    next-turn selection, so repeated selections cannot strand a turn that was
+    legitimately launched before them.
     """
     allowed = set()
     configured = slot.get("model")
@@ -304,6 +309,8 @@ def allowed_models(slot):
             value = selection.get(key)
             if isinstance(value, str) and value:
                 allowed.add(value)
+    if isinstance(in_flight, str) and in_flight:
+        allowed.add(in_flight)
     return allowed
 
 
@@ -355,9 +362,17 @@ def state(slot):
     turn = launch.get("turn")
     if not isinstance(turn, str) or not _TURN_ID.fullmatch(turn):
         raise RuntimeError("OpenCode managed turn pointer is invalid")
-    permitted = allowed_models(slot)
+    # The turn in flight keeps the model it was launched with. That expectation
+    # is immutable, so it is read from the turn's own launch record and kept
+    # apart from the mutable next-turn selection: repeated selections cannot
+    # strand a turn that was launched before them.
+    launch_model = launch.get("model")
+    if not isinstance(launch_model, str) or not launch_model:
+        raise RuntimeError("OpenCode managed turn pointer has no model")
+    _validate_model(launch_model)
+    permitted = allowed_models(slot, launch_model)
     if (launch.get("sessionId") != slot["sessionId"] or launch.get("cwd") != slot["cwd"]
-            or launch.get("model") not in permitted):
+            or launch_model not in permitted):
         raise RuntimeError("OpenCode managed session/model/cwd identity mismatch")
     path = turn_dir(slot["sessionId"], turn) / "state.json"
     if not path.exists():
@@ -376,7 +391,7 @@ def state(slot):
                 "error": "OpenCode turn state is not available"}
     result = json.loads(path.read_text())
     if (result.get("sessionId") != slot["sessionId"] or result.get("cwd") != slot["cwd"]
-            or result.get("model") not in permitted):
+            or result.get("model") != launch_model):
         raise RuntimeError("OpenCode turn identity/cwd/model mismatch")
     if result.get("state") == "launching":
         if time.time() - result.get("startedAt", 0) < 15:
@@ -1140,7 +1155,6 @@ def cancel(slot):
     sid = slot.get("sessionId")
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode sessionId must be an existing native ses_ ID")
-    _validate_model(slot.get("model"))
     try:
         cwd = str(Path(os.path.expanduser(slot.get("cwd", ""))).resolve())
     except (OSError, RuntimeError, TypeError) as error:
@@ -1150,9 +1164,16 @@ def cancel(slot):
     if not pointer.exists():
         raise ValueError("No live OpenCode turn to cancel")
     launch = json.loads(pointer.read_text())
-    if (launch.get("sessionId") != sid or launch.get("cwd") != cwd
-            or launch.get("model") != slot["model"]):
-        raise ValueError("OpenCode managed session/model/cwd identity mismatch")
+    if launch.get("sessionId") != sid or launch.get("cwd") != cwd:
+        raise ValueError("OpenCode managed session/cwd identity mismatch")
+    # The turn in flight is bound to the model it was launched with. The
+    # configured model is the desired model for the next productive turn and
+    # never decides whether a running turn may be cancelled, so switching an
+    # active worker does not make its legitimate turn uncancellable.
+    launch_model = launch.get("model")
+    if not isinstance(launch_model, str) or not launch_model:
+        raise ValueError("OpenCode managed turn pointer has no model")
+    _validate_model(launch_model)
     turn = launch.get("turn")
     if not isinstance(turn, str) or not _TURN_ID.fullmatch(turn):
         raise ValueError("OpenCode managed turn pointer is invalid")
@@ -1162,7 +1183,7 @@ def cancel(slot):
     current = json.loads(state_path.read_text())
     identity = current.get("processIdentity")
     if (current.get("sessionId") != sid or current.get("cwd") != cwd
-            or current.get("model") != slot["model"]):
+            or current.get("model") != launch_model):
         raise ValueError("OpenCode turn identity/cwd/model mismatch")
     if current.get("state") != "working" or not identity_matches(identity):
         raise ValueError("OpenCode process identity is not live and confirmed; no signal sent")

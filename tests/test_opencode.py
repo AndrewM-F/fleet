@@ -99,6 +99,17 @@ class OpenCodeAdapterTests(unittest.TestCase):
         exe = patch.object(paths, "executable", return_value="/usr/bin/opencode")
         exe.start()
         self.addCleanup(exe.stop)
+        # The dispatcher reloads the roster inside the shared model lock, so the
+        # current configuration has to describe this worker. An explicit
+        # configuration is still read the way the runtime reads it.
+        def opencode_slots(cfg=None):
+            if cfg is None:
+                return [self.slot]
+            return [dict(raw, provider="opencode") for raw in cfg.get("opencode", [])]
+
+        roster = patch.object(paths, "opencode_slots", side_effect=opencode_slots)
+        roster.start()
+        self.addCleanup(roster.stop)
         self.identity = {"pid": 43001, "pgid": 43001, "start": [100, 200],
                          "executable": "/usr/bin/opencode"}
 
@@ -357,7 +368,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual(pause.read_text(), "paused")
         self.assertFalse(disabled["dispatchEnabled"])
 
-    def test_minimax_cancel_checks_selected_model_without_signaling_or_switching(self):
+    def test_minimax_cancel_binds_to_the_in_flight_launch_model(self):
         model = "opencode-go/minimax-m3.1-flash-free"
         turn = "minimax-cancel"
         directory = self.data / self.sid / "turns" / turn
@@ -367,10 +378,21 @@ class OpenCodeAdapterTests(unittest.TestCase):
         (directory / "state.json").write_text(json.dumps(dict(identity, state="working",
                                                              processIdentity=self.identity)))
         with patch.object(opencode, "identity_matches", return_value=True):
-            with self.assertRaisesRegex(ValueError, "identity mismatch"):
-                opencode.cancel(dict(self.slot, model="opencode/minimax-m3.1-flash-free"))
+            # The configured model is the desired model for the next turn. A
+            # running turn keeps the model it was launched with, so switching
+            # the worker does not make its legitimate turn uncancellable.
+            self.assertEqual(
+                opencode.cancel(dict(self.slot, model="opencode/minimax-m3.1-flash-free"))["turn"], turn)
+            self.assertTrue((directory / "cancel.json").exists())
+            # A turn whose own records disagree is still refused, and no signal
+            # is sent.
+            (directory / "cancel.json").unlink()
+            (directory / "state.json").write_text(json.dumps(dict(
+                identity, state="working", model="opencode/minimax-m3.1-flash-free",
+                processIdentity=self.identity)))
+            with self.assertRaisesRegex(ValueError, "identity/cwd/model mismatch"):
+                opencode.cancel(dict(self.slot, model=model))
             self.assertFalse((directory / "cancel.json").exists())
-            self.assertEqual(opencode.cancel(dict(self.slot, model=model))["turn"], turn)
 
     def test_slot_verifies_paths_model_and_live_identity_without_attestation_flags(self):
         # Stale verification booleans are not trusted or required; launch repeats the DB check.
@@ -409,8 +431,9 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertEqual(self.db.execute("SELECT state FROM tasks").fetchone()[0], "queued")
         slots[self.sid]["dispatchEnabled"] = True
-        dispatch.dispatch(self.db, slots, states,
-                          lambda *args, **kwargs: sent.append((args, kwargs)))
+        with patch.object(paths, "opencode_slots", return_value=[slots[self.sid]]):
+            dispatch.dispatch(self.db, slots, states,
+                              lambda *args, **kwargs: sent.append((args, kwargs)))
         self.assertEqual(sent[0][0], (slots[self.sid], "tiny task"))
         # The launch carries the model the task was claimed under.
         self.assertEqual(sent[0][1], {"task_id": "t1", "model": opencode.MODEL})

@@ -10,6 +10,17 @@ from . import holds, model_selection, recovery
 from .store import BUSY, emit
 
 
+def _report_refusal(db, task_id, sid, error):
+    """Record a refusal once, so a task that cannot be claimed is never silent."""
+    for (body,) in db.execute("SELECT body FROM events WHERE kind='needs_attention'").fetchall():
+        try:
+            if json.loads(body).get("taskId") == task_id:
+                return
+        except (TypeError, json.JSONDecodeError):
+            continue
+    emit(db, "needs_attention", taskId=task_id, sessionId=sid, error=str(error))
+
+
 def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
     if paused:
         return
@@ -76,12 +87,28 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         model_lock = model_selection.model_lock() if is_opencode else nullcontext()
         with model_lock:
             claim_model = None
+            launch_slot = slot
             if is_opencode:
+                # The roster was loaded before this claim, so a selection that
+                # landed since then is not in it. The configuration is reloaded
+                # and validated inside the shared lock, so the claim and the
+                # launch use the model that is current now. The reload is
+                # fail-closed: an unreadable configuration, a removed worker
+                # or an ambiguous one is a refusal, never a fallback to the
+                # cached roster.
                 try:
-                    claim_model = model_selection.claim_model(slot)
+                    launch_slot = model_selection.current_slot(slot)
+                except (ValueError, OSError) as error:
+                    _report_refusal(db, task_id, sid, error)
+                    continue  # Leave the task queued; the sender is never called.
+                if not launch_slot.get("dispatchEnabled", False):
+                    continue
+                try:
+                    claim_model = model_selection.claim_model(launch_slot)
+                    model_selection.validate_model(claim_model)
                 except ValueError:
-                    # A worker that declares no model cannot be launched. The
-                    # launch path refuses it; the claim keeps its existing
+                    # A worker that declares no approved model cannot be launched.
+                    # The launch path refuses it; the claim keeps its existing
                     # behaviour so nothing else is hidden by this check.
                     claim_model = None
                 if claim_model:
@@ -104,10 +131,10 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             try:
                 if is_opencode:
                     if recovery_record:
-                        sender(slot, task["message"], task_id=task_id,
+                        sender(launch_slot, task["message"], task_id=task_id,
                                recovery=recovery_record, model=claim_model)
                     else:
-                        sender(slot, task["message"], task_id=task_id, model=claim_model)
+                        sender(launch_slot, task["message"], task_id=task_id, model=claim_model)
                 else:
                     sender(slot, task["message"])
             except Exception as error:

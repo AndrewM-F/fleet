@@ -310,7 +310,33 @@ class ModelSelectionTests(unittest.TestCase):
         for worker in report["workers"]:
             self.assertEqual(worker["configuredModel"], MINIMAX)
             self.assertEqual(worker["nativeIdentityModel"], MINIMAX)
-            self.assertEqual(worker["nativeDirectory"], self.cwds[worker["sessionId"]])
+            # The reported native directory is the canonical one, exactly as
+            # verify_native_session reports it: a path alias is the same
+            # directory, so the comparison follows the path.
+            self.assertEqual(worker["nativeDirectory"],
+                             str(Path(self.cwds[worker["sessionId"]]).resolve()))
+
+    def test_a_symlinked_cwd_is_the_same_directory(self):
+        """A path alias names the same directory, and is not a mismatch."""
+        sid = self.sids[0]
+        alias = self.root / "alias"
+        alias.symlink_to(self.cwds[sid])
+        cfg = self.config()
+        for entry in cfg["opencode"]:
+            if entry["sessionId"] == sid:
+                entry["cwd"] = str(alias)
+                entry["sessionCwd"] = str(alias)
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        report = model_selection.inspect(self.db)
+        worker = next(w for w in report["workers"] if w["sessionId"] == sid)
+        self.assertIsNone(worker["nativeError"])
+        self.assertEqual(worker["nativeDirectory"],
+                         str(Path(self.cwds[sid]).resolve()))
+        result = model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["deferredUntilIdle"], [])
+        self.assertEqual(self.slot(sid)["model"], DEEPSEEK)
+        self.assertEqual(self.slot(sid)["cwd"], str(alias))
 
     def test_a_model_without_a_target_is_refused(self):
         before = self.config_path.read_text()
@@ -327,6 +353,229 @@ class ModelSelectionTests(unittest.TestCase):
         result = json.loads(buffer.getvalue())
         self.assertFalse(result["applied"])
         self.assertTrue(result["dryRun"])
+
+    # -- the reviewed defects ----------------------------------------------
+    def live_turn(self, sid, model, turn="live-turn", state="working"):
+        """A managed turn that is in flight for this worker."""
+        directory = opencode.turn_dir(sid, turn)
+        directory.mkdir(parents=True, exist_ok=True)
+        cwd = str(Path(self.cwds[sid]).resolve())
+        identity = {"sessionId": sid, "cwd": cwd, "model": model}
+        (directory.parent.parent / "current.json").write_text(json.dumps(
+            dict(identity, turn=turn, startedAt=time.time())))
+        (directory / "state.json").write_text(json.dumps(dict(
+            identity, turn=turn, state=state, progress=0, startedAt=time.time(),
+            processIdentity={"pid": 43001, "pgid": 43001, "start": [100, 200],
+                             "executable": "/usr/bin/opencode"})))
+        return directory
+
+    def test_a_switch_while_active_does_not_make_the_turn_uncancellable(self):
+        # A cancellation binds to the model the turn was launched with. The
+        # configured model is the desired model for the next productive turn
+        # and never decides whether a running turn may be cancelled.
+        sid = self.sids[0]
+        directory = self.live_turn(sid, MINIMAX)
+        model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        self.assertEqual(self.slot(sid)["model"], DEEPSEEK)
+        with patch.object(opencode, "identity_matches", return_value=True):
+            result = opencode.cancel(self.slot(sid))
+        self.assertEqual(result["turn"], "live-turn")
+        self.assertTrue((directory / "cancel.json").exists())
+
+    def test_a_cancel_refuses_a_turn_whose_own_records_disagree(self):
+        # The identity checks are retained: a turn whose state names another
+        # model than its launch record is refused, and nothing is signalled.
+        sid = self.sids[0]
+        directory = self.live_turn(sid, MINIMAX)
+        state = json.loads((directory / "state.json").read_text())
+        state["model"] = DEEPSEEK
+        (directory / "state.json").write_text(json.dumps(state))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            with self.assertRaisesRegex(ValueError, "identity/cwd/model mismatch"):
+                opencode.cancel(self.slot(sid))
+        self.assertFalse((directory / "cancel.json").exists())
+
+    def test_a_cancel_still_checks_the_session_and_the_process(self):
+        # The session, the working directory and the process identity checks
+        # are kept: only the model binding changed.
+        sid = self.sids[0]
+        directory = self.live_turn(sid, MINIMAX)
+        launch = json.loads((directory.parent.parent / "current.json").read_text())
+        launch["cwd"] = str(self.root)
+        (directory.parent.parent / "current.json").write_text(json.dumps(launch))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            with self.assertRaisesRegex(ValueError, "session/cwd identity mismatch"):
+                opencode.cancel(self.slot(sid))
+        self.assertFalse((directory / "cancel.json").exists())
+        launch["cwd"] = str(Path(self.cwds[sid]).resolve())
+        (directory.parent.parent / "current.json").write_text(json.dumps(launch))
+        with patch.object(opencode, "identity_matches", return_value=False):
+            with self.assertRaisesRegex(ValueError, "identity is not live"):
+                opencode.cancel(self.slot(sid))
+        self.assertFalse((directory / "cancel.json").exists())
+
+    def test_repeated_selections_keep_the_active_turn_identity(self):
+        # A turn that is in flight keeps its own immutable expectation. A
+        # second selection must not strand it, and the worker stays available.
+        sid = self.sids[0]
+        self.live_turn(sid, MINIMAX)
+        model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        model_selection.apply(None, "opencode/minimax-m3.1-flash-free", sid, db=self.db)
+        slot = self.slot(sid)
+        self.assertEqual(slot["model"], "opencode/minimax-m3.1-flash-free")
+        self.assertEqual(slot["modelSelection"]["previous"], DEEPSEEK)
+        # The mutable selection chain alone no longer holds the launched model.
+        self.assertNotIn(MINIMAX, opencode.allowed_models(slot))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            observed = opencode.state(slot)
+        self.assertEqual(observed["state"], "working")
+        self.assertEqual(observed["model"], MINIMAX)
+
+    def test_a_turn_state_must_agree_with_its_own_launch_record(self):
+        # The launch record is the turn's immutable expectation. The state
+        # record is checked against it and not against the mutable roster, so
+        # a later selection cannot make a mismatched turn look legitimate.
+        sid = self.sids[0]
+        directory = self.live_turn(sid, MINIMAX)
+        model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        state = json.loads((directory / "state.json").read_text())
+        state["model"] = DEEPSEEK
+        (directory / "state.json").write_text(json.dumps(state))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "identity/cwd/model mismatch"):
+                opencode.state(self.slot(sid))
+
+    def test_a_selection_that_lands_before_the_claim_is_seen(self):
+        # The roster was loaded before the selection landed. The configuration
+        # is reloaded inside the shared lock, so the claim and the launch use
+        # the model that is current, never the one the roster was loaded with.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        self.assertEqual(stale[sid]["model"], MINIMAX)
+        model_selection.apply(None, DEEPSEEK, sid, db=self.db)
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append((args, rest)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["model"], DEEPSEEK)
+        self.assertEqual(calls[0][0][0]["model"], DEEPSEEK)
+        self.assertEqual(self.task_body("t1")["model"], DEEPSEEK)
+
+    def test_a_worker_disabled_before_the_claim_is_not_claimed(self):
+        # The reloaded configuration is validated, not just read.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        cfg = self.config()
+        for entry in cfg["opencode"]:
+            if entry["sessionId"] == sid:
+                entry["dispatchEnabled"] = False
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+
+    # -- the fail-closed reload --------------------------------------------
+    def test_a_removed_worker_is_never_launched_from_a_cached_roster(self):
+        # The worker was retired from the configuration after the roster was
+        # loaded. The claim is refused, the task stays queued and the sender is
+        # never called.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        cfg = self.config()
+        cfg["opencode"] = [entry for entry in cfg["opencode"]
+                           if entry["sessionId"] != sid]
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+        # The refusal is recorded once, so the stall is never silent.
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM events WHERE kind='needs_attention'").fetchone()[0], 1)
+
+    def test_an_unreadable_configuration_leaves_the_task_queued(self):
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        self.config_path.unlink()
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+        self.assertEqual(self.db.execute(
+            "SELECT count(*) FROM events WHERE kind='needs_attention'").fetchone()[0], 1)
+
+    def test_a_malformed_configuration_leaves_the_task_queued(self):
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        self.config_path.write_text("{ this is not json")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+
+    def test_an_ambiguous_configuration_leaves_the_task_queued(self):
+        # The configuration describes the same session twice.
+        sid = self.sids[0]
+        stale = {sid: dict(self.slot(sid))}
+        cfg = self.config()
+        cfg["opencode"].append(dict(cfg["opencode"][0]))
+        self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        self.add_task("t1", sid=sid)
+        calls = []
+        dispatch.dispatch(self.db, stale,
+                          {sid: {"state": "idle", "cwd": stale[sid]["cwd"]}},
+                          lambda *args, **rest: calls.append(rest))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.db.execute(
+            "SELECT state FROM tasks WHERE id='t1'").fetchone()[0], "queued")
+
+    def test_the_reload_refuses_a_missing_unreadable_malformed_or_ambiguous_configuration(self):
+        sid = self.sids[0]
+        slot = dict(self.slot(sid))
+        pristine = self.config()
+
+        def write(entries):
+            cfg = dict(pristine)
+            cfg["opencode"] = entries
+            self.config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+        self.assertEqual(model_selection.current_slot(slot)["model"], MINIMAX)
+        # A worker that is no longer configured.
+        write([entry for entry in pristine["opencode"] if entry["sessionId"] != sid])
+        with self.assertRaisesRegex(ValueError, "one existing configured OpenCode session"):
+            model_selection.current_slot(slot)
+        # A configuration that describes the worker twice.
+        write(pristine["opencode"] + [dict([entry for entry in pristine["opencode"]
+                                            if entry["sessionId"] == sid][0])])
+        with self.assertRaisesRegex(ValueError, "one existing configured OpenCode session"):
+            model_selection.current_slot(slot)
+        # A configuration that cannot be read.
+        self.config_path.unlink()
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            model_selection.current_slot(slot)
+        # A configuration that cannot be parsed.
+        self.config_path.write_text("{ this is not json")
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            model_selection.current_slot(slot)
 
     # -- nothing else is touched ------------------------------------------
     def test_selection_clears_no_hold_and_keeps_every_other_field(self):
