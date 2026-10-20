@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -385,13 +386,63 @@ class CompletionReconciliationTests(unittest.TestCase):
         self.assertRetainedLedgerUnchanged(expected=1)
 
     def test_a_retained_root_claim_between_validation_and_commit_refuses(self):
-        late = {"id": "late-retained", "sid": SESSION, "state": "running"}
-        with patch.object(completion, "_other_roots_claim",
-                          side_effect=[None, late]) as claims:
+        with patch.object(completion, "_retained_ownership_fence",
+                          side_effect=ValueError("Another Fleet root still owns the task")):
             with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
                 self.reconcile()
-            self.assertEqual(claims.call_count, 2)
         self.assertLedgerUnchanged()
+
+    def test_a_retained_ledger_claim_cannot_slip_through_the_commit_window(self):
+        """Two real WAL ledgers: a cross-root claim in the commit window is fenced."""
+        self.assertEqual(self.db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(self.retired_db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        retained = self.receipts / "data" / "fleet.sqlite"
+        outcome = {}
+
+        def claim():
+            connection = sqlite3.connect(retained, timeout=0.5)
+            try:
+                connection.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                                   ("late-claim", SESSION, str(self.cwd), "{}", "running", 1))
+                connection.commit()
+                outcome["claimed"] = True
+            except sqlite3.Error as error:
+                outcome["claimed"] = False
+                outcome["error"] = str(error)
+            finally:
+                connection.close()
+
+        original = completion._assert_no_conflict
+        calls = []
+
+        def hook(rows, task_id, session_id, resolved_cwd):
+            calls.append(rows)
+            if len(calls) == 2:
+                # The last retained-ledger ownership query has already run and
+                # the current-ledger update has not happened yet: this is the
+                # window a cross-root claim would slip through.
+                worker = threading.Thread(target=claim)
+                worker.start()
+                worker.join(timeout=10)
+                outcome["finished"] = not worker.is_alive()
+            return original(rows, task_id, session_id, resolved_cwd)
+
+        with patch.object(completion, "_assert_no_conflict", side_effect=hook):
+            self.reconcile()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(outcome.get("finished"))
+        self.assertFalse(outcome.get("claimed"))
+        self.assertIn("locked", str(outcome.get("error")))
+        # The fenced claim never landed in the retained ledger.
+        self.assertRetainedLedgerUnchanged()
+        # The same claim is accepted once the fence is released, so the refusal
+        # was the fence and not a broken ledger.
+        connection = sqlite3.connect(retained, timeout=2)
+        connection.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                           ("late-claim", SESSION, str(self.cwd), "{}", "running", 1))
+        connection.commit()
+        connection.close()
+        self.assertEqual(self.retired_db.execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
 
     def test_missing_process_identity_refuses(self):
         result = self.identity({

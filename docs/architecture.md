@@ -39,11 +39,13 @@
   identity, or a null identity beside a successful completion, fails closed. An unknown is never
   read as "nothing there": a missing, invalid or unreadable roster refuses, a missing, unreadable
   or corrupt other-root ledger refuses, and ownership in another root is matched by task id, by
-  session and by canonical working directory. The session's dispatch lock is held from the first
-  validation through the ledger commit, and the roster, the competing ownership and the other-root
-  ownership are rechecked inside the transaction that closes the row, so a new native launch, a
-  task that claims the working directory, or a claim that appears in the retired root in between is
-  refused instead of raced. It writes one audit event carrying the receipt digests and moves the row
+  session and by canonical working directory. That root's ledger is fenced with its own write lock
+  from the verified ownership query through the current-ledger commit, because a transaction on the
+  current ledger does not fence a separate database: a claim written into the retired root in
+  between is blocked instead of slipping through. The session's dispatch lock is held from the
+  first validation through the ledger commit, and the roster and the competing ownership are
+  rechecked inside the transaction that closes the row, so a new native launch or a task that
+  claims the working directory in between is refused instead of raced. It writes one audit event carrying the receipt digests and moves the row
   to `finished`; the task body, the retained receipt, every hold, the pause, the dispatch flags, the
   model and the account stay untouched, and the same-cwd dispatch exclusion rule is unchanged. A
   missing, uncertain or inconsistent receipt is a refusal, an `uncertain` row still needs `resolve`,

@@ -26,9 +26,11 @@ A completed turn ran a process, so its stopped proof is a full recorded native
 identity and a recorded wrapper PID that are both provably gone; a receipt that
 records no identity, or a null identity beside a successful completion, fails
 closed. Ownership in a retired root is matched by task id, by session and by
-canonical working directory, and that match is rechecked inside the transaction
-that closes the row.
+canonical working directory, and that root's ledger is fenced with its own write
+lock from the verified query through the current-ledger commit, because a
+transaction on the current ledger does not fence a separate database.
 """
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -165,37 +167,73 @@ def _release_session_lock(handle):
     handle.close()
 
 
-def _other_roots_claim(db_path, task_id, session_id, resolved_cwd):
-    """The active owner of this work in another Fleet root, if any.
+class _RetainedLedgerFence:
+    """A write fence on another Fleet root's ledger.
 
-    A retired root keeps its own ledger. Only a database that was read
-    successfully and holds no active owner proves that the root does not claim
-    the work. A missing, unreadable or corrupt ledger is unknown, not absent,
-    and refuses the reconciliation.
+    A transaction on the current ledger does not fence a separate database, so
+    a claim could be written into the retained ledger between the ownership
+    query and the current-ledger commit. Holding the retained ledger's own
+    write lock for that whole interval blocks every writer to it, so the
+    ownership that was verified is still the ownership at the commit. The
+    fence only reads: it is rolled back, so the retained ledger keeps its
+    rows.
+    """
+
+    def __init__(self, db_path):
+        self.path = Path(db_path).expanduser().resolve()
+        self.connection = None
+
+    def open(self):
+        if not self.path.is_file():
+            raise ValueError("Retired root ledger is missing; ownership cannot be verified")
+        try:
+            self.connection = sqlite3.connect(self.path, timeout=2, isolation_level=None)
+            self.connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as error:
+            self.close()
+            raise ValueError("Retired root ledger is unreadable or locked; "
+                             "ownership cannot be verified") from error
+        return self
+
+    def active_rows(self):
+        """Every task in the retained ledger that still owns work."""
+        try:
+            return self.connection.execute(
+                "SELECT id,sid,cwd,state FROM tasks WHERE state IN "
+                "('dispatching','sent','running','uncertain')").fetchall()
+        except sqlite3.Error as error:
+            raise ValueError("Retired root ledger is unreadable; "
+                             "ownership cannot be verified") from error
+
+    def close(self):
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        connection.close()
+
+
+@contextlib.contextmanager
+def _retained_ownership_fence(db_path, task_id, session_id, resolved_cwd):
+    """Fence the retained ledger's writers and prove it owns no work here.
 
     Ownership is matched by task id, by session and by canonical working
     directory: a different task in that root that runs under the same session
     or the same working directory owns the same work and blocks the
     reconciliation just as the same task id would.
     """
-    root = Path(db_path).expanduser().resolve()
-    if root == Path(paths.DB).expanduser().resolve():
-        return None  # The same ledger; it is the one being reconciled.
-    if not root.is_file():
-        raise ValueError("Retired root ledger is missing; ownership cannot be verified")
-    uri = "file:" + str(root) + "?mode=ro"
+    fence = _RetainedLedgerFence(db_path).open()
     try:
-        with sqlite3.connect(uri, uri=True, timeout=2) as other:
-            other.execute("PRAGMA query_only=ON")
-            rows = other.execute("SELECT id,sid,cwd,state FROM tasks WHERE state IN "
-                                 "('dispatching','sent','running','uncertain')").fetchall()
-    except sqlite3.Error as error:
-        raise ValueError("Retired root ledger is unreadable; ownership cannot be verified") from error
-    for other_id, other_sid, other_cwd, other_state in rows:
-        if other_id == task_id or other_sid == session_id \
-                or (resolved_cwd and _resolve(other_cwd) == resolved_cwd):
-            return {"id": other_id, "sid": other_sid, "state": other_state}
-    return None
+        for other_id, other_sid, other_cwd, other_state in fence.active_rows():
+            if other_id == task_id or other_sid == session_id \
+                    or (resolved_cwd and _resolve(other_cwd) == resolved_cwd):
+                raise ValueError("Another Fleet root still owns the task")
+        yield fence
+    finally:
+        fence.close()
 
 
 def _assert_stopped_native(result, state_document, pointer):
@@ -318,128 +356,124 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
     _assert_no_conflict(_conflict_rows(db, task_id), task_id, session_id, resolved_cwd)
 
     root = _resolved_root(receipt_root)
-    session_directory = receipt_session_dir(root, session_id)
-    # From here the session's dispatch lock is held, so no managed launch can
-    # start for this session while the completion is verified and committed.
-    session_lock = _hold_session_lock(session_directory)
-    try:
-        directory = receipt_turn_dir(session_directory, turn)
-        request = _read_json(directory / "request.json", "request")
-        state_document = _read_json(directory / "state.json", "state")
-        result = _read_json(directory / "result.json", "result")
-        pointer_path = session_directory / "current.json"
-        pointer = _read_json(pointer_path, "turn pointer")
-
-        identity = {"taskId": task_id, "sessionId": session_id}
-        for label, document in (("request", request), ("state", state_document),
-                                ("result", result), ("turn pointer", pointer)):
-            for key, expected in identity.items():
-                if document.get(key) != expected:
-                    raise ValueError(
-                        f"Native {label} does not identify the requested task and session")
-            if _resolve(document.get("cwd")) != resolved_cwd:
-                raise ValueError(f"Native {label} working directory differs from the task row")
-        # The request, the result and the session pointer record the turn id. The
-        # state document does not: it lives in the turn's own directory, which is
-        # what binds it to the same turn.
-        for label, document in (("request", request), ("result", result),
-                                ("turn pointer", pointer)):
-            if document.get("turn") != turn:
-                raise ValueError(f"Native {label} does not identify the requested turn")
-        if "turn" in state_document and state_document.get("turn") != turn:
-            raise ValueError("Native state does not identify the requested turn")
-        if request.get("model") != state_document.get("model"):
-            raise ValueError("Native request and state disagree about the model")
-
-        if state_document.get("state") not in _COMPLETED_NATIVE \
-                or result.get("state") not in _COMPLETED_NATIVE:
-            raise ValueError("Native receipt does not prove a completed turn")
-        if state_document.get("exitCode") != 0 or result.get("exitCode") != 0:
-            raise ValueError("Native receipt does not prove a successful exit")
-        if state_document.get("cleanup") != "confirmed" or result.get("cleanup") != "confirmed":
-            raise ValueError("Native receipt does not confirm cleanup")
-        if not _is_number(state_document.get("finishedAt")) \
-                or not _is_number(result.get("finishedAt")):
-            raise ValueError("Native receipt has no completion timestamp")
-        if not isinstance(result.get("terminalReason"), str) \
-                or not result["terminalReason"].strip():
-            raise ValueError("Native receipt has no terminal reason")
-
-        # The stopped proof is required, not optional: a completed turn ran a
-        # process, and both the recorded native identity and the recorded
-        # wrapper PID have to be provably gone.
-        process_proof = _assert_stopped_native(result, state_document, pointer)
-
-        claimed = _other_roots_claim(root / "data" / "fleet.sqlite", task_id, session_id,
-                                     resolved_cwd)
-        if claimed:
-            raise ValueError("Another Fleet root still owns the task")
-
-        proof = {
-            "taskId": task_id,
-            "turn": turn,
-            "sessionId": session_id,
-            "cwd": resolved_cwd,
-            "recordedCwd": cwd,
-            "exitCode": 0,
-            "terminalReason": result.get("terminalReason"),
-            "cleanup": "confirmed",
-            "finishedAt": result.get("finishedAt"),
-            "receiptRoot": str(root),
-            "receiptDir": str(directory),
-            "requestSha256": _digest(directory / "request.json"),
-            "stateSha256": _digest(directory / "state.json"),
-            "resultSha256": _digest(directory / "result.json"),
-            "pointerSha256": _digest(pointer_path),
-            "processIdentity": process_proof,
-            "wrapperPid": pointer.get("wrapperPid"),
-        }
-        evidence = dict(proof, previousState=state, state="finished", note=note.strip())
-
-        existing = _existing_record(db, task_id, turn)
-        if existing:
-            recorded = existing["evidence"]
-            if any(recorded.get(key) != value for key, value in proof.items()):
-                raise ValueError("Previously audited reconciliation evidence changed")
-            return {"taskId": task_id, "turn": turn, "sessionId": session_id, "reconciled": True,
-                    "alreadyRecorded": True, "state": "finished", "previousState": state,
-                    "record": existing["id"], "evidence": recorded}
-        if state not in _STALE_STATES:
-            raise ValueError(f"Task is {state}; only a stale running or sent row can be reconciled")
-
-        db.commit()
-        db.execute("BEGIN IMMEDIATE")
+    # The retained root's ledger is fenced with its own write lock before the
+    # last ownership query and held through the current-ledger commit, so no
+    # claim can be written into that root while this reconciliation closes.
+    with _retained_ownership_fence(root / "data" / "fleet.sqlite", task_id, session_id,
+                                    resolved_cwd):
+        session_directory = receipt_session_dir(root, session_id)
+        # From here the session's dispatch lock is held, so no managed launch can
+        # start for this session while the completion is verified and committed.
+        session_lock = _hold_session_lock(session_directory)
         try:
-            current = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone()
-            if not current or current[0] != sid or current[1] != cwd or current[2] != state:
+            directory = receipt_turn_dir(session_directory, turn)
+            request = _read_json(directory / "request.json", "request")
+            state_document = _read_json(directory / "state.json", "state")
+            result = _read_json(directory / "result.json", "result")
+            pointer_path = session_directory / "current.json"
+            pointer = _read_json(pointer_path, "turn pointer")
+
+            identity = {"taskId": task_id, "sessionId": session_id}
+            for label, document in (("request", request), ("state", state_document),
+                                    ("result", result), ("turn pointer", pointer)):
+                for key, expected in identity.items():
+                    if document.get(key) != expected:
+                        raise ValueError(
+                            f"Native {label} does not identify the requested task and session")
+                if _resolve(document.get("cwd")) != resolved_cwd:
+                    raise ValueError(f"Native {label} working directory differs from the task row")
+            # The request, the result and the session pointer record the turn id. The
+            # state document does not: it lives in the turn's own directory, which is
+            # what binds it to the same turn.
+            for label, document in (("request", request), ("result", result),
+                                    ("turn pointer", pointer)):
+                if document.get("turn") != turn:
+                    raise ValueError(f"Native {label} does not identify the requested turn")
+            if "turn" in state_document and state_document.get("turn") != turn:
+                raise ValueError("Native state does not identify the requested turn")
+            if request.get("model") != state_document.get("model"):
+                raise ValueError("Native request and state disagree about the model")
+
+            if state_document.get("state") not in _COMPLETED_NATIVE \
+                    or result.get("state") not in _COMPLETED_NATIVE:
+                raise ValueError("Native receipt does not prove a completed turn")
+            if state_document.get("exitCode") != 0 or result.get("exitCode") != 0:
+                raise ValueError("Native receipt does not prove a successful exit")
+            if state_document.get("cleanup") != "confirmed" or result.get("cleanup") != "confirmed":
+                raise ValueError("Native receipt does not confirm cleanup")
+            if not _is_number(state_document.get("finishedAt")) \
+                    or not _is_number(result.get("finishedAt")):
+                raise ValueError("Native receipt has no completion timestamp")
+            if not isinstance(result.get("terminalReason"), str) \
+                    or not result["terminalReason"].strip():
+                raise ValueError("Native receipt has no terminal reason")
+
+            # The stopped proof is required, not optional: a completed turn ran a
+            # process, and both the recorded native identity and the recorded
+            # wrapper PID have to be provably gone.
+            process_proof = _assert_stopped_native(result, state_document, pointer)
+
+            proof = {
+                "taskId": task_id,
+                "turn": turn,
+                "sessionId": session_id,
+                "cwd": resolved_cwd,
+                "recordedCwd": cwd,
+                "exitCode": 0,
+                "terminalReason": result.get("terminalReason"),
+                "cleanup": "confirmed",
+                "finishedAt": result.get("finishedAt"),
+                "receiptRoot": str(root),
+                "receiptDir": str(directory),
+                "requestSha256": _digest(directory / "request.json"),
+                "stateSha256": _digest(directory / "state.json"),
+                "resultSha256": _digest(directory / "result.json"),
+                "pointerSha256": _digest(pointer_path),
+                "processIdentity": process_proof,
+                "wrapperPid": pointer.get("wrapperPid"),
+            }
+            evidence = dict(proof, previousState=state, state="finished", note=note.strip())
+
+            existing = _existing_record(db, task_id, turn)
+            if existing:
+                recorded = existing["evidence"]
+                if any(recorded.get(key) != value for key, value in proof.items()):
+                    raise ValueError("Previously audited reconciliation evidence changed")
+                return {"taskId": task_id, "turn": turn, "sessionId": session_id, "reconciled": True,
+                        "alreadyRecorded": True, "state": "finished", "previousState": state,
+                        "record": existing["id"], "evidence": recorded}
+            if state not in _STALE_STATES:
+                raise ValueError(f"Task is {state}; only a stale running or sent row can be reconciled")
+
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if not current or current[0] != sid or current[1] != cwd or current[2] != state:
+                    db.rollback()
+                    raise ValueError("Task changed during validation; inspect before reconciling")
+                # Recheck the roster and the competing ownership inside the
+                # transaction, so a worker that rejoined the roster or a task that
+                # claimed the working directory between the checks is refused
+                # instead of raced. The retired root needs no recheck: its ledger
+                # is write-fenced for this whole interval, so its ownership cannot
+                # change between the verified query and this commit.
+                if session_id in _managed_sessions():
+                    db.rollback()
+                    raise ValueError("Worker is still managed by this fleet; "
+                                     "its row is observed normally")
+                _assert_no_conflict(_conflict_rows(db, task_id), task_id, session_id, resolved_cwd)
+                changed = db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=? "
+                                     "AND state IN ('running','sent')", (time.time(), task_id))
+                if changed.rowcount != 1:
+                    db.rollback()
+                    raise ValueError("Task state changed; inspect before reconciling")
+                record = emit(db, _EVENT_KIND, **evidence)
+            except Exception:
                 db.rollback()
-                raise ValueError("Task changed during validation; inspect before reconciling")
-            # Recheck the roster, the competing ownership and the retired root
-            # inside the transaction, so a worker that rejoined the roster, a
-            # task that claimed the working directory, or a claim that appeared
-            # in the retired root between the checks is refused instead of
-            # raced.
-            if session_id in _managed_sessions():
-                db.rollback()
-                raise ValueError("Worker is still managed by this fleet; "
-                                 "its row is observed normally")
-            _assert_no_conflict(_conflict_rows(db, task_id), task_id, session_id, resolved_cwd)
-            claimed = _other_roots_claim(root / "data" / "fleet.sqlite", task_id, session_id,
-                                         resolved_cwd)
-            if claimed:
-                db.rollback()
-                raise ValueError("Another Fleet root still owns the task")
-            changed = db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=? "
-                                 "AND state IN ('running','sent')", (time.time(), task_id))
-            if changed.rowcount != 1:
-                db.rollback()
-                raise ValueError("Task state changed; inspect before reconciling")
-            record = emit(db, _EVENT_KIND, **evidence)
-        except Exception:
-            db.rollback()
-            raise
-        return {"taskId": task_id, "turn": turn, "sessionId": session_id, "reconciled": True,
-                "alreadyRecorded": False, "state": "finished", "previousState": state,
-                "record": record, "evidence": evidence}
-    finally:
-        _release_session_lock(session_lock)
+                raise
+            return {"taskId": task_id, "turn": turn, "sessionId": session_id, "reconciled": True,
+                    "alreadyRecorded": False, "state": "finished", "previousState": state,
+                    "record": record, "evidence": evidence}
+        finally:
+            _release_session_lock(session_lock)

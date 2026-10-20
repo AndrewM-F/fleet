@@ -45,8 +45,10 @@ command prints JSON on stdout and exits non-zero on failure.
   competing task for that cwd. An unknown is a refusal: a missing, invalid or unreadable roster, a
   missing, unreadable or corrupt other-root ledger, a receipt without a process identity, and a
   null identity beside a successful completion all refuse. Ownership in another root is matched by
-  task id, by session and by canonical cwd, and that match is rechecked inside the transaction. The
-  session dispatch lock is held through the commit. It records one auditable event with the receipt
+  task id, by session and by canonical cwd, and that root's ledger is fenced with its own write
+  lock from the verified query through the current-ledger commit, because a transaction on the
+  current ledger does not fence a separate database. The session dispatch lock is held through the
+  commit. It records one auditable event with the receipt
   digests, preserves the task body and the retained receipt, and never releases a hold, a pause, a
   dispatch flag, a model or an account. It is not a generic release: an `uncertain` row still needs
   `bin/fleet resolve`, a live turn still needs `bin/fleet cancel`, and dispatch exclusion is
