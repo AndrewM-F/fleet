@@ -37,6 +37,15 @@ command prints JSON on stdout and exits non-zero on failure.
   successor may then be authorized for the same failed turn. A dispatched (`claimed`) successor's
   reservation is released only by `bin/fleet reconcile-recovery --task ID --note "..."` (or
   `resolve --task` for an `uncertain` successor) after native execution is verified stopped.
+- `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."`
+  — close one stale `running`/`sent` row whose managed OpenCode turn provably completed. It
+  requires the exact task, turn, worker, session and cwd identity, the retained native completion
+  receipt (terminal `done`, exit 0, cleanup confirmed), a dead native process identity and wrapper
+  PID, a free session lock, a worker this fleet no longer manages, and no competing task for that
+  cwd. It records one auditable event with the receipt digests, preserves the task body and the
+  retained receipt, and never releases a hold, a pause, a dispatch flag, a model or an account. It
+  is not a generic release: an `uncertain` row still needs `bin/fleet resolve`, a live turn still
+  needs `bin/fleet cancel`, and dispatch exclusion is unchanged.
 - `bin/fleet cancel TASK --note "..."` — abort a sent/running turn (Pi `abort`, Claude process
   group SIGTERM); the task becomes `cancelled` and is never resent.
 - `bin/fleet hold TASK --note "..."` / `bin/fleet release TASK --note "..."` — pause and resume one

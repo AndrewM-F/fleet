@@ -71,7 +71,48 @@
   cleanup and no live process identity/group — and refuse a bare state flip. Retirement and
   reconciliation touch only that recovery row and task; global pause, per-worker `dispatchEnabled`,
   capacity/quota gates, and unrelated recovery reservations stay in force.
+- **Stale `running` row after a fleet replacement** — a managed turn can finish while no manager is
+  observing its worker, so the ledger row stays `running` and keeps the same-cwd dispatch
+  exclusivity. `bin/fleet resolve` only accepts `uncertain` rows and `bin/fleet cancel` aborts a live
+  turn, so neither can close it. Verify the retained native receipt and use
+  `bin/fleet reconcile-completed` (see below).
 - **Moving `data/`** — `bin/fleet stop`, `scripts/db-check`, then move including no `-wal/-shm`.
+
+## A managed turn completed but its ledger row is still running
+
+A fleet replacement, or a manager outage while the turn ended, leaves the task row in
+`running` even though the native turn finished. The manager closes such a row only while it
+observes that worker, so a worker that left the roster leaves the row behind, and the row keeps
+the same-cwd dispatch exclusivity for every other task in that working directory.
+
+One supported operation closes exactly that row. It is not a release and not a state flip: it
+requires the exact task, turn, worker, session and working-directory identity, the retained native
+completion receipt, and proof that the native execution stopped.
+
+```sh
+bin/fleet reconcile-completed --task 20261020-fleet-replacement-cutover-w5-01 \
+  --turn 86f3236e-6327-4862-ace1-b23c0da84896 \
+  --worker ses_eaa694010ffebFoPIycvHTD3uB \
+  --receipt-root /tmp/opencode-three-fleet-20261018 \
+  --note 'retained receipt proves a terminal done turn with exit 0 and confirmed cleanup'
+```
+
+`--receipt-root` is the Fleet root that still holds the turn, which after a replacement is the
+retired root: the command reads `<root>/data/opencode/<session>/turns/<turn>/` and never the live
+root's other data. It requires the retained `request.json`, `state.json`, `result.json` and the
+session's `current.json` pointer to identify the same task, turn, session and cwd; the native state
+and result to be terminal `done` with exit code 0 and confirmed cleanup; the recorded native
+process identity and wrapper PID to be gone; the session's dispatch lock to be free; the worker to
+be one this fleet no longer manages; and no other task to own that working directory. A missing,
+unreadable, uncertain or inconsistent receipt is a refusal, and the ledger is left unchanged.
+
+The command records one `opencode_completed_reconciled` event with the receipt digests and moves
+the row to `finished`. The task body, the retained receipt, every hold, the global pause, the
+per-worker `dispatchEnabled`, the model and the account are untouched, and the same-cwd dispatch
+exclusion rule is unchanged — only this one stale row stops blocking that directory. A task that is
+still `uncertain` is refused here and still needs `bin/fleet resolve`; a turn that is still running
+is refused and still needs `bin/fleet cancel`. Never edit SQLite or delete history to close a
+stale row.
 
 ## OpenCode wrapper selected stale source before native execution
 

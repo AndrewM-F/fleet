@@ -28,6 +28,17 @@
   --task` for an `uncertain` successor), never by a bare state flip. Retirement/reconciliation touch
   only that recovery row and task: pause, `dispatchEnabled`, capacity/quota gates, and unrelated
   recovery reservations stay in force.
+- **completed-turn reconciliation**: a managed turn can finish while the manager is not observing
+  its worker — after a fleet replacement, or during a manager outage — and the ledger row then stays
+  `running` forever, because only that worker could close it. The surviving row keeps the same-cwd
+  dispatch exclusivity, so nothing else can use that working directory. `reconcile-completed` closes
+  exactly that row: it requires the exact task/turn/worker/session/cwd identity, the retained native
+  receipt (terminal `done`, exit 0, cleanup confirmed), a dead native process identity and wrapper
+  PID, a free session lock, a worker this fleet no longer manages, and no competing task for the
+  same cwd. It writes one audit event carrying the receipt digests and moves the row to `finished`;
+  the task body, the retained receipt, every hold, the pause, the dispatch flags, the model and the
+  account stay untouched. A missing, uncertain or inconsistent receipt is a refusal, an `uncertain`
+  row still needs `resolve`, and the dispatch exclusion rule itself is unchanged.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.
