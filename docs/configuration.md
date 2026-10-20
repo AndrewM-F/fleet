@@ -39,6 +39,23 @@
   mismatch. Rate-limit/quota errors never select another provider or model. A turn request must
   also name the turn directory it sits in, so the turn identity is bound as strictly as the
   session, task and CWD identities around it.
+The configured `model` is the desired model for the next productive turn. The native
+session row keeps its own historical model: it is read, reported and never written, and a
+turn may only run a different approved model when the operator explicitly selected it.
+The persisted native completion must still report the model the turn asked for, so a
+fallback is refused loudly rather than accepted silently.
+
+`bin/fleet opencode-model` reports or changes that configured model for one worker or
+for all of them. It accepts only the explicitly approved free models listed above, and
+the legacy default is unchanged. `--inspect` reports the configured model, the native
+identity, the working directory and whether the worker is active or uncertain; `--dry-run`
+reports the exact change without writing it. A worker that is active or uncertain keeps
+the model its in-flight turn was launched with, and the selection becomes the expected
+model for its next turn. A selection and a dispatch claim share one lock, so a task is
+never claimed under one model and launched under another. The selection clears no hold,
+dispatch flag, queue, account, session id or working directory, and it never contacts a
+provider.
+
 Changing a running lane's model/provider/cwd makes the manager report it `unavailable` until the
 controller is restarted (`bin/fleet stop` / `start`).
 # Fresh and single-harness installations

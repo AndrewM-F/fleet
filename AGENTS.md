@@ -48,6 +48,15 @@ command prints JSON on stdout and exits non-zero on failure.
   a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
+- `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
+  report or set the approved OpenCode provider/model for managed workers. The model must
+  be one of the explicitly approved free models; the legacy default is unchanged. The
+  configuration is the desired model for the next productive turn: the native session row
+  keeps its own historical model and is never written, and no provider is contacted. A
+  worker that is active or uncertain keeps the model its in-flight turn was launched with.
+  A selection and a dispatch claim share one lock, so a task is never claimed under one
+  model and launched under another. The selection clears no hold, dispatch flag, queue,
+  account, session id or working directory.
 
 ## Rules
 1. Never create, replace or duplicate worker sessions; identities live in

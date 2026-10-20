@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, holds, manager, opencode, ops, paths, pi, recovery
+from . import claude, control, events, holds, manager, model_selection, opencode, ops, paths, pi, recovery
 from .store import BUSY, database
 
 
@@ -288,6 +288,20 @@ def cmd_reconcile_recovery(args):
         sys.exit(1)
 
 
+def cmd_opencode_model(args):
+    """Report or set the approved model for managed OpenCode workers."""
+    if args.inspect or not args.model:
+        out(model_selection.inspect(database()))
+        if not args.model:
+            return
+    if args.worker and args.all:
+        raise SystemExit("Choose one worker or all of them")
+    if not args.worker and not args.all:
+        raise SystemExit("Choose --worker SESSION or --all")
+    out(model_selection.apply(None, args.model, args.worker, dry_run=args.dry_run,
+                              db=database()))
+
+
 def cmd_hold(args):
     try:
         out(holds.hold(database(), args.task, args.note))
@@ -403,6 +417,14 @@ def main(argv=None):
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")
     p.add_argument("--note", required=True, help="operator evidence that native execution stopped")
     p.set_defaults(fn=cmd_reconcile_recovery)
+    p = sub.add_parser("opencode-model",
+                       help="inspect or set the approved OpenCode provider/model for a worker")
+    p.add_argument("--model", help="approved provider/model to run for the next productive turn")
+    p.add_argument("--worker", help="one existing OpenCode session id")
+    p.add_argument("--all", action="store_true", help="every configured OpenCode worker")
+    p.add_argument("--inspect", action="store_true", help="report the current model state only")
+    p.add_argument("--dry-run", action="store_true", help="report the change without writing it")
+    p.set_defaults(fn=cmd_opencode_model)
     p = sub.add_parser("hold", help="hold an unstarted queued task without cancelling it")
     p.add_argument("task")
     p.add_argument("--note", required=True, help="operator reason kept with the hold")

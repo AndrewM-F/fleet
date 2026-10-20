@@ -412,7 +412,8 @@ class OpenCodeAdapterTests(unittest.TestCase):
         dispatch.dispatch(self.db, slots, states,
                           lambda *args, **kwargs: sent.append((args, kwargs)))
         self.assertEqual(sent[0][0], (slots[self.sid], "tiny task"))
-        self.assertEqual(sent[0][1], {"task_id": "t1"})
+        # The launch carries the model the task was claimed under.
+        self.assertEqual(sent[0][1], {"task_id": "t1", "model": opencode.MODEL})
 
     def test_opencode_print_mode_never_routes_through_claude(self):
         slot = dict(self.slot, mode="print")

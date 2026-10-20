@@ -273,6 +273,48 @@ def verify_native_model(model, native):
     return model
 
 
+def selection_of(slot):
+    """The explicit operator selection recorded for a worker, if any."""
+    selection = slot.get("modelSelection")
+    if not isinstance(selection, dict):
+        return None
+    model = selection.get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    return selection
+
+
+def allowed_models(slot):
+    """The models a live turn for this worker may legitimately carry.
+
+    The configured model is the desired model for the next productive turn.
+    A turn already in flight may carry the model it was launched with, which
+    is that model, the one before an operator selection, or the selected
+    one, while the transition is still open. The native historical identity
+    is deliberately not in this set: it is the session's own record and is
+    checked separately.
+    """
+    allowed = set()
+    configured = slot.get("model")
+    if isinstance(configured, str) and configured:
+        allowed.add(configured)
+    selection = selection_of(slot)
+    if selection:
+        for key in ("model", "previous"):
+            value = selection.get(key)
+            if isinstance(value, str) and value:
+                allowed.add(value)
+    return allowed
+
+
+def expected_model(slot):
+    """The model the next productive turn must request for this worker."""
+    model = slot.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("OpenCode worker must name its configured model")
+    return model
+
+
 def verify_slot(slot, cfg=None):
     """Validate an approved exact model pin and paths; check native identity at launch."""
     sid = slot.get("sessionId")
@@ -313,8 +355,9 @@ def state(slot):
     turn = launch.get("turn")
     if not isinstance(turn, str) or not _TURN_ID.fullmatch(turn):
         raise RuntimeError("OpenCode managed turn pointer is invalid")
+    permitted = allowed_models(slot)
     if (launch.get("sessionId") != slot["sessionId"] or launch.get("cwd") != slot["cwd"]
-            or launch.get("model") != slot["model"]):
+            or launch.get("model") not in permitted):
         raise RuntimeError("OpenCode managed session/model/cwd identity mismatch")
     path = turn_dir(slot["sessionId"], turn) / "state.json"
     if not path.exists():
@@ -333,7 +376,7 @@ def state(slot):
                 "error": "OpenCode turn state is not available"}
     result = json.loads(path.read_text())
     if (result.get("sessionId") != slot["sessionId"] or result.get("cwd") != slot["cwd"]
-            or result.get("model") != slot["model"]):
+            or result.get("model") not in permitted):
         raise RuntimeError("OpenCode turn identity/cwd/model mismatch")
     if result.get("state") == "launching":
         if time.time() - result.get("startedAt", 0) < 15:
@@ -392,8 +435,13 @@ def _verify_inherited_lock(fd, lock_path):
         raise ValueError("OpenCode wrapper session lock could not be verified") from error
 
 
-def send(slot, message, task_id=None, recovery=None):
-    """Start one locked CLI turn in an existing session; delivery is never retried."""
+def send(slot, message, task_id=None, recovery=None, model=None):
+    """Start one locked CLI turn in an existing session; delivery is never retried.
+
+    ``model`` is the model the task was claimed under. The dispatcher passes it so a
+    claim and its launch can never disagree, and the configured model is the
+    desired model for the next productive turn.
+    """
     slot = verify_slot(slot)
     if not slot.get("dispatchEnabled", False):
         raise RuntimeError("OpenCode dispatch is disabled for this worker")
@@ -401,6 +449,9 @@ def send(slot, message, task_id=None, recovery=None):
         raise ValueError("OpenCode task message is empty")
     if not isinstance(task_id, str) or not task_id:
         raise ValueError("OpenCode dispatch requires the Fleet task ID")
+    # The model this turn must run, and the only model the request may carry.
+    expected = model if isinstance(model, str) and model.strip() else expected_model(slot)
+    _validate_model(expected)
     sid = slot["sessionId"]
     directory = session_dir(sid)
     lock = _session_lock(directory)
@@ -435,22 +486,44 @@ def send(slot, message, task_id=None, recovery=None):
                        "Use that checkout explicitly for file and Git operations; "
                        "the native session CWD remains unchanged.\n\n" + message)
         native = verify_native_session(sid, slot["cwd"], slot["databasePath"])
-        # The slot's configured model and provider must be the model and
-        # provider the native session itself runs. This is checked immediately
-        # before the launch, so a task can never choose the model and a
-        # session whose native identity has drifted never starts a turn. The
-        # native session CWD and identity are unchanged by this.
-        verify_native_model(slot["model"], native)
+        # The native session's own model is its historical identity. It is
+        # checked, reported and never written. A turn may only run a different
+        # approved model when the operator explicitly selected it; otherwise
+        # the configured model and the native identity must be the same pair.
+        native_provider = native.get("nativeModelProvider")
+        native_name = native.get("nativeModelId")
+        native_identity = (f"{native_provider}/{native_name}"
+                           if native_provider and native_name else None)
+        selection = None
+        if native_identity == expected:
+            # The ordinary case: the configured model and the native identity
+            # must be the same pair.
+            verify_native_model(expected, native)
+        else:
+            # A transition: the native session keeps its own historical model
+            # and only an explicit operator selection may move the turn to
+            # another approved model. The native identity is still checked.
+            selection = selection_of(slot)
+            if not selection or selection.get("model") != expected:
+                raise ValueError("OpenCode configured model differs from the native session model")
+            if native_identity is not None:
+                _validate_model(native_identity)
         path.mkdir(parents=True)
         logs.mkdir(parents=True, exist_ok=True)
         os.chmod(path, 0o700)
         os.chmod(logs, 0o700)
         request = {"turn": turn, "taskId": task_id, "sessionId": sid,
                    "cwd": slot["cwd"], "sessionCwd": native["sessionCwd"],
-                   "databasePath": native["databasePath"], "model": slot["model"],
+                   "databasePath": native["databasePath"], "model": expected,
+                   "nativeIdentityModel": native_identity,
                    "message": message, "executable": slot["executable"],
                    "logDir": str(logs), "timeoutSeconds": int(slot.get("turnTimeoutSeconds", 0)),
                    "lockFd": lock.fileno()}
+        if selection:
+            request["modelSelection"] = {"model": expected,
+                                         "nativeIdentityModel": native_identity,
+                                         "previous": selection.get("previous"),
+                                         "authorized": True}
         if recovery:
             request["recoveryId"] = recovery["id"]
             request["ownedWorktree"] = recovery["owned_worktree"]
@@ -458,7 +531,7 @@ def send(slot, message, task_id=None, recovery=None):
         atomic(path / "request.json", request, indent=None)
         os.chmod(path / "request.json", 0o600)
         launch = {"turn": turn, "taskId": task_id, "sessionId": sid,
-                  "cwd": slot["cwd"], "model": slot["model"], "startedAt": time.time()}
+                  "cwd": slot["cwd"], "model": expected, "startedAt": time.time()}
         if recovery:
             launch["recoveryId"] = recovery["id"]
         atomic(directory / "current.json", launch, indent=None)
@@ -742,9 +815,23 @@ def run_turn(request_path):
     native = verify_native_session(sid, cwd, request.get("databasePath"))
     # The request model must be the model the native session itself runs. The
     # native database is the authority here, not the request file, so a request
-    # that names any other model or provider cannot start a turn.
-    verify_native_model(model, native)
+    # that names any other model or provider cannot start a turn. The only
+    # exception is a request that carries the explicit operator selection that
+    # authorized the transition, and then the native identity is still checked
+    # to be an approved model.
+    native_provider = native.get("nativeModelProvider")
+    native_name = native.get("nativeModelId")
+    native_identity = (f"{native_provider}/{native_name}"
+                       if native_provider and native_name else None)
+    selection = request.get("modelSelection")
+    if native_identity != model:
+        authorized = (isinstance(selection, dict) and selection.get("authorized") is True
+                      and selection.get("model") == model and native_identity is not None)
+        if not authorized:
+            raise ValueError("OpenCode configured model differs from the native session model")
+        _validate_model(native_identity)
     request["databasePath"] = native["databasePath"]
+    request["nativeIdentityModel"] = native_identity
     request["turnRoot"] = str(root)
     logs = Path(request["logDir"])
     logs.mkdir(parents=True, exist_ok=True)
@@ -1020,6 +1107,7 @@ def run_turn(request_path):
         result = {"turn": turn, "taskId": request["taskId"], "sessionId": sid, "cwd": cwd,
                   "state": status["state"], "provider": actual_provider, "model": actual_model,
                   "expectedProvider": expected_provider, "expectedModel": model,
+                  "nativeIdentityModel": request.get("nativeIdentityModel"),
                   "usage": usage, "terminalReason": terminal_reason, "summary": summary,
                   "toolFailures": tool_failures, "exitCode": code, "error": status.get("error"),
                   "cleanup": status["cleanup"], "managedProcessIdentity": process_identity_record,
