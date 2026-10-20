@@ -29,7 +29,7 @@
 - **OpenCode error turn** — do not resolve it with the Claude-only `--worker` command or reset its
   task. Verify the failed task and cleanup receipt, then snapshot the separate owned checkout with
   `bin/fleet recovery-snapshot --cwd OWNED_WORKTREE`. The configured native session CWD stays as-is.
-  Authorize a successor only when a finished task for the same worker records the branch and exact
+  Authorize a successor only when a finished task for the same worker proves the branch and exact
   owned-worktree path:
   ```sh
   bin/fleet recover-opencode --worker SESSION_ID --task FAILED_TASK_ID --turn TURN_ID \
@@ -37,6 +37,60 @@
     --owned-worktree OWNED_WORKTREE --branch BRANCH --head COMMIT_SHA \
     --worktree-sha256 DIGEST --note 'verified cleanup and preserved partial work'
   ```
+  If the original owner task legitimately instructed the worker to create that branch and
+  worktree, its historical message may not contain them. Record append-only ownership evidence
+  once, then consume it instead of free text:
+  ```sh
+  bin/fleet adopt-ownership --id ADOPTION_ID --owner-task OWNER_TASK_ID --worker SESSION_ID \
+    --failed-task FAILED_TASK_ID --turn TURN_ID --owned-worktree OWNED_WORKTREE \
+    --branch BRANCH --head FULL_COMMIT_SHA --worktree-sha256 DIGEST \
+    --decision 'explicit ownership decision' \
+    --evidence-reference 'URL, path, message ID, or record ID to inspect' \
+    --ownership-evidence 'quoted ownership excerpt or substantive statement' --note '...'
+  bin/fleet recover-opencode ... --adoption-id ADOPTION_ID
+  ```
+  A genuine native turn that predates the Fleet task ledger has no owner task row at all, so
+  neither an owner task nor an adoption can express its ownership. Record the turn's ownership in
+  a durable receipt inside the fleet's own recovery directory, then use it as the ownership source:
+  ```sh
+  cat > "$FLEET_ROOT/data/recovery/direct-turn-<id>.json" <<'JSON'
+  {
+    "schemaVersion": "pi-direct-turn-ownership/v2",
+    "originalSession": "ses_...",
+    "ownedWorktree": "/absolute/path/to/the/owned/worktree",
+    "branch": "branch-name",
+    "initialHead": "full commit sha the direct turn started from",
+    "startedAt": 1792480175,
+    "originalUserMessageId": "msg_...",
+    "completionIdleMessageId": "msg_...",
+    "note": "substantive operator statement about that direct turn"
+  }
+  JSON
+  bin/fleet recover-opencode ... --direct-turn-receipt "$FLEET_ROOT/data/recovery/direct-turn-<id>.json"
+  ```
+  The receipt is proved before anything is authorized: its session must be the recovering worker,
+  the native session row must show that session in the recorded worktree with the configured model,
+  and those exact native message IDs must bound the original user turn, its final completed
+  assistant, and its successful idle marker before the failed managed turn. A later session-wide
+  idle outcome or assistant message cannot prove the original turn. The recorded branch must be the
+  checkout's branch, the recorded initial head must be an ancestor of the current head, and the
+  current snapshot must be unchanged. The receipt's path and digest are recorded with the recovery
+  and re-proved before the successor dispatches, so a receipt that is later edited is refused. A
+  missing, foreign, tampered or contradictory receipt is a refusal; no Fleet task is created,
+  edited or fabricated for the ownership. Exactly one ownership source is accepted: an owner task,
+  an adoption, or a direct-turn receipt.
+
+  Adoption requires a finished owner task on the same session and native CWD, the canonical
+  checkout, branch, full HEAD SHA, current digest, an explicit decision, a distinct evidence
+  reference, and substantive ownership evidence. The reference is only a locator: the operator
+  must inspect and verify the referenced source before adopting. A URL, checksum, or path alone
+  is not substantive evidence and is rejected; quote the ownership statement in
+  `--ownership-evidence` and put the locator in `--evidence-reference`. Adoption alone never
+  queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor, and
+  it never rewrites task/event/turn history. Authorization and dispatch revalidate the same
+  adoption row and pinned snapshot; a missing record or any checkout change fails closed.
+  Reusing an adoption ID with an altered reference, evidence excerpt, decision, or any other
+  field is rejected; an exact replay remains idempotent across restart.
   Enqueue only the new task, linked to both the failed task and returned recovery ID:
   `{"id":"NEW_TASK_ID","previousTaskId":"FAILED_TASK_ID","recoveryId":"RECOVERY_ID","rootAuthorized":true,"message":"..."}`.
   Fleet prepends the recorded owned checkout and branch to every recovery turn's prompt,

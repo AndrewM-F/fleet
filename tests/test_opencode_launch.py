@@ -227,7 +227,7 @@ class LaunchFailureTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='reserved'").fetchone(),
                          ('claimed',))
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id='failed-task'").fetchone(),
-                         ('finished',))
+                         ('uncertain',))
 
     def test_database_routing_and_previous_audit_evidence_cannot_change(self):
         self.reconcile()

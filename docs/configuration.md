@@ -19,26 +19,31 @@
 - `claude[]`: `sessionId`, `cwd`, optional `sessionCwd`, `model`, `effort`, `mode` (`print`),
   `resume`, `dispatchEnabled`.
 - `opencode[]`: an existing native `sessionId` (`ses_…`), absolute `databasePath` for its native
-  OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (exactly
-  one of `opencode/minimax-m3.1-flash-free`, `opencode-go/minimax-m3.1-flash-free`, or the
-  legacy `opencode/deepseek-v4.1-flash-free`), and `dispatchEnabled` (defaults false). There is
-  no automatic preference switch or fallback; choose the exact model explicitly. Set `databasePath`
+  OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (one of
+  `opencode/deepseek-v4.1-flash-free`, `opencode/minimax-m3.1-flash-free`, or
+  `opencode-go/minimax-m3.1-flash-free`), and `dispatchEnabled`
+  (defaults false). There is no automatic model switch or fallback. Set `databasePath`
   from `opencode debug paths db`; this read-only command does not start a server or open the DB.
   Before each `--session` launch, Fleet reads only that exact `session_v2` identity row in SQLite
-  read-only mode and requires its directory to match `cwd`. That same row records the model and
-  provider the native session runs, and the target slot's configured model and provider must
-  match it exactly, at the managed launch and again at the turn itself. A session whose native
-  identity has drifted, or a request that names another approved model or provider, is refused
-  before a turn starts. Unknown IDs fail before the CLI can
-  create a session. Dispatch uses a per-session lock and an isolated runtime config with `model`,
-  `small_model`, and the enabled provider pinned to the free model/provider. Agent overrides are
-  refused. `provider: "opencode"` remains the Fleet transport tag even when the exact model's API
-  provider is `opencode-go`. The isolated runtime enables only that selected API provider and pins
-  both primary and small models to the selected ID. Direct stream metadata, when present, and
-  persisted native completion metadata must match it; a different approved provider is still a
-  mismatch. Rate-limit/quota errors never select another provider or model. A turn request must
-  also name the turn directory it sits in, so the turn identity is bound as strictly as the
-  session, task and CWD identities around it.
+  read-only mode and requires its directory to match `cwd`. Unknown IDs fail before the CLI can
+  create a session. The configured model must match the native session model unless the operator
+  explicitly selected another approved free model for the next turn; task text cannot select it.
+  Dispatch uses a per-session lock and an isolated runtime config with `model`,
+  `small_model`, and the enabled provider pinned to that model and its provider, so no other
+  provider and no paid model can be reached. `provider: "opencode"` remains the Fleet transport
+  tag even for the `opencode-go` API provider. Agent overrides are refused. A turn request must
+  name its own turn directory, binding the turn to its session, task and CWD. The v2.0.5 JSON
+  stream does not include actual provider/model IDs in its normal step
+  events, so receipts leave actual IDs blank unless the transport emits direct model metadata and
+  record the pinned CLI model separately. Direct stream metadata, when available, and persisted
+  native completion metadata must match the requested model and provider. Quota and rate-limit
+  errors never select another provider or model.
+  The cancellation and recovery paths compare the persisted launch and turn receipts against the
+  model configured for that target session, so a roster entry that names a different model is
+  validated on its own identity and on its own persisted receipts rather than refused by a
+  fleet-wide constant. Every other session, task, turn, CWD, process and cleanup check, and the
+  refusal of rate-limit and quota failures, is unchanged.
+
 The configured `model` is the desired model for the next productive turn. The native
 session row keeps its own historical model: it is read, reported and never written, and a
 turn may only run a different approved model when the operator explicitly selected it.

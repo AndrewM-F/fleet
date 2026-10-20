@@ -20,12 +20,14 @@ from .util import atomic
 
 # Retain the legacy pin for existing rosters; selection is always explicit per slot.
 MODEL = "opencode/deepseek-v4.1-flash-free"
-APPROVED_MODELS = frozenset({
-    MODEL,
-    "opencode/minimax-m3.1-flash-free",
-    "opencode-go/minimax-m3.1-flash-free",
-})
-
+# The only models this fleet may drive. Every entry is an explicitly approved
+# free model and the fleet default is first. A paid provider or model is
+# never listed, so a session configured with anything else is refused before
+# a turn starts, and the isolated runtime is pinned to the approved model and
+# its provider, so no other provider can be reached at all.
+APPROVED_FREE_MODELS = (MODEL, "opencode/minimax-m3.1-flash-free",
+                        "opencode-go/minimax-m3.1-flash-free")
+APPROVED_MODELS = frozenset(APPROVED_FREE_MODELS)
 _SESSION_ID = re.compile(r"ses_[A-Za-z0-9_-]+\Z")
 _TURN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 _POLL_SECONDS = 0.1
@@ -190,6 +192,14 @@ def _database_path(value):
     return path.resolve()
 
 
+def _split_model(model):
+    """Split a configured model id into its provider and model name."""
+    provider, separator, name = str(model).partition("/")
+    if not separator or not provider or not name:
+        raise ValueError("OpenCode model must be provider/model")
+    return provider, name
+
+
 def _native_model_parts(value):
     """Read the provider and model the native session itself records.
 
@@ -260,16 +270,43 @@ def verify_native_model(model, native):
     """Bind the configured model to the model the native session itself runs.
 
     The native session recorded the provider and model it was created with.
-    The configured model must be exactly that pair, so the model a turn
-    actually runs is the session's own approved model and never one a task
-    supplied, and a session whose native identity has drifted cannot be
-    driven at all. The native session CWD and identity are unchanged by
-    this.
+    This check requires an exact pair when no explicit operator selection
+    authorizes a transition. The native session CWD and identity are unchanged.
     """
     provider, name = _validate_model(model)
     if (native.get("nativeModelProvider") != provider
             or native.get("nativeModelId") != name):
         raise ValueError("OpenCode configured model differs from the native session model")
+    return model
+
+
+def configured_model(slot):
+    """The model configured for one OpenCode worker.
+
+    The roster is the only source of a session's configured model. The
+    cancellation and recovery paths compare the persisted launch and turn
+    receipts against it, so a session configured with a free model other than
+    the fleet default is validated against its own configuration instead of
+    being refused by a global constant.
+    """
+    model = slot.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("OpenCode worker must name its configured model")
+    return model
+
+
+def approved_free_model(slot):
+    """The approved free model configured for one OpenCode worker.
+
+    The roster is the only place a session's model comes from, and it must
+    name one of the explicitly approved free models. A task never supplies
+    it. The native session model is checked separately; a differing model
+    requires an explicit operator selection for that turn.
+    """
+    model = configured_model(slot)
+    if model not in APPROVED_FREE_MODELS:
+        raise ValueError("OpenCode model must be one of the approved free models: "
+                         + ", ".join(APPROVED_FREE_MODELS))
     return model
 
 
@@ -322,12 +359,20 @@ def expected_model(slot):
     return model
 
 
-def verify_slot(slot, cfg=None):
-    """Validate an approved exact model pin and paths; check native identity at launch."""
+def verify_slot(slot, cfg=None, expected_model=None):
+    """Validate the approved free model and paths; session identity is checked at launch.
+
+    The slot must name an explicitly approved free model. ``expected_model``
+    additionally pins the worker to one exact model, which the cancellation
+    and recovery paths use to bind a worker to the model configured for the
+    target session. Every other check is unchanged.
+    """
     sid = slot.get("sessionId")
     if not isinstance(sid, str) or not _SESSION_ID.fullmatch(sid):
         raise ValueError("OpenCode sessionId must be an existing native ses_ ID")
-    _validate_model(slot.get("model"))
+    model = approved_free_model(slot)
+    if expected_model is not None and model != expected_model:
+        raise ValueError(f"OpenCode model must be pinned to {expected_model}")
     if slot.get("mode") not in (None, "opencode"):
         raise ValueError("OpenCode workers cannot use Claude mode settings")
     cwd = Path(os.path.expanduser(slot.get("cwd", ""))).resolve()
@@ -763,6 +808,9 @@ def _runtime_environment(request):
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
+    # The isolated runtime is pinned to the validated model and to exactly its
+    # provider, so the CLI can reach no other provider and no paid fallback.
+    provider, _ = _split_model(request["model"])
     config = {"$schema": "https://opencode.ai/config.json", "model": request["model"],
               "small_model": request["model"], "enabled_providers": [provider],
               "plugins": [], "mcp": {"servers": {}}}
@@ -828,18 +876,16 @@ def run_turn(request_path):
         raise ValueError("OpenCode request turn ID does not match its turn directory")
     _verify_inherited_lock(request.get("lockFd"), session_directory / "dispatch.lock")
     native = verify_native_session(sid, cwd, request.get("databasePath"))
-    # The request model must be the model the native session itself runs. The
-    # native database is the authority here, not the request file, so a request
-    # that names any other model or provider cannot start a turn. The only
-    # exception is a request that carries the explicit operator selection that
-    # authorized the transition, and then the native identity is still checked
-    # to be an approved model.
+    # A model transition requires the explicit recorded operator selection.
+    # The native model remains an approved historical identity.
     native_provider = native.get("nativeModelProvider")
     native_name = native.get("nativeModelId")
     native_identity = (f"{native_provider}/{native_name}"
                        if native_provider and native_name else None)
     selection = request.get("modelSelection")
-    if native_identity != model:
+    if native_identity == model:
+        verify_native_model(model, native)
+    else:
         authorized = (isinstance(selection, dict) and selection.get("authorized") is True
                       and selection.get("model") == model and native_identity is not None)
         if not authorized:
@@ -851,7 +897,7 @@ def run_turn(request_path):
     logs = Path(request["logDir"])
     logs.mkdir(parents=True, exist_ok=True)
     state_path = root / "state.json"
-    status = {"sessionId": sid, "cwd": cwd, "model": model, "provider": "opencode",
+    status = {"turn": turn, "sessionId": sid, "cwd": cwd, "model": model, "provider": "opencode",
               "taskId": request["taskId"], "state": "launching", "progress": 0,
               "startedAt": time.time(), "pid": os.getpid()}
     _write_status(state_path, status)

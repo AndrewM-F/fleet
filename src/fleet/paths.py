@@ -18,6 +18,7 @@ PAUSE = DATA / "dispatch.paused"
 MANAGER_LOCK = DATA / "manager.lock"
 QUEUE_LOCK = DATA / "queue.lock"
 RECEIPTS = DATA / "receipts"
+RECOVERY = DATA / "recovery"
 CLAUDE = DATA / "claude"
 OPENCODE = DATA / "opencode"
 

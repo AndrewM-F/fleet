@@ -15,7 +15,18 @@
   and recovery reservations are untouched.
 - **OpenCode recovery**: a failed task and native turn stay terminal. An operator may authorize one
   new task only after the exact error/cleanup receipt, free session lock, and an explicit owned
-  worktree path recorded by a finished task for the same session. Native session CWD stays
+  worktree path proven by a finished task for the same session (its free-text message, an
+  immutable `recovery_adoptions` record when history predates the exact path/branch convention, or
+  a durable direct-turn ownership receipt in `data/recovery/` when the original native turn
+  predates the task ledger entirely and no task row exists). A direct-turn receipt records the
+  original session, the canonical owned worktree, the branch, the initial head, and the exact
+  original user and successful idle message IDs. Those IDs bind a completed assistant to one
+  native turn before the failed managed turn; the mutable session-wide idle outcome cannot
+  substitute for that proof. The native session directory/model and unchanged checkout are also
+  checked before authorization; its path and digest
+  are stored with the recovery and re-proved before the successor dispatches. It never creates,
+  edits or fabricates a Fleet task.
+  Native session CWD stays
   unchanged; branch/head and tracked/untracked fingerprint are checked at authorization, dispatch,
   and send. SQLite records the immutable failure-to-successor/worktree owner link before it becomes
   dispatchable. Dispatch atomically consumes that authorization with the successor's
@@ -27,7 +38,12 @@
   through verified stopped-native-execution reconciliation (`reconcile-recovery`, or `resolve
   --task` for an `uncertain` successor), never by a bare state flip. Retirement/reconciliation touch
   only that recovery row and task: pause, `dispatchEnabled`, capacity/quota gates, and unrelated
-  recovery reservations stay in force.
+  recovery reservations stay in force. Ownership adoption is append-only evidence: it never queues,
+  dispatches, starts a turn, or authorizes a successor by itself, never rewrites task/event/turn
+  history, and authorization plus dispatch revalidate the same adoption row and pinned snapshot.
+  The adoption separates a locator (`evidence_reference`) from substantive ownership prose
+  (`ownership_evidence`); a URL, checksum, or path alone is rejected as evidence, and the operator
+  must inspect and verify the referenced source. The locator is not proof by itself.
 - **completed-turn reconciliation**: a managed turn can finish while the manager is not observing
   its worker — after a fleet replacement, or during a manager outage — and the ledger row then stays
   `running` forever, because only that worker could close it. The surviving row keeps the same-cwd

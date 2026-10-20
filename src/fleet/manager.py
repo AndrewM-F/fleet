@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import time
 
 from . import claude, opencode, paths, pi, pr_queue, recovery
@@ -40,17 +41,64 @@ def observe(db, sid, state, now=None):
             db.execute("UPDATE tasks SET state='running',updated=? WHERE id=?", (now, task_id))
             emit(db, "task_consumed", taskId=task_id, sessionId=sid)
         if phase == "running" and state["state"] in TERMINAL:
-            db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=?", (now, task_id))
-            task_data = json.loads(db.execute("SELECT body FROM tasks WHERE id=?",
-                                              (task_id,)).fetchone()[0])
-            launch_failed = state.get("provider") == "opencode" and state.get("launchFailure") is True
-            if task_data.get("recoveryId") and not launch_failed:
-                db.execute("UPDATE recoveries SET status='completed',updated=? "
-                           "WHERE id=? AND status='claimed' AND owner_task_id=?",
-                           (now, task_data["recoveryId"], task_id))
+            if task.get("recoveryId"):
+                # A terminal status is not stopped-process proof. Serialize with
+                # the native send lock and retain the claim on any missing or
+                # uncertain receipt, including cleanup or process identity.
+                claim = recovery.claimed_successor(db, task_id)
+                evidence = "claimed recovery does not match the successor task"
+                stopped = False
+                if claim and claim["id"] == task["recoveryId"]:
+                    try:
+                        lock = opencode._session_lock(opencode.session_dir(sid))
+                    except (OSError, RuntimeError) as error:
+                        evidence = f"native session lock is unavailable: {error}"
+                    else:
+                        try:
+                            slots = [slot for slot in paths.opencode_slots()
+                                     if slot.get("sessionId") == sid]
+                            if len(slots) == 1 and state.get("taskId") == task_id:
+                                stopped, evidence = recovery.verify_stopped_native_execution(
+                                    slots[0], task_id)
+                            else:
+                                stopped, evidence = False, "successor slot or observed task differs"
+                            if stopped:
+                                changed = db.execute(
+                                    "UPDATE recoveries SET status='completed',updated=? "
+                                    "WHERE id=? AND status='claimed' AND owner_task_id=?",
+                                    (now, claim["id"], task_id))
+                                stopped = changed.rowcount == 1
+                                if not stopped:
+                                    evidence = "claimed recovery changed before completion"
+                            if stopped:
+                                db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=?",
+                                           (now, task_id))
+                                emit(db, "recovery_completed", recoveryId=claim["id"],
+                                     taskId=task_id, evidence=evidence)
+                                db.commit()  # finish while the native turn lock is held
+                        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+                            db.rollback()
+                            stopped, evidence = False, f"native stopped proof failed: {error}"
+                        finally:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                            lock.close()
+                else:
+                    stopped = False
+                if not stopped:
+                    db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?",
+                               (now, task_id))
+                    emit(db, "task_uncertain", taskId=task_id, sessionId=sid,
+                         reason="recovery successor stopped proof unavailable: " + evidence)
+                    continue
+            else:
+                db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=?",
+                           (now, task_id))
+            launch_failed = (state.get("provider") == "opencode"
+                             and state.get("launchFailure") is True)
             outcome = ({"outcome": "launch_failed", "error": state.get("error")}
                        if launch_failed else {})
-            emit(db, "review_ready", taskId=task_id, sessionId=sid, state=state["state"], **outcome)
+            emit(db, "review_ready", taskId=task_id, sessionId=sid,
+                 state=state["state"], **outcome)
         elif phase == "sent" and now - updated > 90:
             db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?", (now, task_id))
             emit(db, "task_unconsumed", taskId=task_id, sessionId=sid)

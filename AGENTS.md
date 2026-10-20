@@ -37,6 +37,34 @@ command prints JSON on stdout and exits non-zero on failure.
   successor may then be authorized for the same failed turn. A dispatched (`claimed`) successor's
   reservation is released only by `bin/fleet reconcile-recovery --task ID --note "..."` (or
   `resolve --task` for an `uncertain` successor) after native execution is verified stopped.
+  When the original owner task predates the exact worktree/branch convention (for example, it
+  instructed the worker to create them), `bin/fleet adopt-ownership --id ID --owner-task TASK
+  --worker SID --failed-task TASK --turn TURN --owned-worktree PATH --branch BRANCH --head SHA
+  --worktree-sha256 DIGEST --decision "..." --evidence-reference "LOCATOR"
+  --ownership-evidence "EXCERPT/STATEMENT" --note "..."` appends immutable ownership evidence,
+  and `recover-opencode --adoption-id ID` consumes it instead of free text. `--evidence-reference`
+  is only a locator (URL, path, message ID, or record ID) that the operator must inspect and
+  verify; it is not proof by itself. `--ownership-evidence` must be the substantive ownership
+  excerpt or statement, not the same locator and not a bare URL, checksum, or path. Adoption alone
+  never queues or dispatches a task, starts a turn, rehomes a session, or authorizes a successor,
+  and it never rewrites task/event/turn history. The adoption pins the exact snapshot:
+  authorization and dispatch revalidate the same record and fail closed if it is missing or the
+  checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
+  or any other field is rejected; an exact replay remains idempotent across restart.
+  A genuine native turn that predates the Fleet task ledger has no owner task row at all. For
+  that case `bin/fleet recover-opencode --direct-turn-receipt PATH` is the ownership source
+  instead of `--ownership-task` or `--adoption-id`; exactly one ownership source is accepted. The
+  receipt is a durable JSON file in the fleet's own `data/recovery/` directory that records the
+  original session, the canonical owned worktree, the branch, the initial head, the turn's start
+  time and an operator statement. It is proved before authorization: the receipt's session must be
+  the recovering worker, the native session row must show that session in the recorded worktree
+  with the configured model and the receipt's exact original user and successful idle message IDs,
+  with a completed final assistant for that same turn before the failed managed turn, the
+  recorded branch must be the checkout's branch, the recorded initial head must be an ancestor of
+  the current head, and the current snapshot must be unchanged. The receipt's path and digest are
+  recorded with the recovery, and the same proof is rechecked before a successor dispatches. A
+  missing, tampered, foreign or contradictory receipt is a refusal, and no Fleet task is created,
+  edited or fabricated for the ownership.
 - `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."`
   — close one stale `running`/`sent` row whose managed OpenCode turn provably completed. It
   requires the exact task, turn, worker, session and cwd identity, the retained native completion

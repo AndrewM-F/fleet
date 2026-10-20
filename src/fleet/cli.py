@@ -263,27 +263,32 @@ def cmd_recovery_snapshot(args):
 
 
 def cmd_recover_opencode(args):
-    out(recovery.authorize_opencode(database(), session_id=args.worker,
+    sources = [bool(args.ownership_task), bool(args.adoption_id), bool(args.direct_turn_receipt)]
+    if sum(sources) != 1:
+        raise SystemExit("Choose exactly one ownership source: --ownership-task, "
+                         "--adoption-id or --direct-turn-receipt")
+    db = database()
+    ownership_task_id = args.ownership_task
+    if args.adoption_id:
+        adoption = recovery.adoption_record(db, args.adoption_id)
+        if not adoption:
+            raise ValueError("Recovery adoption record is missing")
+        ownership_task_id = adoption["owner_task_id"]
+    out(recovery.authorize_opencode(db, session_id=args.worker,
                                     failed_task_id=args.task, turn=args.turn,
                                     recovery_id=args.recovery_id,
                                     successor_task_id=args.successor_task,
-                                    ownership_task_id=args.ownership_task,
+                                    ownership_task_id=ownership_task_id,
                                     owned_worktree=args.owned_worktree,
                                     branch=args.branch, head=args.head,
-                                    worktree_sha256=args.worktree_sha256, note=args.note))
+                                    worktree_sha256=args.worktree_sha256, note=args.note,
+                                    adoption_id=args.adoption_id,
+                                    direct_turn_receipt=args.direct_turn_receipt))
 
 
 def cmd_reconcile_opencode_launch(args):
     try:
         out(recovery.reconcile_launch_failure(database(), args.task, args.turn, args.note))
-    except Exception as error:
-        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
-        sys.exit(1)
-
-
-def cmd_reconcile_recovery(args):
-    try:
-        out(recovery.reconcile_successor(database(), args.task, args.note))
     except Exception as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
         sys.exit(1)
@@ -313,6 +318,31 @@ def cmd_opencode_model(args):
         raise SystemExit("Choose --worker SESSION or --all")
     out(model_selection.apply(None, args.model, args.worker, dry_run=args.dry_run,
                               db=database()))
+
+
+def cmd_adopt_ownership(args):
+    try:
+        out(recovery.adopt_ownership(database(), adoption_id=args.adoption_id,
+                                     owner_task_id=args.owner_task,
+                                     session_id=args.worker, failed_task_id=args.failed_task,
+                                     turn=args.turn, owned_worktree=args.owned_worktree,
+                                     branch=args.branch, head=args.head,
+                                     worktree_sha256=args.worktree_sha256,
+                                     decision=args.decision,
+                                     evidence_reference=args.evidence_reference,
+                                     ownership_evidence=args.ownership_evidence,
+                                     note=args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_reconcile_recovery(args):
+    try:
+        out(recovery.reconcile_successor(database(), args.task, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
 
 
 def cmd_hold(args):
@@ -411,13 +441,17 @@ def main(argv=None):
     p.add_argument("--turn", required=True, help="failed managed OpenCode turn UUID")
     p.add_argument("--recovery-id", required=True)
     p.add_argument("--successor-task", required=True)
-    p.add_argument("--ownership-task", required=True,
+    p.add_argument("--ownership-task", default="",
                    help="finished Fleet task that records the owner branch and worktree")
     p.add_argument("--owned-worktree", required=True,
                    help="exact owner Git worktree; the native session CWD remains unchanged")
     p.add_argument("--branch", required=True)
     p.add_argument("--head", required=True)
     p.add_argument("--worktree-sha256", required=True)
+    p.add_argument("--adoption-id", default="",
+                   help="immutable ownership adoption recorded by adopt-ownership")
+    p.add_argument("--direct-turn-receipt", default="",
+                   help="durable direct-turn ownership receipt when no owner task exists")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
     p = sub.add_parser("reconcile-opencode-launch", help="audit a proven pre-provider launch failure")
@@ -425,6 +459,25 @@ def main(argv=None):
     p.add_argument("--turn", required=True)
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_reconcile_opencode_launch)
+    p = sub.add_parser("adopt-ownership",
+                       help="append immutable ownership evidence for a recovery successor")
+    p.add_argument("--id", dest="adoption_id", required=True)
+    p.add_argument("--owner-task", required=True,
+                   help="existing finished task that owns the checkout and branch")
+    p.add_argument("--worker", required=True)
+    p.add_argument("--failed-task", required=True, help="failed terminal task ID")
+    p.add_argument("--turn", required=True, help="failed managed OpenCode turn UUID")
+    p.add_argument("--owned-worktree", required=True)
+    p.add_argument("--branch", required=True)
+    p.add_argument("--head", required=True, help="full HEAD commit SHA")
+    p.add_argument("--worktree-sha256", required=True)
+    p.add_argument("--decision", required=True, help="explicit operator ownership decision")
+    p.add_argument("--evidence-reference", required=True,
+                   help="locator (URL, path, message ID, or record ID) for the source to inspect")
+    p.add_argument("--ownership-evidence", required=True,
+                   help="substantive ownership excerpt/statement; a URL or checksum alone is rejected")
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_adopt_ownership)
     p = sub.add_parser("reconcile-recovery",
                        help="release a claimed recovery reservation after a verified native stop")
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")

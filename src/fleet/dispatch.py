@@ -78,7 +78,6 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         if max_concurrent and active >= max_concurrent:
             return
         task["baselineProgress"] = state.get("progress")
-        db.commit()
         # A model selection and a claim/launch share one lock, so a task can
         # never be claimed under one model and launched under another. The model
         # the claim uses is recorded in the task body and is the model the
@@ -113,6 +112,7 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
                     claim_model = None
                 if claim_model:
                     task["model"] = claim_model
+            db.commit()
             db.execute("BEGIN IMMEDIATE")
             claimed = db.execute(
                 "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued' "
