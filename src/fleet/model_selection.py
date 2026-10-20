@@ -84,6 +84,28 @@ def _busy_states(db, session_id):
     return ("dispatching", "sent", "running", "uncertain")
 
 
+def current_slot(slot):
+    """The worker's configured entry, re-read from the configuration.
+
+    The dispatcher reloads the roster inside the shared model lock, so a
+    selection that lands after the roster was loaded is still seen before the
+    claim. The roster snapshot is kept when the configuration cannot be read
+    or does not describe this worker, so dispatch never stops because a
+    configuration could not be read; a worker whose working directory changed
+    under the dispatcher is refused rather than launched elsewhere.
+    """
+    try:
+        entries = paths.opencode_slots()
+    except (OSError, ValueError):
+        return slot
+    for entry in entries:
+        if entry.get("sessionId") == slot.get("sessionId"):
+            if str(Path(entry.get("cwd", "")).resolve()) != str(Path(slot.get("cwd", "")).resolve()):
+                raise ValueError("OpenCode worker cwd changed since the roster was loaded")
+            return entry
+    return slot
+
+
 def busy_workers(db, cfg=None):
     """The OpenCode workers with a claimed, running or uncertain task."""
     cfg = paths.config() if cfg is None else cfg

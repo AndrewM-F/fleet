@@ -76,12 +76,24 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         model_lock = model_selection.model_lock() if is_opencode else nullcontext()
         with model_lock:
             claim_model = None
+            launch_slot = slot
             if is_opencode:
+                # The roster was loaded before this claim, so a selection that
+                # landed since then is not in it. The configuration is reloaded
+                # and validated inside the shared lock, so the claim and the
+                # launch use the model that is current now.
                 try:
-                    claim_model = model_selection.claim_model(slot)
+                    launch_slot = model_selection.current_slot(slot)
+                except (ValueError, OSError):
+                    continue  # The worker is no longer the configured one; leave the task queued.
+                if not launch_slot.get("dispatchEnabled", False):
+                    continue
+                try:
+                    claim_model = model_selection.claim_model(launch_slot)
+                    model_selection.validate_model(claim_model)
                 except ValueError:
-                    # A worker that declares no model cannot be launched. The
-                    # launch path refuses it; the claim keeps its existing
+                    # A worker that declares no approved model cannot be launched.
+                    # The launch path refuses it; the claim keeps its existing
                     # behaviour so nothing else is hidden by this check.
                     claim_model = None
                 if claim_model:
@@ -104,10 +116,10 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             try:
                 if is_opencode:
                     if recovery_record:
-                        sender(slot, task["message"], task_id=task_id,
+                        sender(launch_slot, task["message"], task_id=task_id,
                                recovery=recovery_record, model=claim_model)
                     else:
-                        sender(slot, task["message"], task_id=task_id, model=claim_model)
+                        sender(launch_slot, task["message"], task_id=task_id, model=claim_model)
                 else:
                     sender(slot, task["message"])
             except Exception as error:

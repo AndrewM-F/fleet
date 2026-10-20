@@ -51,8 +51,14 @@ the legacy default is unchanged. `--inspect` reports the configured model, the n
 identity, the working directory and whether the worker is active or uncertain; `--dry-run`
 reports the exact change without writing it. A worker that is active or uncertain keeps
 the model its in-flight turn was launched with, and the selection becomes the expected
-model for its next turn. A selection and a dispatch claim share one lock, so a task is
-never claimed under one model and launched under another. The selection clears no hold,
+model for its next turn. That in-flight expectation is immutable: it is read from the
+turn's own launch record, so repeated selections cannot strand a turn that was launched
+before them, and a cancellation binds to it rather than to the next-turn model, so
+switching an active worker never makes its running turn uncancellable. A selection and a
+dispatch claim share one lock, so a task is never claimed under one model and launched
+under another, and the dispatcher re-reads the configuration inside that lock, so a
+selection that lands after the roster was loaded is still the model the claim and the
+launch use. The selection clears no hold,
 dispatch flag, queue, account, session id or working directory, and it never contacts a
 provider.
 
