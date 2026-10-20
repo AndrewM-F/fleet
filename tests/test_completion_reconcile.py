@@ -131,6 +131,11 @@ class CompletionReconciliationTests(unittest.TestCase):
                          ("running",))
         self.assertEqual(self.events(), [])
 
+    def assertRetainedLedgerUnchanged(self, expected=0):
+        """The retained ledger keeps exactly the rows the test placed there."""
+        self.assertEqual(self.retired_db.execute("SELECT count(*) FROM tasks").fetchone()[0],
+                         expected)
+
     def test_verified_completed_row_is_closed_and_audited(self):
         before = self.ledger()
         receipts = {path.name: path.read_bytes() for path in
@@ -357,6 +362,36 @@ class CompletionReconciliationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
             self.reconcile()
         self.assertLedgerUnchanged()
+        self.assertRetainedLedgerUnchanged(expected=1)
+
+    def test_another_root_task_under_the_same_session_refuses(self):
+        self.retired_db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                                ("other-retained", SESSION, str(self.root / "elsewhere"), "{}",
+                                 "running", 1))
+        self.retired_db.commit()
+        with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+        self.assertRetainedLedgerUnchanged(expected=1)
+
+    def test_another_root_task_under_the_same_cwd_refuses(self):
+        self.retired_db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                                ("other-retained", OTHER_SESSION, str(self.cwd), "{}",
+                                 "uncertain", 1))
+        self.retired_db.commit()
+        with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+        self.assertRetainedLedgerUnchanged(expected=1)
+
+    def test_a_retained_root_claim_between_validation_and_commit_refuses(self):
+        late = {"id": "late-retained", "sid": SESSION, "state": "running"}
+        with patch.object(completion, "_other_roots_claim",
+                          side_effect=[None, late]) as claims:
+            with self.assertRaisesRegex(ValueError, "Another Fleet root still owns the task"):
+                self.reconcile()
+            self.assertEqual(claims.call_count, 2)
+        self.assertLedgerUnchanged()
 
     def test_missing_process_identity_refuses(self):
         result = self.identity({
@@ -374,17 +409,31 @@ class CompletionReconciliationTests(unittest.TestCase):
             self.reconcile()
         self.assertLedgerUnchanged()
 
-    def test_explicit_no_process_started_receipt_is_accepted(self):
+    def test_contradictory_null_identity_with_a_completed_turn_refuses(self):
         result = self.identity({
             "state": "done", "exitCode": 0, "cleanup": "confirmed",
             "finishedAt": 1792471653.5, "terminalReason": "stop",
             "managedProcessIdentity": None})
         self.result.write_text(json.dumps(result))
         self.pointer.write_text(json.dumps(self.identity({"model": MODEL, "startedAt": 1})))
-        outcome = self.reconcile()
-        self.assertTrue(outcome["reconciled"])
-        self.assertEqual(outcome["evidence"]["processIdentity"], "not-started")
-        self.assertIsNone(outcome["evidence"]["wrapperPid"])
+        with self.assertRaisesRegex(ValueError, "no native process identity for a completed turn"):
+            self.reconcile()
+        self.assertLedgerUnchanged()
+
+    def test_a_partial_native_identity_refuses(self):
+        for identity in ({"pid": 86551}, {"pid": 86551, "pgid": 86551},
+                         {"pid": 86551, "pgid": 86551, "start": [1]},
+                         {"pid": 86551, "pgid": 86551, "start": [1], "executable": ""}):
+            with self.subTest(identity=sorted(identity)):
+                result = self.identity({
+                    "state": "done", "exitCode": 0, "cleanup": "confirmed",
+                    "finishedAt": 1792471653.5, "terminalReason": "stop",
+                    "managedProcessIdentity": identity})
+                self.result.write_text(json.dumps(result))
+                with self.assertRaisesRegex(ValueError, "invalid native process identity"):
+                    self.reconcile()
+                self.assertLedgerUnchanged()
+        self.write_receipt()
 
     def test_a_launch_holding_the_session_lock_refuses(self):
         handle = self.lock_path.open("rb")

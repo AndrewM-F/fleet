@@ -21,6 +21,13 @@ It never rebuilds history, never replays a task, and never touches a hold, the
 global pause, a dispatch flag, a model or an account. The original task body and
 the retained turn receipt are preserved verbatim; the ledger row and one
 auditable event are the only things it writes.
+
+A completed turn ran a process, so its stopped proof is a full recorded native
+identity and a recorded wrapper PID that are both provably gone; a receipt that
+records no identity, or a null identity beside a successful completion, fails
+closed. Ownership in a retired root is matched by task id, by session and by
+canonical working directory, and that match is rechecked inside the transaction
+that closes the row.
 """
 import fcntl
 import hashlib
@@ -38,11 +45,9 @@ from .store import emit
 _COMPLETED_NATIVE = {"done", "completed"}
 # Ledger states a completed-but-unobserved row can still carry.
 _STALE_STATES = {"running", "sent"}
-# Ledger states that own a worker or a working directory.
-_OWNING_STATES = ("dispatching", "sent", "running", "uncertain")
-_EVENT_KIND = "opencode_completed_reconciled"
 # Distinguishes "the key is absent" from "the key is present and null".
 _MISSING = object()
+_EVENT_KIND = "opencode_completed_reconciled"
 
 
 def _resolve(value):
@@ -160,13 +165,18 @@ def _release_session_lock(handle):
     handle.close()
 
 
-def _other_roots_claim(db_path, task_id):
-    """The active owner of this task in another Fleet root, if any.
+def _other_roots_claim(db_path, task_id, session_id, resolved_cwd):
+    """The active owner of this work in another Fleet root, if any.
 
     A retired root keeps its own ledger. Only a database that was read
     successfully and holds no active owner proves that the root does not claim
-    the task. A missing, unreadable or corrupt ledger is unknown, not absent,
+    the work. A missing, unreadable or corrupt ledger is unknown, not absent,
     and refuses the reconciliation.
+
+    Ownership is matched by task id, by session and by canonical working
+    directory: a different task in that root that runs under the same session
+    or the same working directory owns the same work and blocks the
+    reconciliation just as the same task id would.
     """
     root = Path(db_path).expanduser().resolve()
     if root == Path(paths.DB).expanduser().resolve():
@@ -177,12 +187,66 @@ def _other_roots_claim(db_path, task_id):
     try:
         with sqlite3.connect(uri, uri=True, timeout=2) as other:
             other.execute("PRAGMA query_only=ON")
-            row = other.execute("SELECT sid,state FROM tasks WHERE id=?", (task_id,)).fetchone()
+            rows = other.execute("SELECT id,sid,cwd,state FROM tasks WHERE state IN "
+                                 "('dispatching','sent','running','uncertain')").fetchall()
     except sqlite3.Error as error:
         raise ValueError("Retired root ledger is unreadable; ownership cannot be verified") from error
-    if row and row[1] in _OWNING_STATES:
-        return {"sid": row[0], "state": row[1]}
+    for other_id, other_sid, other_cwd, other_state in rows:
+        if other_id == task_id or other_sid == session_id \
+                or (resolved_cwd and _resolve(other_cwd) == resolved_cwd):
+            return {"id": other_id, "sid": other_sid, "state": other_state}
     return None
+
+
+def _assert_stopped_native(result, state_document, pointer):
+    """Prove that the completed turn's native execution stopped.
+
+    A completed turn ran a process: the wrapper cannot finish as ``done``
+    without a spawned native process and a verified identity, and the
+    no-process paths end ``blocked`` rather than completed. A receipt that
+    records no identity, or records a null one beside a successful
+    completion, contradicts that and fails closed. A full recorded identity
+    and a recorded wrapper PID are both required, and both must be gone.
+    """
+    identity = result.get("managedProcessIdentity", _MISSING)
+    if identity is _MISSING:
+        identity = state_document.get("processIdentity", _MISSING)
+    if identity is _MISSING:
+        raise ValueError("Native receipt records no process identity; the stopped proof is missing")
+    if identity is None:
+        raise ValueError("Native receipt records no native process identity "
+                         "for a completed turn")
+    if not isinstance(identity, dict):
+        raise ValueError("Native receipt has an invalid native process identity")
+    for key in ("pid", "pgid"):
+        value = identity.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError("Native receipt has an invalid native process identity")
+    start = identity.get("start")
+    if not isinstance(start, (list, tuple)) or not start \
+            or not all(isinstance(item, int) and not isinstance(item, bool) for item in start):
+        raise ValueError("Native receipt has an invalid native process identity")
+    executable = identity.get("executable")
+    if not isinstance(executable, str) or not executable.strip():
+        raise ValueError("Native receipt has an invalid native process identity")
+    if opencode.identity_matches(identity):
+        raise ValueError("Native managed process is still live")
+    if opencode._group_exists(identity["pgid"]):
+        raise ValueError("Native managed process group is still present")
+    wrapper_pid = pointer.get("wrapperPid", _MISSING)
+    if wrapper_pid is _MISSING:
+        raise ValueError("Recorded wrapper PID is missing; the stopped proof is incomplete")
+    if not isinstance(wrapper_pid, int) or isinstance(wrapper_pid, bool) or wrapper_pid <= 0:
+        raise ValueError("Recorded wrapper PID is invalid")
+    try:
+        os.kill(wrapper_pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        raise ValueError("Recorded wrapper PID cannot be verified") from error
+    else:
+        raise ValueError("Recorded wrapper PID is still present")
+    return "gone"
 
 
 def _conflict_rows(db, task_id):
@@ -301,44 +365,13 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
                 or not result["terminalReason"].strip():
             raise ValueError("Native receipt has no terminal reason")
 
-        # The stopped proof is required, not optional. A receipt that records no
-        # native process identity and no wrapper only proves that no process
-        # ever started, and that has to be stated explicitly.
-        process_identity = result.get("managedProcessIdentity", _MISSING)
-        if process_identity is _MISSING:
-            process_identity = state_document.get("processIdentity", _MISSING)
-        if process_identity is _MISSING:
-            raise ValueError("Native receipt records no process identity; "
-                             "the stopped proof is missing")
-        if process_identity is None:
-            process_proof = "not-started"
-        else:
-            if not isinstance(process_identity, dict) or not process_identity.get("pid") \
-                    or not process_identity.get("pgid"):
-                raise ValueError("Native receipt has an invalid native process identity")
-            if opencode.identity_matches(process_identity):
-                raise ValueError("Native managed process is still live")
-            if opencode._group_exists(process_identity["pgid"]):
-                raise ValueError("Native managed process group is still present")
-            process_proof = "gone"
-        wrapper_pid = pointer.get("wrapperPid", _MISSING)
-        if wrapper_pid is _MISSING:
-            if process_proof != "not-started":
-                raise ValueError("Recorded wrapper PID is missing; the stopped proof is incomplete")
-        else:
-            if not isinstance(wrapper_pid, int) or isinstance(wrapper_pid, bool) \
-                    or wrapper_pid <= 0:
-                raise ValueError("Recorded wrapper PID is invalid")
-            try:
-                os.kill(wrapper_pid, 0)
-            except ProcessLookupError:
-                pass
-            except PermissionError as error:
-                raise ValueError("Recorded wrapper PID cannot be verified") from error
-            else:
-                raise ValueError("Recorded wrapper PID is still present")
+        # The stopped proof is required, not optional: a completed turn ran a
+        # process, and both the recorded native identity and the recorded
+        # wrapper PID have to be provably gone.
+        process_proof = _assert_stopped_native(result, state_document, pointer)
 
-        claimed = _other_roots_claim(root / "data" / "fleet.sqlite", task_id)
+        claimed = _other_roots_claim(root / "data" / "fleet.sqlite", task_id, session_id,
+                                     resolved_cwd)
         if claimed:
             raise ValueError("Another Fleet root still owns the task")
 
@@ -359,7 +392,7 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
             "resultSha256": _digest(directory / "result.json"),
             "pointerSha256": _digest(pointer_path),
             "processIdentity": process_proof,
-            "wrapperPid": wrapper_pid if wrapper_pid is not _MISSING else None,
+            "wrapperPid": pointer.get("wrapperPid"),
         }
         evidence = dict(proof, previousState=state, state="finished", note=note.strip())
 
@@ -381,15 +414,21 @@ def reconcile_completed(db, task_id, turn, session_id, receipt_root, note):
             if not current or current[0] != sid or current[1] != cwd or current[2] != state:
                 db.rollback()
                 raise ValueError("Task changed during validation; inspect before reconciling")
-            # Recheck the roster and the competing ownership inside the
-            # transaction, so a worker that rejoined the roster or a task that
-            # claimed the working directory between the checks is refused
-            # instead of raced.
+            # Recheck the roster, the competing ownership and the retired root
+            # inside the transaction, so a worker that rejoined the roster, a
+            # task that claimed the working directory, or a claim that appeared
+            # in the retired root between the checks is refused instead of
+            # raced.
             if session_id in _managed_sessions():
                 db.rollback()
                 raise ValueError("Worker is still managed by this fleet; "
                                  "its row is observed normally")
             _assert_no_conflict(_conflict_rows(db, task_id), task_id, session_id, resolved_cwd)
+            claimed = _other_roots_claim(root / "data" / "fleet.sqlite", task_id, session_id,
+                                         resolved_cwd)
+            if claimed:
+                db.rollback()
+                raise ValueError("Another Fleet root still owns the task")
             changed = db.execute("UPDATE tasks SET state='finished',updated=? WHERE id=? "
                                  "AND state IN ('running','sent')", (time.time(), task_id))
             if changed.rowcount != 1:
