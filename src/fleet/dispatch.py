@@ -35,6 +35,11 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
             continue
         slot = slots[sid]
         state = states.get(sid, {})
+        if slot.get("draining"):
+            # A draining worker takes no new work. Its queued task is not
+            # dropped, cancelled or re-routed here: it stays bound to the
+            # worker until an operator resolves it explicitly.
+            continue
         task = json.loads(raw)
         if holds.is_held(db, task_id):
             continue  # An operator hold pauses this task; never consume or cancel it.

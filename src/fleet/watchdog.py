@@ -45,6 +45,7 @@ def check_queue(db, slots, states, paused=False, minimum=1, now=None,
         sid for sid, slot in slots.items()
         if (slot.get("provider") not in {"claude", "opencode"}
             or slot.get("dispatchEnabled", False))
+        and not slot.get("draining")
         and states.get(sid, {}).get("state") in IDLE | BUSY
     }
     missing = []

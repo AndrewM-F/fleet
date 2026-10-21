@@ -43,6 +43,45 @@
   validated on its own identity and on its own persisted receipts rather than refused by a
   fleet-wide constant. Every other session, task, turn, CWD, process and cleanup check, and the
   refusal of rate-limit and quota failures, is unchanged.
+  A roster entry may also carry `draining: true` (set by `bin/fleet drain-opencode`). A draining
+  worker takes no new work: the dispatcher skips it and the queue-reserve alert ignores it, while
+  the tasks already bound to it stay queued, held and untouched until an operator resolves them.
+
+## On-demand OpenCode sessions
+
+A native OpenCode session is normally created by the operator and then rostered. When root
+authorizes on-demand sessions, `bin/fleet add-opencode` creates them through the supported
+OpenCode CLI (`session.create` on `POST /api/session`) and registers them in `opencode[]`. It is
+the only path that may create a session: the Fleet never writes OpenCode's internal database and
+never invents a session id, so the id in a receipt is always the id the native server returned.
+
+- The request is refused unless the root is this fleet's root, the native account
+  (`databasePath`) is the account the roster already uses, the model is the approved free model
+  that account's workers are configured with, the working directory is a git worktree under
+  `worktreeRoot`, and the count is a whole number inside the validated bound.
+- Creating a session contacts no provider: the request carries the pinned model and the
+  directory, and the native server records them. No model call, no paid resource and no
+  credential access is involved.
+- The roster is written once, after every created session was read back from the native identity
+  row. A partial failure therefore leaves the roster exactly as it was; the native sessions that
+  were created before the failure are kept, recorded in `opencode_sessions` and registered by a
+  retry of the same `--request-key` instead of being created a second time. The same request key
+  never adds twice.
+- New workers are dispatch-disabled unless `--enable-dispatch` is given, so a new session can be
+  canaried before it takes work.
+- `--max-concurrent` is the only way to change the admission limit, and only inside the
+  validated limits: it is never lowered, never raised implicitly, never above twice the logical
+  session count and never above the absolute ceiling. The logical session count, the admission
+  limit and the heavy-job admission (two slots) are three separate numbers, and this command
+  changes only the first two, the second only when it is asked for.
+- `bin/fleet drain-opencode` stops dispatching to a worker and reports the work it still owns.
+  `bin/fleet remove-opencode` removes it from the roster and refuses while a task or turn is
+  queued, in flight or uncertain, while a recovery holds the session, and while the native
+  identity cannot be verified. The native session and its history are kept, and no hold, task,
+  queue entry, worktree or credential is touched.
+- Both the provisioning request and every session carry a durable receipt in
+  `opencode_provisioning` and `opencode_sessions` inside `fleet.sqlite`, so ownership and
+  idempotency survive a manager restart.
 
 The configured `model` is the desired model for the next productive turn. The native
 session row keeps its own historical model: it is read, reported and never written, and a

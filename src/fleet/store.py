@@ -48,6 +48,28 @@ _RECOVERY_ADOPTIONS_COLUMNS = (
     "evidence_reference", "ownership_evidence", "note", "created")
 
 
+# Durable receipts for on-demand OpenCode sessions. The request row is the
+# idempotency key of one add request; the session row is the ownership receipt
+# of one native session, so a retry never creates a second session and a removal
+# can always prove which native session it removed from the roster.
+_OPENCODE_PROVISIONING_TABLE = """
+CREATE TABLE IF NOT EXISTS opencode_provisioning (
+  request_key TEXT PRIMARY KEY,
+  model TEXT NOT NULL, account TEXT NOT NULL, cwd TEXT NOT NULL, root TEXT NOT NULL,
+  requested_count INTEGER NOT NULL, dispatch_enabled INTEGER NOT NULL,
+  status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+  detail TEXT NOT NULL DEFAULT '');
+"""
+_OPENCODE_SESSIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS opencode_sessions (
+  session_id TEXT PRIMARY KEY,
+  request_key TEXT NOT NULL, native_id TEXT NOT NULL, model TEXT NOT NULL,
+  account TEXT NOT NULL, cwd TEXT NOT NULL, root TEXT NOT NULL,
+  status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+  detail TEXT NOT NULL DEFAULT '');
+"""
+
+
 def _upgrade_recovery_adoptions(db):
     """Preserve legacy adoption rows while adding the locator/evidence split.
 
@@ -140,6 +162,8 @@ def database(path=None):
     """)
     db.executescript(_RECOVERIES_TABLE)
     db.executescript(_RECOVERY_ADOPTIONS_TABLE)
+    db.executescript(_OPENCODE_PROVISIONING_TABLE)
+    db.executescript(_OPENCODE_SESSIONS_TABLE)
     _upgrade_recovery_adoptions(db)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}

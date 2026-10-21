@@ -2,8 +2,10 @@
 
 Local, repo-independent manager that dispatches explicit root-authorized tasks to existing
 Pi (RPC), Claude (`--print`), and explicitly rostered OpenCode CLI worker sessions, relays
-completions with receipts, and never calls a model in the control path. Agents: read
-[AGENTS.md](AGENTS.md).
+completions with receipts, and never calls a model in the control path. An OpenCode session
+is normally created by the operator and then rostered; `bin/fleet add-opencode` creates one on
+demand through the supported OpenCode CLI, which is the only path that may create a session.
+Agents: read [AGENTS.md](AGENTS.md).
 
 ## Setup
 Python 3.11+, `pi` and `claude` on PATH (or set `executables` in config).
@@ -35,6 +37,9 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet recover-opencode --direct-turn-receipt PATH` | ownership source for a genuine native turn that predates the task ledger: a durable receipt in `data/recovery/` recording the original session, canonical worktree, branch and initial head, proved against the native completed turn and the unchanged checkout |
 | `bin/fleet reconcile-recovery --task ID` | release a claimed recovery reservation after verified native stop |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |
+| `bin/fleet add-opencode --count N --model PROVIDER/MODEL --cwd PATH --root PATH [--request-key KEY] [--enable-dispatch] [--max-concurrent N] [--dry-run\|--status]` | create and register OpenCode sessions on demand, idempotently per request key |
+| `bin/fleet drain-opencode --session SID --note "..."` | stop dispatching to one worker and report the work it still owns (nothing is dropped) |
+| `bin/fleet remove-opencode --session SID --note "..."` | remove one worker from the roster, keeping its native session and history |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |
 | `bin/fleet run` / `wait` / `ack --event-id N` | foreground manager / any-event wait (was `fleet.py`) |
 

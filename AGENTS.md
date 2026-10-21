@@ -92,6 +92,32 @@ command prints JSON on stdout and exits non-zero on failure.
   a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
+- `bin/fleet add-opencode --count N --model PROVIDER/MODEL --cwd PATH --root PATH
+  [--database-path PATH] [--request-key KEY] [--enable-dispatch] [--max-concurrent N]
+  [--dry-run] [--status] [--note "..."]` — create and register OpenCode sessions on demand. The
+  session is created by the supported OpenCode CLI (`session.create` on `POST /api/session`), which
+  is the only path that may create a session; the Fleet never writes OpenCode's internal database
+  and never invents a session id. Creating a session contacts no provider, so no model call and no
+  paid resource is involved. The request is refused unless the root is this fleet's root, the
+  account is the native account the roster already uses, the model is the approved free model that
+  account's workers are configured with, the working directory is a git worktree under
+  `worktreeRoot`, and the count is inside the validated bound. The roster is written once, after
+  every created session was read back from the native identity row, so a partial failure leaves the
+  roster untouched; the native sessions that were created before a failure are kept, recorded and
+  registered by a retry of the same `--request-key` instead of being created twice. The same key
+  never adds twice. New workers are dispatch-disabled unless `--enable-dispatch` is given.
+  `--max-concurrent` is the only way to change the admission limit, and only inside the validated
+  limits; the limit is never raised implicitly, and the heavy-job admission is a separate,
+  unchanged bound. The command never starts, stops or replaces a manager.
+- `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
+  the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
+  is bound to the worker is reported as outstanding, and the worker takes no new work until the
+  operator resolves it.
+- `bin/fleet remove-opencode --session SID --note "..."` — remove one worker from the roster. It
+  refuses while a task or turn is queued, in flight or uncertain, while a recovery holds the
+  session, and while the native identity cannot be verified (`--allow-unverified-native` is an
+  explicit, recorded operator override). The native session and its history are kept, and no hold,
+  task, queue entry, worktree or credential is touched.
 - `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
   report or set the approved OpenCode provider/model for managed workers. The model must
   be one of the explicitly approved free models; the legacy default is unchanged. The
@@ -110,8 +136,9 @@ command prints JSON on stdout and exits non-zero on failure.
   account, session id or working directory.
 
 ## Rules
-1. Never create, replace or duplicate worker sessions; identities live in
-   `config/fleet.local.json` (one entry per session).
+1. Never create, replace or duplicate worker sessions outside `bin/fleet add-opencode`; identities
+   live in `config/fleet.local.json` (one entry per session), and a session id always comes from
+   the native OpenCode server, never from a guess.
 2. Never resend a task in state `uncertain`; inspect the worker and enqueue a new task ID.
 3. Acknowledge an event only after you have acted on it; unacked events persist across restarts.
 4. Don't edit `data/` by hand. Stop the fleet and run `scripts/db-check` before copying or moving it.
