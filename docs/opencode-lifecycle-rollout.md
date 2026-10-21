@@ -8,7 +8,10 @@ Three facts about the live deployment shape the plan and are stated here rather 
 - **The running manager is a pinned older build.** It does not know the `draining` flag, so a
   drained worker keeps receiving queued work from it. The drain is therefore *advisory* against
   that manager: the fleet has to be paused for the drain window, or the manager has to be
-  upgraded to a build that honours the flag, before a drain can be relied on.
+  upgraded to a build that honours the flag, before a drain can be relied on. Nothing else in this
+  plan depends on the manager: the roster and the admission limit are reloaded by the pinned
+  manager on every cycle, which `tests/test_pinned_manager.py` proves by running that exact code
+  in a temporary root.
 - **The live store predates the receipt tables.** `opencode_provisioning` and
   `opencode_sessions` are additive: the new code creates them on the first `database()` call, an
   older manager ignores unknown tables, and no existing row is rewritten. The migration is a
@@ -49,6 +52,13 @@ the installed CLI's own schema, so the report says whether the creation call is 
 provider-free before anything is created.
 
 ## Stage 3 — the creation path is proved against the installed CLI
+
+The request the Fleet sends is the one the installed CLI's own schema declares: the model as a
+`Model.Ref` object with a required `id` and `providerID`, the location as a `Location.PublicRef`
+object with a required `directory`, and nothing else. The evidence, the correction it forced and
+the limits of that evidence are in
+[opencode-native-api-evidence.md](opencode-native-api-evidence.md); the precise remaining
+precondition is root's first live request confirming the provider-free property on the account.
 
 The command consults the OpenAPI document the installed OpenCode CLI serves itself
 (`opencode api --standalone GET /openapi.json`) before it creates anything. The evidence is

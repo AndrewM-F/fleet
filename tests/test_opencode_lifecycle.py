@@ -56,9 +56,25 @@ if "GET" in argv and "/openapi.json" in argv:
     if control.get("noSchemaOperation"):
         print(json.dumps({{"openapi": "3.1.0", "paths": {{}}}}))
         raise SystemExit(0)
+    # The resolved schema of the installed OpenCode CLI (opencode v2.0.29): the
+    # model is a Model.Ref object with a required id and providerID, the location
+    # is a Location.PublicRef object with a required directory, and the body
+    # allows no other property.
     print(json.dumps({{
         "openapi": "3.1.0",
         "info": {{"title": "opencode HttpApi", "version": "0.0.1"}},
+        "components": {{"schemas": {{
+            "Model.Ref": {{"type": "object",
+                           "properties": {{"id": {{"type": "string"}},
+                                           "providerID": {{"type": "string"}},
+                                           "variant": {{"type": "string"}}}},
+                           "required": ["id", "providerID"],
+                           "additionalProperties": False}},
+            "Location.PublicRef": {{"type": "object",
+                                    "properties": {{"directory": {{"type": "string"}}}},
+                                    "required": ["directory"],
+                                    "additionalProperties": False}},
+        }}}},
         "paths": {{"/api/session": {{"post": {{
             "operationId": "session.create",
             "summary": "Create session",
@@ -69,11 +85,12 @@ if "GET" in argv and "/openapi.json" in argv:
                                 "parentID": {{"type": "string"}},
                                 "title": {{"type": "string"}},
                                 "agent": {{"type": "string"}},
-                                "model": {{"type": "object"}},
-                                "location": {{"type": "object"}},
+                                "model": {{"$ref": "#/components/schemas/Model.Ref"}},
+                                "location": {{"$ref": "#/components/schemas/Location.PublicRef"}},
                                 "metadata": {{"type": "object"}},
-                                "permissions": {{"type": "object"}}}},
-                "required": []}}}}}}}},
+                                "permissions": {{"type": "array", "items": {{"type": "object"}}}}}},
+                "required": [],
+                "additionalProperties": False}}}}}}}},
             "responses": {{"200": {{"description": "Success"}}}},
             "security": []}}}}}},
     }}))
@@ -89,9 +106,28 @@ if mode == "garbage":
 session_id = control["sessionId"]
 if not control.get("duplicate"):
     session_id = f"{{session_id}}-{{creations}}"
+if data is not None:
+    # The request is validated against the resolved schema first.
+    allowed = {{"id", "parentID", "title", "agent", "model", "location", "metadata",
+               "permissions"}}
+    if set(data) - allowed:
+        sys.stderr.write("the request body has a property the schema does not declare\\n")
+        raise SystemExit(4)
+    model = data.get("model")
+    if (not isinstance(model, dict) or set(model) - {{"id", "providerID", "variant"}}
+            or not model.get("id") or not model.get("providerID")):
+        sys.stderr.write("the model reference does not match Model.Ref\\n")
+        raise SystemExit(4)
+    location = data.get("location")
+    if (not isinstance(location, dict) or set(location) - {{"directory"}}
+            or not location.get("directory")):
+        sys.stderr.write("the location reference does not match Location.PublicRef\\n")
+        raise SystemExit(4)
 directory = (data or {{}}).get("location", {{}}).get("directory")
 if data:
-    recorded = control.get("recordModel") or data.get("model")
+    recorded = control.get("recordModel")
+    if recorded is None:
+        recorded = json.dumps(data["model"], separators=(",", ":"))
     with sqlite3.connect(DATABASE) as database:
         database.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
                          (session_id, directory, "project-test", recorded))
@@ -198,8 +234,10 @@ class NativeRequestTests(Sandbox):
         creations = self.creations()
         self.assertEqual(len(creations), 1)
         self.assertEqual(creations[0]["argv"][:4], ["api", "--standalone", "POST", "/api/session"])
-        self.assertEqual(creations[0]["data"]["model"], MODEL)
-        self.assertEqual(creations[0]["data"]["location"]["directory"], str(self.wt))
+        # The resolved schema takes the model as a Model.Ref object.
+        self.assertEqual(creations[0]["data"]["model"],
+                         {"id": "minimax-m3.1-flash-free", "providerID": "opencode-go"})
+        self.assertEqual(creations[0]["data"]["location"], {"directory": str(self.wt)})
         config = json.loads(creations[0]["config"])
         self.assertEqual(config["model"], MODEL)
         self.assertEqual(config["small_model"], MODEL)
@@ -216,7 +254,9 @@ class NativeRequestTests(Sandbox):
                              (identifier,)).fetchone()
         self.assertEqual(row[0], identifier)
         self.assertEqual(row[1], str(self.wt))
-        self.assertEqual(row[2], MODEL)
+        # The native session records the model as the reference it was given.
+        self.assertEqual(json.loads(row[2]),
+                         {"id": "minimax-m3.1-flash-free", "providerID": "opencode-go"})
         self.assertEqual([entry["sessionId"] for entry in self.roster()],
                          [self.existing, identifier])
 
@@ -892,7 +932,8 @@ class NativeIdentityTests(Sandbox):
         identifier = self.roster()[-1]["sessionId"]
         with sqlite3.connect(self.native) as db:
             row = db.execute("SELECT model FROM session_v2 WHERE id=?", (identifier,)).fetchone()
-        self.assertEqual(row[0], MODEL)
+        self.assertEqual(json.loads(row[0]),
+                         {"id": "minimax-m3.1-flash-free", "providerID": "opencode-go"})
 
     def test_a_pending_session_that_no_longer_verifies_is_not_registered(self):
         identifier = "ses_PENDING000000000001"
@@ -951,8 +992,12 @@ class NativeIdentityTests(Sandbox):
         self.assertTrue(set(payload).issubset(documented))
         self.assertEqual(set(payload), {"location", "model"})
         self.assertEqual(sorted(payload["location"]), ["directory"])
-        self.assertEqual(payload["model"], MODEL)
+        # The model is a Model.Ref object with a required id and providerID.
+        self.assertEqual(sorted(payload["model"]), ["id", "providerID"])
+        self.assertEqual(payload["model"]["providerID"], "opencode-go")
+        self.assertEqual(payload["model"]["id"], "minimax-m3.1-flash-free")
         self.assertNotIn("prompt", json.dumps(payload).lower())
+        self.assertNotIn("text", json.dumps(payload).lower())
 
 
 class PlanTests(Sandbox):
@@ -1011,6 +1056,119 @@ class PlanTests(Sandbox):
         self.assertTrue(hasattr(roster, "roster_lock"))
         self.assertTrue(hasattr(roster, "queue_lock"))
         self.assertTrue(hasattr(roster, "write_config_cas"))
+
+
+class ApiContractTests(Sandbox):
+    """The request the implementation sends is the one the installed schema declares."""
+
+    def test_the_synthetic_cli_refuses_a_payload_the_schema_does_not_declare(self):
+        # The model as a plain "provider/model" string is not the resolved
+        # Model.Ref: the schema wants an object with a required id and providerID.
+        result = subprocess.run([str(self.fake), "api", "--standalone", "POST", "/api/session",
+                                 "--data", json.dumps({"location": {"directory": str(self.wt)},
+                                                      "model": MODEL})],
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Model.Ref", result.stderr)
+
+    def test_the_synthetic_cli_refuses_a_location_the_schema_does_not_declare(self):
+        result = subprocess.run([str(self.fake), "api", "--standalone", "POST", "/api/session",
+                                 "--data", json.dumps({"location": str(self.wt),
+                                                      "model": {"id": "minimax-m3.1-flash-free",
+                                                                "providerID": "opencode-go"}})],
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Location.PublicRef", result.stderr)
+
+    def test_the_synthetic_cli_refuses_a_property_the_body_does_not_declare(self):
+        result = subprocess.run([str(self.fake), "api", "--standalone", "POST", "/api/session",
+                                 "--data", json.dumps({"location": {"directory": str(self.wt)},
+                                                      "model": {"id": "minimax-m3.1-flash-free",
+                                                                "providerID": "opencode-go"},
+                                                      "prompt": "a prompt"})],
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not declare", result.stderr)
+
+    def test_the_implementation_payload_is_accepted_by_the_schema(self):
+        self.add(count=1, request_key="w5-contract-001")
+        self.assertEqual(len(self.creations()), 1)
+
+
+class CrashWindowTests(Sandbox):
+    """The windows around the roster write are recoverable and never duplicate."""
+
+    def test_a_crash_between_the_roster_write_and_the_receipts_is_recovered(self):
+        # The roster is written, then the receipts are updated. A crash in that
+        # window must not make the retry create a second set of sessions.
+        original = opencode_lifecycle._record_session
+
+        def fail_once(db, session_id, request_key, request, status, detail=""):
+            if status == "registered":
+                raise KeyboardInterrupt("the receipt update was interrupted")
+            return original(db, session_id, request_key, request, status, detail)
+
+        with patch.object(opencode_lifecycle, "_record_session", side_effect=fail_once):
+            with self.assertRaises(KeyboardInterrupt):
+                self.add(count=1, request_key="w5-crash-001")
+        self.assertEqual(len(self.creations()), 1)
+        self.assertEqual(len(self.roster()), 2)
+        resumed = self.add(count=1, request_key="w5-crash-001")
+        # The recorded session is recovered; no second native session is created.
+        self.assertEqual(len(self.creations()), 1)
+        self.assertEqual(resumed["created"], 0)
+        self.assertEqual(len(self.roster()), 2)
+
+    def test_an_interrupted_attempt_without_a_record_is_not_resumed_by_adoption(self):
+        with patch.object(opencode_lifecycle, "_record_session", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.add(count=1, request_key="w5-crash-002")
+        self.db.execute("UPDATE opencode_provisioning SET status='uncertain', detail='' "
+                        "WHERE request_key=?", ("w5-crash-002",))
+        self.db.commit()
+        with self.assertRaises(ValueError) as error:
+            self.add(count=1, request_key="w5-crash-002")
+        self.assertIn("uncertain", str(error.exception))
+        self.assertEqual(len(self.creations()), 1)
+        self.assertEqual(len(self.roster()), 1)
+
+
+class ImportProtectionTests(Sandbox):
+    """The queue import and the dispatch claim share the roster writer lock."""
+
+    def test_the_queue_import_waits_for_the_roster_writer_lock(self):
+        import threading
+        from fleet import manager
+        started = threading.Event()
+        release = threading.Event()
+        order = []
+
+        def hold():
+            with roster.roster_lock():
+                started.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        started.wait(10)
+        db = store.database(paths.DB)
+        try:
+            def run_import():
+                manager.import_queue(db, {self.existing: self.roster()[0]},
+                                    str(Path(self.tmp.name) / "queue.json"))
+                order.append("imported")
+
+            importer = threading.Thread(target=run_import)
+            importer.start()
+            importer.join(2)
+            self.assertEqual(order, [], "the import did not wait for the roster writer lock")
+            release.set()
+            importer.join(10)
+            holder.join(10)
+            self.assertEqual(order, ["imported"])
+        finally:
+            db.close()
+            release.set()
 
 
 if __name__ == "__main__":

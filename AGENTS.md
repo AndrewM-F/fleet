@@ -124,8 +124,10 @@ command prints JSON on stdout and exits non-zero on failure.
   `--reconciled-session` and that exact id is verified — id, working directory and model — before
   it is registered. A session whose receipt says it was never verified is never ignored: it is
   reconciled first, and an unresolved one refuses the request. The creation call is proved against
-  the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare a
-  provider-free `session.create` creates nothing.
+  the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare the
+  resolved shape — the model as a `Model.Ref` object with a required `id` and `providerID`, the
+  location as a `Location.PublicRef` object with a required `directory`, and no other property —
+  creates nothing.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the
@@ -141,7 +143,9 @@ command prints JSON on stdout and exits non-zero on failure.
   leaves the roster only through this command, with these barriers.
 - The staged activation and rollback plan for a live fleet, including the pinned older manager and
   the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
-  It is not executed by this command.
+  It is not executed by this command. The pinned manager reloads the roster and the admission limit on
+  every cycle, which `tests/test_pinned_manager.py` proves against that exact code, but it does not
+  honour `draining`: the fleet is paused for the drain window, or the manager is upgraded first.
 - `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
   report or set the approved OpenCode provider/model for managed workers. The model must
   be one of the explicitly approved free models; the legacy default is unchanged. The

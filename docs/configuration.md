@@ -101,10 +101,15 @@ never invents a session id, so the id in a receipt is always the id the native s
   awaiting-import work, no recovery claim, and a verifiable native identity. A request is
   withdrawn by draining and removing its workers, one by one; there is no faster path that
   skips the barriers.
+- The creation call is proved against the installed CLI's own schema before it is made, and the
+  request is the one that schema declares: the model as a `Model.Ref` object with a required `id`
+  and `providerID`, the location as a `Location.PublicRef` object with a required `directory`, and
+  nothing else. The evidence and its limits are in
+  [opencode-native-api-evidence.md](opencode-native-api-evidence.md).
 - The staged activation and rollback plan is
   [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
-  manager, which does not honour `draining`, and the durable state migration that adds the
-  receipt tables before any request.
+  manager, which reloads the roster and the admission limit on every cycle but does not honour
+  `draining`, and the durable state migration that adds the receipt tables before any request.
 
 The configured `model` is the desired model for the next productive turn. The native
 session row keeps its own historical model: it is read, reported and never written, and a

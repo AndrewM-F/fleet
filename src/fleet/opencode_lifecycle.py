@@ -281,6 +281,23 @@ def verify_native_api_support(executable, timeout=API_PROBE_TIMEOUT_SECONDS):
     if not {"model", "location"}.issubset(set(properties)):
         raise ProvisioningError("The installed OpenCode CLI does not declare the model and "
                                 "location fields this request sends; no session was created")
+    if body.get("additionalProperties") is not False:
+        raise ProvisioningError("The installed OpenCode CLI does not close its session creation "
+                                "body to the declared properties; no session was created")
+    schemas = spec.get("components", {}).get("schemas", {})
+
+    def resolved(name):
+        return schemas.get(name) or {}
+
+    model_ref = resolved("Model.Ref")
+    if model_ref.get("type") != "object" or set(model_ref.get("required", [])) != {"id", "providerID"}:
+        raise ProvisioningError("The installed OpenCode CLI declares a different model reference "
+                                "than this request sends; no session was created")
+    location_ref = resolved("Location.PublicRef") or resolved("Location.Ref")
+    if (location_ref.get("type") != "object"
+            or set(location_ref.get("required", [])) != {"directory"}):
+        raise ProvisioningError("The installed OpenCode CLI declares a different location "
+                                "reference than this request sends; no session was created")
     if any(any(word in name.lower() for word in _PROMPT_SHAPED) for name in properties):
         raise ProvisioningError("The installed OpenCode CLI declares a prompt-shaped field for a "
                                 "session creation; no session was created")
@@ -291,10 +308,29 @@ def verify_native_api_support(executable, timeout=API_PROBE_TIMEOUT_SECONDS):
             "operationId": operation.get("operationId"), "path": "/api/session",
             "openapi": spec.get("openapi"), "bodyProperties": sorted(properties),
             "required": [], "security": [],
+            "modelRef": {"id": sorted(model_ref.get("properties", {})),
+                         "required": sorted(model_ref.get("required", []))},
+            "locationRef": {"properties": sorted(location_ref.get("properties", {})),
+                            "required": sorted(location_ref.get("required", []))},
+            "additionalProperties": body.get("additionalProperties"),
             "sha256": hashlib.sha256(result.stdout.encode()).hexdigest()}
 
 
 # --- native session creation ----------------------------------------------
+
+def session_create_payload(cwd, model):
+    """The request body the installed CLI's schema declares for a session create.
+
+    The resolved schema takes the model as a ``Model.Ref`` **object** with a
+    required ``id`` and ``providerID``, and the location as a
+    ``Location.PublicRef`` object with a required ``directory``. The body
+    allows no other property, so the request carries nothing else: no text, no
+    content and no provider reference beyond the model.
+    """
+    provider, name = opencode._validate_model(model)
+    return {"location": {"directory": str(cwd)},
+            "model": {"id": name, "providerID": provider}}
+
 
 def _parse_session(output):
     """Read the session the native server returned; never invent one."""
@@ -351,7 +387,7 @@ def create_native_session(executable, account, cwd, model, scratch, timeout=None
     request = {"model": model, "turnRoot": str(scratch), "executable": str(executable),
                "databasePath": str(account)}
     env = opencode._runtime_environment(request)
-    payload = {"location": {"directory": str(cwd)}, "model": model}
+    payload = session_create_payload(cwd, model)
     command = [str(executable), "api", "--standalone", "POST", "/api/session",
                "--data", json.dumps(payload, separators=(",", ":"))]
     try:
@@ -465,6 +501,23 @@ def _record_session(db, session_id, request_key, request, status, detail=""):
         (session_id, request_key, session_id, request["model"], request["account"],
          request["cwd"], request["root"], status, now, now, detail))
     db.commit()
+
+
+def _recorded_sessions(row):
+    """The native sessions a request recorded for itself before its roster write."""
+    if row is None or not row[10]:
+        return []
+    try:
+        payload = json.loads(row[10])
+    except ValueError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list):
+        return []
+    return [value for value in sessions
+            if isinstance(value, str) and _SESSION_ID.fullmatch(value)]
 
 
 def _roster_session_ids(cfg):
@@ -634,7 +687,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                                  + ". It is not ignored and no new session is created.") from error
             _record_session(db, receipt["session_id"], key, request, "created",
                             "reconciled: the native identity was read back")
-    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled:
+    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled \
+            and not _recorded_sessions(existing):
         # The previous attempt's outcome is unknown: nothing is adopted on
         # speculation. The operator names the native session that was created and
         # that exact id is verified before it is registered. A recorded session
@@ -660,6 +714,22 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                              "request: " + str(error)) from error
         _record_session(db, identifier, key, request, "created",
                         "reconciled explicitly by the operator")
+    # The sessions an interrupted attempt of this request created are recovered
+    # from the record it left behind and verified again before they are
+    # registered. They are this request's own sessions, so this is a recovery and
+    # not an adoption of an unrostered session.
+    recorded = _recorded_sessions(existing)
+    for identifier in recorded:
+        if any(receipt["session_id"] == identifier for receipt in receipts):
+            continue
+        try:
+            _verify_created(identifier, request["cwd"], request["account"], request["model"])
+        except (ValueError, OSError) as error:
+            raise ValueError("A native session this request created before it was interrupted "
+                             "no longer verifies (" + identifier + "): " + str(error)
+                             + ". It is not ignored and no new session is created.") from error
+        _record_session(db, identifier, key, request, "created",
+                        "recovered from the request's own record")
     receipts = _session_receipts(db, key)
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
@@ -707,7 +777,10 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     # lock is held only for this short step.
     with roster.roster_lock():
         current = _provisioning_row(db, key)
-        if current is not None and current[7] == "creating" and _creator_alive(current[12]):
+        if (current is not None and current[7] == "creating" and _creator_alive(current[12])
+                and not _recorded_sessions(current)):
+            # A live attempt that has not named its sessions yet is in progress;
+            # a request that recorded its sessions is recoverable instead.
             raise ValueError("Another request with this key is in progress; retry after it "
                              "finishes. No session was created now.")
         _record_provisioning(db, key, request, "creating",
@@ -801,6 +874,12 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     if len(set(to_register)) != len(to_register):
         raise ProvisioningError("The request would register the same native session twice; "
                                  "nothing was written")
+    # The ids are recorded against the request before the roster is written, so a
+    # crash between the two is recoverable: the retry registers exactly these
+    # sessions instead of creating a second set.
+    _record_provisioning(db, key, request, "creating",
+                         json.dumps({"sessions": to_register}), payload_digest=digest,
+                         creator_pid=os.getpid())
     with roster.roster_lock():
         updated = paths.config()
         for identifier in to_register:
