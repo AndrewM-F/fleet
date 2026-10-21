@@ -1,5 +1,6 @@
 """The authoritative SQLite store: events (ack-tracked), worker snapshots, tasks."""
 import json
+from pathlib import Path
 import sqlite3
 import time
 
@@ -180,6 +181,10 @@ def database(path=None):
     if path is None:
         paths.DATA.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path or paths.DB, timeout=10)
+    return _initialize_database(db)
+
+
+def _initialize_database(db):
     db.executescript("""
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS events (
@@ -234,3 +239,31 @@ def emit(db, kind, **body):
                      (kind, json.dumps(body), time.time()))
     db.commit()
     return cur.lastrowid
+
+
+def planning_database(path=None):
+    """Upgrade an in-memory snapshot; never initialize/migrate the source store.
+
+    Read-only SQLite opens can write WAL sidecars. Refuse a WAL store
+    rather than touching its sidecars or silently ignoring committed WAL data.
+    Missing stores are represented by an empty in-memory schema.
+    """
+    source_path = paths.DB if path is None else Path(path)
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        if source_path.exists():
+            wal = source_path.with_name(source_path.name + "-wal")
+            if wal.exists():
+                # SQLite's shared-memory WAL index may be written even by a
+                # read-only connection. A strict no-write plan refuses this
+                # case rather than touching source sidecars or ignoring WAL.
+                raise ValueError("Read-only planning requires a checkpointed store without WAL")
+            uri = source_path.resolve().as_uri() + "?mode=ro&immutable=1"
+            with sqlite3.connect(uri, uri=True) as source:
+                source.backup(snapshot)
+            if wal.exists():
+                raise ValueError("Store changed to WAL during read-only planning; retry later")
+        return _initialize_database(snapshot)
+    except Exception:
+        snapshot.close()
+        raise

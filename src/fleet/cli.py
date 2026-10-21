@@ -12,7 +12,7 @@ import time
 
 from . import (claude, completion, control, events, holds, manager, model_selection, opencode,
                opencode_lifecycle, ops, paths, pi, recovery)
-from .store import BUSY, database
+from .store import BUSY, database, planning_database
 
 
 def out(value):
@@ -374,7 +374,11 @@ def cmd_add_opencode(args):
     """Add OpenCode sessions to the roster, or report the current state."""
     try:
         if args.status:
-            out(opencode_lifecycle.status(database()))
+            db = planning_database() if args.dry_run else database()
+            try:
+                out(opencode_lifecycle.status(db))
+            finally:
+                db.close()
             return
         missing = [name for name, value in (("--model", args.model), ("--cwd", args.cwd),
                                             ("--root", args.root))
@@ -385,12 +389,20 @@ def cmd_add_opencode(args):
             raise SystemExit("Choose --count or --target-total")
         if args.count is not None and args.target_total is not None:
             raise SystemExit("Choose --count or --target-total, not both")
-        out(opencode_lifecycle.add_sessions(
-            database(), count=args.count, target_total=args.target_total, model=args.model,
-            cwd=args.cwd, root=args.root, database_path=args.database_path,
-            request_key=args.request_key, enable_dispatch=args.enable_dispatch,
-            max_concurrent=args.max_concurrent, dry_run=args.dry_run, note=args.note or "",
-            reconciled_sessions=args.reconciled_session))
+        db = planning_database() if args.dry_run else database()
+        try:
+            result = opencode_lifecycle.add_sessions(
+                db, count=args.count, target_total=args.target_total, model=args.model,
+                cwd=args.cwd, root=args.root, database_path=args.database_path,
+                request_key=args.request_key, enable_dispatch=args.enable_dispatch,
+                max_concurrent=args.max_concurrent, dry_run=args.dry_run, note=args.note or "",
+                reconciled_sessions=args.reconciled_session)
+        finally:
+            db.close()
+        out(result)
+        if (result.get("failed") or result.get("uncertain")
+                or result.get("status") in {"failed", "uncertain"}):
+            sys.exit(1)
     except (ValueError, OSError, opencode_lifecycle.ProvisioningError) as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
         sys.exit(1)
@@ -615,5 +627,6 @@ def main(argv=None):
     p.set_defaults(fn=lambda a: out(ops.install_launchd() if a.action == "install"
                                     else ops.uninstall_launchd()))
     args = parser.parse_args(argv)
-    paths.DATA.mkdir(parents=True, exist_ok=True)
+    if not (args.cmd == "add-opencode" and args.dry_run):
+        paths.DATA.mkdir(parents=True, exist_ok=True)
     args.fn(args)
