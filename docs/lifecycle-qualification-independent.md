@@ -3,47 +3,31 @@
 **Author:** W8 (independent qualification; not the runtime owner)
 **Runtime owner:** W5 — this document qualifies their implementation and changes none of it
 **Qualification suite:** `tests/test_lifecycle_qualification_independent.py` (one owned file)
-**Status:** **not qualified.** Against the owner's published head `9d2bd8db`, seven invariants do
-not pass (six assertion failures and one error); an eighth, found at the admission base, was
-repaired by the owner and is kept as a passing regression. Each failure is recorded below with its
-exact test name, command, observed behaviour and the smallest owned-path patch suggestion for the
-source owner.
+**Status:** **not qualified.** Against the owner's published PR #8 head `0cca1b35`, **40 tests:
+36 pass, 4 fail** — four invariants do not pass. The owner repaired the seven findings this
+qualification had reported; they are now covered by passing regressions, and **four cases remain
+open** (D9–D12). Every failure is recorded below with its exact test name, command, observed
+behaviour and the smallest owned-path patch suggestion for the source owner.
 
 ## 1. The exact source base
 
 | Field | Value |
 | --- | --- |
 | Repository | `/Users/amf/Developer/.codex/fleet` (remote `0xPlayerOne/fleet`) |
-| **Admission base** | **`f4f26de14359d2f3b220fe5195f65c91a82c7b9f`** — "feat(fleet): one command to a total roster size, with a single writer lock" — the head W5 published at admission, treated as a provisional immutable test base |
-| **Owner final head** | **`9d2bd8db9432fe51c3848c8e143c50f3272be662`** — "feat(fleet): match the resolved session-create contract, and prove the reload" — published as `origin/feat/opencode-session-lifecycle-add-remove`, submitted for review by W5 at 2026-10-21T09:23:56Z (`review_ready`, task `20261021-w5-fleet-lifecycle-final-add-only-and-native-contract-proof-08`, state `done`) |
-| Owner branch | `feat/opencode-session-lifecycle-add-remove` (published; the local owner worktree `/Users/amf/Developer/.worktrees/fleet-opencode-session-lifecycle` is read-only for this qualification) |
-| **Qualification branch** | `codex/20261021-w8-independent-lifecycle-qualification`, head **`f7eca207d2c8b554dc16265163f77d54f3d1eaee`** (two commits on the owner final head) |
-| Qualification worktree | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8` |
-| Branch base | the two qualification commits were first built on `f4f26de` and then **rebased onto the owner final head** `9d2bd8db` once the owner's task reported terminal. The rebase replays **only W8's two commits**; no owner path was changed, and the diff against the owner branch is still exactly the two new paths |
-| Base provenance | W5's task was `working` when the suite was first built, so the qualification did not wait: it was built, checked and run against `f4f26de`, and the defects were routed back before the owner's task finished |
+| **Qualification base** | **`0cca1b35fa76fccde3bc8d11a6dd9bdfe6838462`** — "fix(fleet): close the seven reviewed lifecycle findings" — the published PR #8 head; the remote-tracking ref `origin/feat/opencode-session-lifecycle-add-remove` names exactly this commit |
+| **Qualification branch** | `codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` |
+| **Qualification worktree** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-0cca1b35` — created clean from that commit |
+| **Previous base (the comparison)** | `9d2bd8db9432fe51c3848c8e143c50f3272be662` — the head the previous report ran on; every invariant is compared against it (§3) |
+| **Previous branch (preserved, untouched)** | `codex/20261021-w8-independent-lifecycle-qualification` @ `6e3454ffd632bb1177821d5b4a08d93d82c5de0b` — the four earlier commits, the two artifacts and every earlier receipt are left exactly as they were |
+| Carry-forward | the four W8 commits were carried onto the new base with `git cherry-pick` (`927f855`, `f7eca20`, `b6d6de3`, `6e3454ff` → `b10a617`, `88693b7`, `bc0de8a`, `1b34baa`). They touch **only** the two owned paths, so nothing of W5's source is rewritten or duplicated |
+| Owned delta against the base | exactly two new paths: `tests/test_lifecycle_qualification_independent.py`, `docs/lifecycle-qualification-independent.md` |
+| W5's branch and worktree | **untouched.** `feat/opencode-session-lifecycle-add-remove` still names `0cca1b35`; their worktree's uncommitted tree was not read, copied, merged or stashed — only the fact that it carries uncommitted work was observed |
+| Operations not performed | no fetch, no pull, no reset, no stash, no prune, no rebase of the previous branch, no mutation of W5's branch, no publication |
 
-The admission base and the owner final head are both reported because the evidence has two parts:
-what the published base did (§3, D1–D5) and what the owner's published head still does (§3,
-final-head status). **Qualification is not declared: the same suite does not pass on the published
-head** (§3, §6).
-
-**The published head under review, re-verified read-only.** The owner's continuation
-`20261021-w5-fleet-lifecycle-seven-final-review-findings-repair-09` was **working** when this
-qualification re-checked it (live manager view, session `ses_a028b8fd0eed4f2c985ed1e0fa`, turn
-`31e6197a-afca-4401-91a5-6caf7e5c10d8`, updated 2026-10-21T09:52:09Z; task sent 09:44:33Z,
-consumed 09:44:57Z). Its worktree carries **uncommitted** changes to
-`src/fleet/control.py`, `src/fleet/manager.py`, `src/fleet/model_selection.py`,
-`src/fleet/opencode_lifecycle.py`, `src/fleet/roster.py`, `tests/test_opencode_lifecycle.py` and a
-new `tests/test_lifecycle_findings.py`. **None of that tree was read, and none of it was
-integrated**: only the path names were observed, through `git status --porcelain`, to establish
-that there is uncommitted work and that the published head is still the head under review. The
-published head remains `9d2bd8db` — the local remote-tracking ref
-`origin/feat/opencode-session-lifecycle-add-remove` says so, and it is the head this qualification
-verified as published at the previous checkpoint. The remote could **not** be re-fetched for a
-fresh confirmation: `git ls-remote https://github.com/0xPlayerOne/fleet.git` fails with
-`could not read Username for 'https://github.com': Device not configured`, because this worker has
-no GitHub authorization. That limitation is stated rather than worked around; the immutable head
-this qualification ran against is the commit `9d2bd8db` itself.
+The base moved because the owner published the repair of the seven reviewed findings. This
+qualification therefore starts a **separate clean worktree and branch from exactly that commit** and
+carries its own artifacts forward, so the previous branch, its commits and its receipts stay
+intact and independently checkable.
 
 ## 2. What the suite covers, and what it deliberately does not
 
@@ -99,6 +83,14 @@ dedicated test (§3, D1).
 | **The same key never creates a second native session after a takeover** | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | barrier | **FAIL (D6)** |
 | **A partial-create crash leaves the request uncertain instead of creating again** | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | fault injection | **FAIL (D7)** |
 | **A dry run does not mutate a receipt** | `test_a_dry_run_does_not_mutate_a_receipt` | fault injection | **FAIL (D8)** |
+| **An existing empty or whitespace-only queue file refuses the removal** | `test_an_existing_empty_queue_file_refuses_the_removal` | fault injection | **FAIL (D9)** |
+| **An existing queue file without a tasks list refuses the removal** | `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal` | fault injection | **FAIL (D10)** |
+| **A truncated queue file refuses the removal** | `test_a_truncated_queue_file_refuses_the_removal` | fault injection | pass |
+| **A missing queue file is distinguished from an unreadable one** | `test_a_missing_queue_file_is_distinguished_from_an_unreadable_one` | fault injection | pass |
+| **An out-of-band configuration change after the snapshot is rejected** | `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | fault injection | **FAIL (D11)** |
+| **The compare-and-swap uses the digest captured with the snapshot** | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot` | fault injection | **FAIL (D12)** |
+| **A concurrent same-key request registers the worker exactly once** | `test_a_concurrent_same_key_request_registers_the_worker_exactly_once` | barrier | pass |
+| **A final intent never overwrites a registered request** | `test_a_final_intent_never_overwrites_a_registered_request` | — | pass |
 | The status report counts the roster and the receipts truthfully | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | — | pass |
 | **A recovery receipt refuses a turn whose cleanup is not confirmed** | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | fault injection | pass |
 | **A recovery receipt refuses a turn whose process is still live** | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | fault injection | pass |
@@ -115,11 +107,28 @@ Each item is a failing test in the committed suite. **No production fix is imple
 here**; the suggestion is the smallest change in the source owner's own paths, offered for the
 owner to accept, reject or re-shape.
 
-**Status against the owner published head `9d2bd8db`:** D1 is **repaired** by the owner's commit
-"match the resolved session-create contract, and prove the reload" — its test now passes. **D2, D3,
-D4 and D5 still fail**, unchanged, and they are retained here as the open regressions. **D6, D7 and
-D8 are the named review findings reproduced in this run**; all three still fail at the published
-head, so all three remain applicable.
+**Status against the owner published head `0cca1b35`, compared with `9d2bd8db`:**
+
+| Finding | At `9d2bd8db` | At `0cca1b35` | Owner fix observed in `0cca1b3` |
+| --- | --- | --- | --- |
+| D1 — request body does not conform to the proved schema | repaired | **pass** (regression kept) | `session_create_payload` and the resolved-type checks in the support probe |
+| D2 — an unreadable queue makes the removal barrier blind | fail | **pass** | `roster.QueueUnreadable`; the removal refuses |
+| D3 — terminal queue history blocks the removal | fail | **pass** | `queued_tasks_for` skips a task that is already in the ledger |
+| D4 — an import with a stale roster snapshot targets a removed worker | fail | **pass** | the roster is read again inside the writer lock; a removed worker is refused |
+| D5 — a model selection loses a concurrently added worker | fail | **pass** | the selection takes the roster lock before the model lock and writes through the compare-and-swap |
+| D6 — the same key creates a second native session after a takeover | fail | **pass** | the intent may only continue when the sessions it can account for cover the whole request |
+| D7 — a crash in the middle of a creation is not left uncertain | fail | **pass** | the same accounted-set rule |
+| D8 — a dry run mutates a receipt | fail | **pass** | the receipt reconciliation is skipped for a dry run |
+| D9 — an existing empty or whitespace queue file is treated as an empty queue | — | **FAIL** | not fixed: `if not raw.strip(): return []` |
+| D10 — an existing queue file without a tasks list is treated as an empty queue | — | **FAIL** | not fixed: `queue.get("tasks", [])` defaults to an empty list |
+| D11 — a configuration change after the model writer's snapshot is overwritten | — | **FAIL** | not fixed: the compare-and-swap digest is read again at write time |
+| D12 — the compare-and-swap does not use the digest captured with the snapshot | — | **FAIL** | the same cause as D11, observed directly |
+| D13 — a late same-key request creates a second native session and overwrites the registered intent | — | **FAIL** | not fixed: the guard reads the intent's status only when it is `creating` |
+
+**Nine of the twelve findings are repaired and covered by passing regressions; five cases remain
+open.** D11 and D12 are one cause with two observations: the model writer reads the configuration,
+then compares against a digest it reads **again** at write time, so the compare-and-swap can never
+detect a change that arrived in between.
 
 ### D1 — the session-create body does not conform to the schema the runtime proved
 
@@ -253,6 +262,78 @@ head, so all three remain applicable.
   receipts *after* the dry-run early return, so a dry run reports the plan and the receipt state it
   found, and changes nothing.
 
+### D9 — an existing empty or whitespace-only queue file is treated as an empty queue
+
+* **Test:** `test_an_existing_empty_queue_file_refuses_the_removal`
+  (class `QueueAndLedgerIntegrityTests`)
+* **Observed:** `AssertionError: ValueError not raised` — with a queue file that exists but carries
+  only whitespace, the removal **proceeded** and the worker left the roster.
+* **Why it matters:** the queue file is there, so the work in it is unknown. The owner's own rule
+  is "An unreadable or malformed queue is **not** an empty queue"; an existing file that carries
+  nothing readable is in the same position, and the current implementation answers it with
+  `if not raw.strip(): return []` — the empty answer — before the malformed check is reached.
+* **Smallest owned-path suggestion** (`src/fleet/roster.py`): treat an existing but empty or
+  whitespace-only file as unreadable, and keep only the **absent** file as the empty case, so the
+  two are no longer answered the same way.
+
+### D10 — an existing queue file without a tasks list is treated as an empty queue
+
+* **Test:** `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal`
+  (class `QueueAndLedgerIntegrityTests`)
+* **Observed:** `AssertionError: unexpectedly None` — the removal **proceeded**. The check
+  `not isinstance(queue.get("tasks", []), list)` cannot see the difference, because a missing
+  `tasks` key defaults to an empty **list**, which is a list.
+* **Why it matters:** a queue file that names no task list cannot be read; the work in it is
+  unknown, and the removal must refuse rather than report that nothing is waiting.
+* **Smallest owned-path suggestion** (`src/fleet/roster.py`): require the `tasks` key to be present
+  and to be a list, instead of defaulting it.
+
+### D11 — a configuration change after the model writer's snapshot is overwritten
+
+* **Test:** `test_an_out_of_band_config_change_after_the_snapshot_is_rejected`
+  (class `BarrierRaceTests`)
+* **Observed:** `AssertionError: ValueError not raised` — the model writer read the configuration,
+  another writer changed it, and the model writer's write **overwrote the change** instead of being
+  refused. The compare-and-swap did not fire.
+* **Why it matters:** the roster is the identity source of the fleet. A write that silently
+  discards a configuration change made in between loses whatever that change carried.
+* **Smallest owned-path suggestion** (`src/fleet/model_selection.py`): capture the configuration's
+  digest **together with the configuration** it read, and hand that digest to
+  `roster.write_config_cas` — not a digest read again at write time.
+
+### D12 — the compare-and-swap does not use the digest captured with the snapshot
+
+* **Test:** `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot`
+  (class `BarrierRaceTests`)
+* **Observed:** `AssertionError: ValueError not raised`. The digest handed to
+  `roster.write_config_cas` is the digest of the configuration **as it is at write time**, not the
+  one captured with the snapshot, so the comparison always matches and the compare-and-swap is
+  inert against any change that arrived in between.
+* **Why it matters:** this is the mechanism behind D11, observed directly: the guard exists and is
+  called, but it is given a digest that cannot disagree with the file it is about to write.
+* **Smallest owned-path suggestion** (`src/fleet/model_selection.py`): the same one — capture the
+  digest with the snapshot and pass that digest to the compare-and-swap.
+
+### D13 — a late same-key request creates a second native session and overwrites the registered intent
+
+* **Test:** `test_a_concurrent_same_key_request_creates_one_session_and_keeps_the_final_intent`
+  (class `BarrierRaceTests`)
+* **Observed:** `AssertionError: 2 != 1 : one key must create at most one native session` — with
+  the interleaving forced (the late request computes what it still needs before the first request
+  has registered anything, and reaches the writer lock after the first request has finished), **two
+  native sessions were created for one request key**. The late request's intent write also moves the
+  key's intent from `registered` back to `creating`, which is the property the owner's
+  `keep_registered` clause was added for.
+* **Why it matters:** the command's own contract is that the same key never adds twice. The guard
+  that enforces it refuses a request only while the intent says `creating` **and** names a live
+  creator; a request that arrives after the key was registered passes the guard, creates a second
+  native session, and then loses the compare-and-swap. That second native session exists in the
+  native inventory, is not in the roster, and is reported by neither request.
+* **Smallest owned-path suggestion** (`src/fleet/opencode_lifecycle.py`): re-read the request's
+  receipts and its intent **inside** the writer lock, immediately before the creation, and refuse a
+  request whose key is already registered — so the number of sessions to create is decided under the
+  lock rather than before it.
+
 ## 4. Candidate cases accepted and refused
 
 | Candidate | Accepted | Refused |
@@ -307,17 +388,38 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 
 | Command | Scope | Result |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite, at the **admission base** `f4f26de` | **29 tests: 24 pass, 4 assertion failures, 1 error** — 5 not passing (D1–D5) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `f4f26de`, including this suite | **492 tests: 11 failures, 1 error** — 5 of them D1–D5, **7 pre-existing** |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository at `f4f26de` **without** this file (it is the only `test_l*` module) | **463 tests: 7 failures** — the pre-existing baseline |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the suite at the published head `9d2bd8db`** | **32 tests: 25 pass, 6 assertion failures, 1 error** — 7 not passing (D2–D8); D1 passes |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `9d2bd8db`, including this suite | **507 tests: 13 failures, 1 error** — 7 of them D2–D8, 7 pre-existing |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository at `9d2bd8db` **without** this file | **475 tests: 7 failures** — the pre-existing baseline |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **this suite at the published head `0cca1b35`** | **40 tests: 35 pass, 5 fail** — D9, D10, D11, D12, D13. Identical on two consecutive runs (the concurrent case forces its interleaving) |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository **without** this file | **475 tests: 30 errors, 4 skipped, 0 failures** — the owner's own state at this head (§6.1) |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `0cca1b35`, including this suite | see §6.1 |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | the previous base `9d2bd8db` (the comparison) | 32 tests: 25 pass, 6 assertion failures, 1 error — D2–D8 |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the previous base `9d2bd8db`, without this file | 475 tests: 7 failures |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
-| `git diff --stat 9d2bd8db...codex/20261021-w8-independent-lifecycle-qualification` | the owned delta against the owner branch | two new paths only |
+| `git diff --stat 0cca1b35...codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` | the owned delta against the published head | two new paths only |
 
-**Per-test receipt at the published head `9d2bd8db`** (32 tests; the seven that do not pass are
-named, every other test passed):
+### 6.1 The owner's own suite at `0cca1b35` — a regression, preserved as a failure
+
+The owner's suite, **without** this qualification, is **475 tests with 30 errors** at this head
+(0 failures; the seven `tests/test_queue_runway.py` failures of the previous head are gone). The
+thirty errors are all one cause: the new `manager.import_queue` reads the roster with
+`paths.all_slots()`, which reads the configuration file, and the recovery, queued-holds and fleet
+fixtures do not have one — so `import_queue` raises `FileNotFoundError` before it can do anything:
+
+```
+File ".../src/fleet/manager.py", line 120, in import_queue
+    current = {slot["sessionId"] for slot in paths.all_slots()}
+File ".../src/fleet/paths.py", line 43, in slots
+    cfg = config() if cfg is None else cfg
+File ".../src/fleet/paths.py", line 27, in config
+    return json.loads(Path(path or CONFIG).read_text())
+FileNotFoundError: .../config/fleet.local.json
+```
+
+`paths.all_slots()` has a guard for exactly this case ("Legacy unit fixtures often replace the
+provider pair without creating a config file"), but it is unreachable: `slots(cfg)` is called
+before the guard, and it is `slots()` that reads the file. **This qualification does not touch the
+owner's tests or the owner's source; the failures are preserved and reported here for root.**
+
+### 6.2 Per-test receipt at the published head `0cca1b35`
 
 | # | Test | Class | Result |
 | --- | --- | --- | --- |
@@ -334,60 +436,32 @@ named, every other test passed):
 | 11 | `test_a_crashed_creator_leaves_the_request_uncertain_and_not_retryable` | `CrashAndUncertaintyTests` | pass |
 | 12 | `test_an_explicitly_named_session_is_registered_without_a_second_creation` | `CrashAndUncertaintyTests` | pass |
 | 13 | `test_a_native_effect_that_cannot_be_read_back_stays_uncertain` | `CrashAndUncertaintyTests` | pass |
-| 14 | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | `QueueAndLedgerIntegrityTests` | **FAIL (D2)** |
+| 14 | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | `QueueAndLedgerIntegrityTests` | pass (D2, repaired) |
 | 15 | `test_an_unreadable_task_ledger_refuses_the_removal_and_keeps_the_roster` | `QueueAndLedgerIntegrityTests` | pass |
-| 16 | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | `QueueAndLedgerIntegrityTests` | **ERROR (D3)** |
+| 16 | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | `QueueAndLedgerIntegrityTests` | pass (D3, repaired) |
 | 17 | `test_a_queue_entry_that_names_the_worker_is_never_lost_by_a_drain` | `QueueAndLedgerIntegrityTests` | pass |
-| 18 | `test_a_running_worker_is_never_removed` | `RemovalBarrierTests` | pass |
-| 19 | `test_a_removal_keeps_the_native_session_and_every_hold` | `RemovalBarrierTests` | pass |
-| 20 | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | `RemovalBarrierTests` | pass |
-| 21 | `test_an_active_worker_with_unpublished_work_is_never_removed` | `RemovalBarrierTests` | pass |
-| 22 | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | `BarrierRaceTests` | pass |
-| 23 | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | `BarrierRaceTests` | pass |
-| 24 | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | `BarrierRaceTests` | pass |
-| 25 | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | `BarrierRaceTests` | **FAIL (D4)** |
-| 26 | `test_a_model_selection_write_never_loses_a_roster_entry` | `BarrierRaceTests` | **FAIL (D5)** |
-| 27 | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | `ReceiptTruthfulnessTests` | pass |
-| 28 | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | `ReceiptTruthfulnessTests` | pass |
-| 29 | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | `ReceiptTruthfulnessTests` | pass |
-| 30 | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | `ReviewFindingReproductionTests` | **FAIL (D6)** |
-| 31 | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | `ReviewFindingReproductionTests` | **FAIL (D7)** |
-| 32 | `test_a_dry_run_does_not_mutate_a_receipt` | `ReviewFindingReproductionTests` | **FAIL (D8)** |
-
-**Baseline versus new failures.** The repository's own suite at `9d2bd8db`, without this file, is
-**475 tests with 7 failures**; with this file it is **507 tests with 13 failures and 1 error**. The
-7 owner failures are unchanged and are all in `tests/test_queue_runway.py`
-(`QueueRunwayTests`): `test_active_is_not_reserve`,
-`test_cycle_returns_early_when_runway_is_low`,
-`test_default_remains_nonblocking_snapshot_with_timeout_zero`,
-`test_pending_import_is_distinct_and_deduplicated`, `test_queued_successors_cover_both_workers`,
-`test_unapproved_or_unknown_targets_do_not_cover_workers` and
-`test_uncertain_and_finished_never_count`. Their symptom is a *session id* appearing in a
-report's task list where a task id was expected
-(`['b', 'ses_EXISTING000000000001'] != ['b']`). That is the same queue-history area as D3, and it
-is reported here as context for the owner, not as a finding of this qualification.
-
-**This suite adds no failure to the repository's own tests.** Every failure it contributes is one of
-its own seven, each of which is a retained defect reproduction.
-
-The repository has no separate lint or format tool (no CI workflow, no packaging configuration);
-the documented check is the unittest discovery above, plus a byte-compile of the owned file. The
-owned file follows the repository's style (module docstring, `unittest.TestCase` classes, no
-third-party imports, the same source-layout path bootstrap as the repository's own tests) and stays
-within 100 columns.
-
-**This suite adds no failure to the repository's own tests.** The 7 failures in the baseline run are
-present with or without this file, all in `tests/test_queue_runway.py`
-(`QueueRunwayTests`): `test_active_is_not_reserve`,
-`test_cycle_returns_early_when_runway_is_low`,
-`test_default_remains_nonblocking_snapshot_with_timeout_zero`,
-`test_pending_import_is_distinct_and_deduplicated`, `test_queued_successors_cover_both_workers`,
-`test_unapproved_or_unknown_targets_do_not_cover_workers` and
-`test_uncertain_and_finished_never_count`. They belong to the runtime owner's area and are
-**pre-existing at the published base**; the observed symptom is a *session id* appearing in a
-report's task list where a task id was expected
-(`['b', 'ses_EXISTING000000000001'] != ['b']`). That is the same queue-history area as D3, and it
-is reported here as context for the owner, not as a finding of this qualification.
+| 18 | `test_an_existing_empty_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | **FAIL (D9)** |
+| 19 | `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | **FAIL (D10)** |
+| 20 | `test_a_truncated_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
+| 21 | `test_a_missing_queue_file_is_distinguished_from_an_unreadable_one` | `QueueAndLedgerIntegrityTests` | pass |
+| 22 | `test_a_running_worker_is_never_removed` | `RemovalBarrierTests` | pass |
+| 23 | `test_a_removal_keeps_the_native_session_and_every_hold` | `RemovalBarrierTests` | pass |
+| 24 | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | `RemovalBarrierTests` | pass |
+| 25 | `test_an_active_worker_with_unpublished_work_is_never_removed` | `RemovalBarrierTests` | pass |
+| 26 | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | `BarrierRaceTests` | pass |
+| 27 | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | `BarrierRaceTests` | pass |
+| 28 | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | `BarrierRaceTests` | pass |
+| 29 | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | `BarrierRaceTests` | pass (D4, repaired) |
+| 30 | `test_a_model_selection_write_never_loses_a_roster_entry` | `BarrierRaceTests` | pass (D5, repaired) |
+| 31 | `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | `BarrierRaceTests` | **FAIL (D11)** |
+| 32 | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot` | `BarrierRaceTests` | **FAIL (D12)** |
+| 33 | `test_a_concurrent_same_key_request_creates_one_session_and_keeps_the_final_intent` | `BarrierRaceTests` | **FAIL (D13)** |
+| 34 | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | `ReviewFindingReproductionTests` | pass (D6, repaired) |
+| 35 | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | `ReviewFindingReproductionTests` | pass (D7, repaired) |
+| 36 | `test_a_dry_run_does_not_mutate_a_receipt` | `ReviewFindingReproductionTests` | pass (D8, repaired) |
+| 37 | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | `ReceiptTruthfulnessTests` | pass |
+| 38 | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | `ReceiptTruthfulnessTests` | pass |
+| 39 | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | `ReceiptTruthfulnessTests` | pass |
 
 The repository has no separate lint or format tool (no CI workflow, no packaging configuration);
 the documented check is the unittest discovery above, plus a byte-compile of the owned file. The
@@ -397,28 +471,31 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite does not pass on the published head.** Seven invariants do not pass at `9d2bd8db` —
-   D2, D3, D4, D5, D6, D7 and D8 (§3). Until the source owner repairs them — or records why the
+1. **The suite does not pass on the published head.** Five invariants do not pass at `0cca1b35` —
+   D9, D10, D11, D12 and D13 (§3). Until the source owner repairs them — or records why the
    invariant is wrong — this branch cannot be qualified.
-2. **The published head is not green in the repository's own suite either.** 7 tests in
-   `tests/test_queue_runway.py` fail at `9d2bd8db` with or without this qualification (§6). They
-   are the runtime owner's, and they are in the same queue-history area as D3.
-3. **D1 is repaired and kept as a regression.** Its test is retained in the suite and now passes on
-   `9d2bd8db`; it is not deleted, so the repair stays covered.
-4. **The owner's continuation has not published a head.** Task
-   `20261021-w5-fleet-lifecycle-seven-final-review-findings-repair-09` was still working with an
-   **uncommitted** tree when this ran (§1). That tree was not read and not integrated. When it
-   reaches a published checked head, the same suite must be re-run against that immutable head;
-   qualification is declared only if it passes there.
-5. **The published head could not be re-fetched for a second confirmation.** This worker has no
-   GitHub authorization, so `git ls-remote` fails (§1). The head this qualification ran against is
-   the commit `9d2bd8db` itself, and the local remote-tracking ref names it.
-6. **D1–D8 are observations, not verdicts.** The owner may show that an invariant is wrong; this
-   document then records that, exactly as the earlier Fleet audits record withdrawn claims
-   instead of editing them away.
-7. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
+2. **The published head is not green in the owner's own suite either.** Without this qualification,
+   the repository's own suite is **475 tests with 30 errors** at `0cca1b35` (§6.1): the new
+   `manager.import_queue` reads the configuration through `paths.all_slots()`, whose legacy
+   no-config-file guard is unreachable, so every fixture without a configuration file fails before
+   the import can run. Those errors are **preserved as failures** and are the owner's to fix; this
+   qualification changed nothing of theirs.
+3. **Nine of the twelve findings are repaired** and are now covered by passing regressions, so the
+   repairs stay protected. D1–D8's repairs are all covered by tests that remain in the suite.
+4. **D11 and D12 are one cause**, and D13 is a second window in the same area: the runtime decides
+   what a request still needs *before* it takes the writer lock, so a late same-key request can
+   create a second native session and move a registered intent back to `creating`.
+5. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
    disposable native CLI and a disposable fleet, which are outside this outcome's scope and outside
-   its authority.
+   its authority. In particular the D13 result is observed against the **fake** native server: the
+   second native session is real in the synthetic inventory, and nothing here says what a real
+   server would do with it.
+6. **The out-of-band change in D11 and D12 is written by the test itself**, bypassing the writer
+   lock, because that is what "out of band" means. A change that respects the lock cannot reach
+   that window, so the two cases describe the same exposure from two directions.
+7. **The published head was not re-fetched.** This worker has no GitHub authorization, so
+   `git ls-remote` fails; the head this qualification ran against is the commit `0cca1b35` itself,
+   and the local remote-tracking ref `origin/feat/opencode-session-lifecycle-add-remove` names it.
 8. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
-   documentation file was modified, and no live manager, session, configuration, registered
-   worktree or resource was touched.
+   documentation file was modified, W5's branch and worktree were not touched, and no live manager,
+   session, configuration, registered worktree or resource was changed.
