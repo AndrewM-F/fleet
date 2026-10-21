@@ -54,8 +54,15 @@ class RecoveryTests(unittest.TestCase):
                      "sessionCwd": str(self.native_cwd),
                      "databasePath": str(self.root / "native.db"), "model": opencode.MODEL,
                      "provider": "opencode", "dispatchEnabled": True}
-        with sqlite3.connect(self.slot["databasePath"]):
-            pass
+        # The disposable owned native identity of this worker: the session row the
+        # native side records, so the ownership paths can prove the session they
+        # name instead of patching the proof away.
+        with sqlite3.connect(self.slot["databasePath"]) as native:
+            native.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, project_id TEXT, "
+                           "model TEXT)")
+            native.execute("INSERT INTO session_v2 VALUES (?,?,?,?)",
+                           (self.sid, str(self.native_cwd.resolve()), "project-test",
+                            opencode.MODEL))
         self.other_slot = dict(self.slot, sessionId=self.other_sid,
                                cwd=str(self.other_native_cwd),
                                sessionCwd=str(self.other_native_cwd))

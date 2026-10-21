@@ -1,0 +1,214 @@
+"""A stale native identity cannot be adopted, and an adoption proves its session.
+
+CP #12 (Fleet issue #12) covers the stale identity and the ownership-adoption
+recovery path. The fixture below owns a disposable native session identity: the
+session row the native side records, next to a managed turn pointer, its turn
+receipts and a Fleet task ledger. Every proof therefore runs against a real
+identity row instead of a patched one, and a test can make that identity stale
+by removing the row or by pointing it at another directory.
+
+Nothing here touches a live fleet, a live configuration, a live native database
+or a credential: the root, the roster, the ledger, the native identity and the
+checkout are all disposable fixtures under a temporary directory.
+"""
+import json
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from fleet import opencode, paths, recovery, store  # noqa: E402
+
+
+class StaleIdentityAdoptionTests(unittest.TestCase):
+    """The ownership adoption proves the native session it names."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cwd = self.root / "worktree"
+        self.cwd.mkdir()
+        self.native_cwd = self.root / "native-worker"
+        self.native_cwd.mkdir()
+        self.other_cwd = self.root / "other-worker"
+        self.other_cwd.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "repair", str(self.cwd)], check=True)
+        subprocess.run(["git", "-C", str(self.cwd), "config", "user.email", "fleet@test"],
+                       check=True)
+        subprocess.run(["git", "-C", str(self.cwd), "config", "user.name", "Fleet Test"],
+                       check=True)
+        (self.cwd / "partial.txt").write_text("preserve this partial work\n")
+        subprocess.run(["git", "-C", str(self.cwd), "add", "partial.txt"], check=True)
+        subprocess.run(["git", "-C", str(self.cwd), "commit", "-qm", "fixture"], check=True)
+        self.sid = "ses_stale_identity"
+        self.turn = "turn_failed_1"
+        self.failed_task = "failed-task"
+        self.owner_task = "owner-task"
+        self.successor = "successor-task"
+        self.native_db = self.root / "native.db"
+        self.slot = {"sessionId": self.sid, "cwd": str(self.native_cwd.resolve()),
+                     "sessionCwd": str(self.native_cwd.resolve()),
+                     "databasePath": str(self.native_db), "model": opencode.MODEL,
+                     "provider": "opencode", "dispatchEnabled": True}
+        self.write_native_identity(self.native_cwd)
+        self.db_path = self.root / "fleet.sqlite"
+        self.db = store.database(self.db_path)
+        self.addCleanup(self.db.close)
+        self.addCleanup(self.tmp.cleanup)
+        self.data = self.root / "data"
+        self.queue = self.data / "queue.json"
+        self.queue.parent.mkdir(parents=True, exist_ok=True)
+        for name, value in (("OPENCODE", self.data / "opencode"), ("LOGS", self.root / "logs"),
+                            ("BIN", self.root / "bin" / "fleet"), ("QUEUE", self.queue),
+                            ("QUEUE_LOCK", self.data / "queue.lock"),
+                            ("PAUSE", self.data / "dispatch.paused"), ("DATA", self.data)):
+            patcher = patch.object(paths, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.config_path = self.root / "synthetic-fleet.json"
+        # A synthetic CLI executable: the lifecycle proofs resolve it, and nothing
+        # in this module ever runs it.
+        self.fake = self.root / "fake-opencode"
+        self.fake.write_text("#!/bin/sh\nexit 0\n")
+        self.fake.chmod(0o755)
+        self.config_path.write_text(json.dumps(
+            {"executables": {"opencode": str(self.fake)},
+             "pi": [], "claude": [], "opencode": [self.slot]}))
+        config_patcher = patch.object(paths, "CONFIG", self.config_path)
+        config_patcher.start()
+        self.addCleanup(config_patcher.stop)
+        self.prepare_failure()
+        for task_id, message in ((self.failed_task, "the failed managed turn"),
+                                  (self.owner_task,
+                                   "create the isolated worktree and branch for this work, "
+                                   "then continue")):
+            self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                            (task_id, self.sid, str(self.native_cwd.resolve()),
+                             json.dumps({"message": message, "sessionId": self.sid,
+                                         "rootAuthorized": True}), "finished", 1))
+        self.db.commit()
+
+    # --- the disposable owned identity and turn ---------------------------
+    def write_native_identity(self, directory, model=opencode.MODEL, session_id=None):
+        """Record the native session identity this fixture owns."""
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("CREATE TABLE IF NOT EXISTS session_v2 (id TEXT, directory TEXT, "
+                           "project_id TEXT, model TEXT)")
+            native.execute("DELETE FROM session_v2")
+            native.execute("INSERT INTO session_v2 VALUES (?,?,?,?)",
+                           (session_id or self.sid, str(Path(directory).resolve()),
+                            "project-test", model))
+
+    def drop_native_identity(self):
+        """Make the native identity stale: the session row is gone."""
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("DROP TABLE IF EXISTS session_v2")
+
+    def prepare_failure(self):
+        """The managed turn that failed, with its pointer and its receipts."""
+        session = paths.OPENCODE / self.sid
+        turn_dir = session / "turns" / self.turn
+        turn_dir.mkdir(parents=True, exist_ok=True)
+        launch = {"turn": self.turn, "taskId": self.failed_task, "sessionId": self.sid,
+                  "cwd": str(self.native_cwd.resolve()), "model": opencode.MODEL}
+        (session / "current.json").write_text(json.dumps(launch))
+        state = dict(launch, state="error", cleanup="confirmed",
+                     error="OpenCode turn did not produce a verified native completion",
+                     finishedAt=100)
+        result = dict(turn=self.turn, taskId=self.failed_task, sessionId=self.sid,
+                      cwd=str(self.native_cwd.resolve()), expectedModel=opencode.MODEL,
+                      state="error", cleanup="confirmed", error=state["error"], toolFailures=[],
+                      finishedAt=100,
+                      managedProcessIdentity={"pid": 9999999, "pgid": 9999999, "start": [1],
+                                              "executable": "/usr/bin/opencode"})
+        (turn_dir / "state.json").write_text(json.dumps(state))
+        (turn_dir / "result.json").write_text(json.dumps(result))
+
+    # --- the two calls under test ------------------------------------------
+    def adoption_inputs(self, **overrides):
+        snapshot = recovery.worktree_snapshot(self.cwd)
+        values = {"adoption_id": "adoption-1", "owner_task_id": self.owner_task,
+                  "session_id": self.sid, "failed_task_id": self.failed_task,
+                  "turn": self.turn, "owned_worktree": str(self.cwd.resolve()),
+                  "branch": snapshot["branch"], "head": snapshot["head"],
+                  "worktree_sha256": snapshot["worktreeSha256"],
+                  "decision": "adopt this checkout as the worker's explicitly owned worktree",
+                  "evidence_reference": "operator-handoff:W4-2026-10-21T09:00Z",
+                  "ownership_evidence": ("W4 handoff: the operator confirmed this isolated "
+                                         "checkout and branch are the ones the owner task used "
+                                         "for this worker, and that the checkout is unchanged."),
+                  "note": "ownership adoption for the original owner task"}
+        values.update(overrides)
+        return values
+
+    def adopt(self, **overrides):
+        return recovery.adopt_ownership(self.db, **self.adoption_inputs(**overrides))
+
+    def authorize(self, **overrides):
+        snapshot = recovery.worktree_snapshot(self.cwd)
+        values = {"session_id": self.sid, "failed_task_id": self.failed_task, "turn": self.turn,
+                  "recovery_id": "recovery-1", "successor_task_id": self.successor,
+                  "ownership_task_id": self.owner_task, "adoption_id": "adoption-1",
+                  "owned_worktree": str(self.cwd.resolve()), "branch": snapshot["branch"],
+                  "head": snapshot["head"], "worktree_sha256": snapshot["worktreeSha256"],
+                  "note": "confirmed failed completion and preserved partial checkout"}
+        values.update(overrides)
+        return recovery.authorize_opencode(self.db, **values)
+
+    # --- the proofs ---------------------------------------------------------
+    def test_the_adoption_proves_the_native_identity_and_records_the_evidence(self):
+        adopted = self.adopt()
+        self.assertEqual(adopted, {"adoptionId": "adoption-1", "alreadyRecorded": False})
+        record = recovery.adoption_record(self.db, "adoption-1")
+        self.assertEqual(record["owner_sid"], self.sid)
+        self.assertEqual(record["owner_task_id"], self.owner_task)
+
+    def test_a_stale_native_identity_is_refused_and_records_nothing(self):
+        self.drop_native_identity()
+        with self.assertRaisesRegex(ValueError, "native session identity"):
+            self.adopt()
+        self.assertIsNone(recovery.adoption_record(self.db, "adoption-1"))
+        kinds = [row[0] for row in self.db.execute("SELECT kind FROM events ORDER BY id")]
+        self.assertNotIn("recovery_ownership_adopted", kinds)
+        # The failed task, the owner task and the turn history are untouched.
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks").fetchone()[0], 2)
+        self.assertTrue((paths.OPENCODE / self.sid / "current.json").is_file())
+
+    def test_a_native_identity_that_points_elsewhere_is_refused(self):
+        self.write_native_identity(self.other_cwd)
+        with self.assertRaisesRegex(ValueError, "native session identity"):
+            self.adopt()
+        self.assertIsNone(recovery.adoption_record(self.db, "adoption-1"))
+
+    def test_a_session_that_went_stale_after_the_adoption_reserves_nothing(self):
+        self.adopt()
+        self.drop_native_identity()
+        with self.assertRaisesRegex(ValueError, "native session identity"):
+            self.authorize()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
+        # No successor task, no queue entry and no reservation of any kind.
+        self.assertEqual(self.db.execute("SELECT count(*) FROM tasks").fetchone()[0], 2)
+        self.assertFalse(self.queue.exists())
+
+    def test_the_proved_identity_authorizes_the_adopted_recovery(self):
+        self.adopt()
+        result = self.authorize()
+        self.assertEqual(result["status"], "authorized")
+        row = self.db.execute("SELECT status,adoption_id,owner_sid FROM recoveries "
+                               "WHERE id='recovery-1'").fetchone()
+        self.assertEqual(row, ("authorized", "adoption-1", self.sid))
+        # The owner task's own message is never rewritten.
+        self.assertEqual(self.db.execute("SELECT body FROM tasks WHERE id=?",
+                                         (self.owner_task,)).fetchone()[0],
+                         json.dumps({"message": "create the isolated worktree and branch for this "
+                                               "work, then continue", "sessionId": self.sid,
+                                     "rootAuthorized": True}))
+
+
+if __name__ == "__main__":
+    unittest.main()

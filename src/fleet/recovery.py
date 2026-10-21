@@ -185,6 +185,29 @@ def adoption_record(db, adoption_id):
     return dict(zip(names, row))
 
 
+def _prove_native_identity(slot, session_id, cwd):
+    """Prove that the native session behind this worker is still the same one.
+
+    The managed turn pointer, the turn receipts and the task ledger prove that
+    a turn happened for this worker. They do not prove that the native session
+    itself is still the session the roster names: a native identity that has
+    gone stale (the session row is gone, or it points at another directory) is
+    unreadable, and ownership evidence for it would be recorded against a
+    session the Fleet cannot prove.
+
+    The direct-turn receipt already proves the native session before it is
+    accepted as an ownership source. The adoption is the other ownership source
+    that substitutes for durable history, so it proves the same thing, and it
+    proves it again when the adoption is consumed: a session that went stale
+    between the adoption and the authorization reserves nothing.
+    """
+    try:
+        return opencode.verify_native_session(session_id, cwd, slot.get("databasePath"))
+    except (ValueError, OSError) as error:
+        raise ValueError("The native session identity of this worker could not be verified: "
+                         + str(error)) from error
+
+
 def _verify_pointer_identity(session_id, failed_task_id, turn, cwd, model):
     pointer = opencode.session_dir(session_id) / "current.json"
     if not pointer.is_file():
@@ -305,6 +328,10 @@ def adopt_ownership(db, *, adoption_id, owner_task_id, session_id, failed_task_i
     if failed[2] != "finished":
         raise ValueError("Failed task must remain terminal before adoption")
     _verify_pointer_identity(session_id, failed_task_id, turn, cwd, configured_model)
+    # The adoption stands in for durable owner history, so it proves the native
+    # session itself before the evidence is recorded. A stale native identity
+    # records nothing.
+    _prove_native_identity(slots[0], session_id, cwd)
 
     snapshot = worktree_snapshot(worktree)
     if (snapshot["branch"] != branch or snapshot["head"] != head
@@ -826,6 +853,10 @@ def authorize_opencode(db, *, session_id, failed_task_id, turn, recovery_id,
                      "failed_task_id": failed_task_id, "cwd": cwd,
                      "owned_worktree": worktree, "branch": branch, "head": head,
                      "worktree_sha256": worktree_sha256}, adoption_id)
+            # The adoption is the ownership source here, so the native session
+            # behind it is proved again: a session that went stale after the
+            # adoption reserves no worker, no worktree and no successor.
+            _prove_native_identity(slot, session_id, cwd)
         elif worktree not in ownership_message or branch not in ownership_message:
             raise ValueError("Owned worktree and branch are not recorded by this worker's owner task")
     task = db.execute("SELECT sid,cwd,state FROM tasks WHERE id=?", (failed_task_id,)).fetchone()

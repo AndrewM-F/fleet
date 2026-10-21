@@ -51,6 +51,13 @@ command prints JSON on stdout and exits non-zero on failure.
   authorization and dispatch revalidate the same record and fail closed if it is missing or the
   checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
   or any other field is rejected; an exact replay remains idempotent across restart.
+  The adoption also proves the native session it names, exactly as the direct-turn receipt
+  does: the session row is read from the native database and must still be the session the
+  roster names, in the recorded working directory. A native identity that has gone stale (the
+  session row is gone, or it points at another directory) is refused, and the adoption records
+  nothing. The same proof runs again when the adoption is consumed by `recover-opencode`, so a
+  session that went stale between the adoption and the authorization reserves no worker, no
+  worktree and no successor.
   A genuine native turn that predates the Fleet task ledger has no owner task row at all. For
   that case `bin/fleet recover-opencode --direct-turn-receipt PATH` is the ownership source
   instead of `--ownership-task` or `--adoption-id`; exactly one ownership source is accepted. The
