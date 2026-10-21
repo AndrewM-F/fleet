@@ -69,6 +69,13 @@ class FakeProcess:
 
 class OpenCodeAdapterTests(unittest.TestCase):
     def setUp(self):
+        # Synthetic adapter fixture: real backend enforcement is tested separately.
+        for boundary, replacement in (
+                ("pre_prompt", lambda request: None),
+                ("launch", lambda request, args, **kwargs: opencode.subprocess.Popen(args, **kwargs))):
+            gate = patch.object(opencode.credential_isolation, boundary, side_effect=replacement)
+            gate.start()
+            self.addCleanup(gate.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.cwd = root / "worktree"
@@ -224,7 +231,8 @@ class OpenCodeAdapterTests(unittest.TestCase):
             on_exit = None
             if completion is not None:
                 options = {} if completion is True else dict(completion)
-                on_exit = lambda: self.persist_completion(request_path, events, **options)
+                def on_exit():
+                    return self.persist_completion(request_path, events, **options)
             return FakeProcess(*args, events=events, code=code, on_exit=on_exit, **kwargs)
         def fake_identity(pid):
             return dict(self.identity, pid=int(pid), pgid=int(pid))

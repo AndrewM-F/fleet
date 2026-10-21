@@ -17,6 +17,13 @@ from fleet import control, dispatch, holds, manager, opencode, ops, paths, recov
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
+        # Synthetic adapter fixture: real backend enforcement is tested separately.
+        for boundary, replacement in (
+                ("pre_prompt", lambda request: None),
+                ("launch", lambda request, args, **kwargs: opencode.subprocess.Popen(args, **kwargs))):
+            gate = patch.object(opencode.credential_isolation, boundary, side_effect=replacement)
+            gate.start()
+            self.addCleanup(gate.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.cwd = self.root / "worktree"
@@ -72,6 +79,13 @@ class RecoveryTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Never depend on an ignored local fleet config in the source checkout.
+        config_path = self.root / "synthetic-fleet.json"
+        config_path.write_text(json.dumps({"pi": [], "claude": [], "opencode": [self.slot, self.other_slot]}))
+        for name, value in (("CONFIG", config_path), ("DATA", self.data)):
+            fixture_path = patch.object(paths, name, value)
+            fixture_path.start()
+            self.addCleanup(fixture_path.stop)
         self.slot_patch = patch.object(paths, "opencode_slots",
                                        return_value=[self.slot, self.other_slot])
         self.slot_patch.start()
