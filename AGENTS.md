@@ -131,10 +131,13 @@ command prints JSON on stdout and exits non-zero on failure.
   request was going to create. A receipt for an earlier creation, or a partial reconciliation,
   leaves a native effect unaccounted, so the request stays uncertain until the exact identities
   are named. A dry run
-  writes nothing at all, not even the receipt a reconciliation would have made. The initial intent
-  for a request key rechecks the bound payload and the terminal state under the writer lock, so a
-  stale caller returns idempotently or refuses and never overwrites a request another caller has
-  already completed. The creation call is proved against
+  writes nothing at all, not even the receipt a reconciliation would have made. The decision for a
+  request key is taken under the writer lock, against the row, its payload digest and every session
+  receipt as they are there, and the number of sessions to create is counted there as well. A stale
+  caller that planned from an earlier snapshot therefore returns idempotently or refuses: it never
+  creates an extra session or a subset, never takes over a live creator because that creator has
+  receipts, and never overwrites a request another caller completed or left uncertain. An uncertain
+  request stays blocked until the exact identities are named and verified. The creation call is proved against
   the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare the
   resolved shape — the model as a `Model.Ref` object with a required `id` and `providerID`, the
   location as a `Location.PublicRef` object with a required `directory`, and no other property —

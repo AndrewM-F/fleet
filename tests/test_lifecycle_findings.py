@@ -336,13 +336,13 @@ class DryRunWriteTests(FindingSandbox):
             db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
                        ("ses_UNVERIFIED0000000001", str(self.wt), "p", MODEL))
         before = self.db.execute("SELECT status FROM opencode_sessions").fetchall()
-        # The dry run still refuses the uncertain attempt, and it refuses without
-        # having written the promotion the reconciliation would have made.
-        with self.assertRaises(ValueError) as error:
-            opencode_lifecycle.add_sessions(
-                self.db, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
-                request_key="w5-dry-001", dry_run=True)
-        self.assertIn("uncertain", str(error.exception))
+        # The dry run reports the request's state and writes nothing: not the
+        # promotion the reconciliation would have made.
+        result = opencode_lifecycle.add_sessions(
+            self.db, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+            request_key="w5-dry-001", dry_run=True)
+        self.assertTrue(result["dryRun"])
+        self.assertEqual(result["requestStatus"], "creating")
         after = self.db.execute("SELECT status FROM opencode_sessions").fetchall()
         self.assertEqual(before, after, "the dry run changed a receipt")
         self.assertEqual(self.db.execute("SELECT status FROM opencode_provisioning "
@@ -564,6 +564,98 @@ class StaleCallerTests(FindingSandbox):
         self.assertEqual(row[7], "registered")
         # One native session, one roster entry: the second caller added nothing.
         self.assertEqual(len(paths.config()["opencode"]), 2)
+
+
+class StaleSnapshotBarrierTests(FindingSandbox):
+    """A caller that planned from a stale snapshot creates nothing and overwrites nothing."""
+
+    def creations(self):
+        if not self.fake_log.exists():
+            return []
+        return [json.loads(line) for line in self.fake_log.read_text().splitlines()
+                if line.strip() and "POST" in line and "/api/session" in line]
+
+    def test_a_stale_caller_creates_nothing_and_never_overwrites(self):
+        # B takes its snapshot and pauses. A runs the request, creates its
+        # native session and pauses before the roster registration. B resumes
+        # with the snapshot it took before any of that.
+        b_snapshot = threading.Event()
+        release_b = threading.Event()
+        a_effect = threading.Event()
+        release_a = threading.Event()
+        real_intent = opencode_lifecycle._locked_intent
+        real_record = opencode_lifecycle._record_provisioning
+        outcome = {"b": None, "a": None}
+
+        def intent(db, key, request, count, entries, digest, reconciled, current_total, note):
+            if threading.current_thread() is b_thread:
+                b_snapshot.set()
+                release_b.wait(60)
+            return real_intent(db, key, request, count, entries, digest, reconciled,
+                               current_total, note)
+
+        def record(db, key, request, status, detail="", count=None, payload_digest="",
+                   creator_pid=0, keep_registered=False):
+            if (threading.current_thread() is a_thread and status == "creating"
+                    and detail.startswith("{")):
+                # A has created its native session and recorded the ids; it
+                # pauses before the roster registration.
+                a_effect.set()
+                release_a.wait(60)
+            return real_record(db, key, request, status, detail, count, payload_digest,
+                               creator_pid, keep_registered)
+
+        def run_b():
+            connection = store.database(paths.DB)
+            try:
+                outcome["b"] = opencode_lifecycle.add_sessions(
+                    connection, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                    request_key="w5-barrier-001")
+            except Exception as error:  # noqa: BLE001 - the refusal is the result
+                outcome["b"] = {"error": str(error)}
+            finally:
+                connection.close()
+
+        def run_a():
+            connection = store.database(paths.DB)
+            try:
+                outcome["a"] = opencode_lifecycle.add_sessions(
+                    connection, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                    request_key="w5-barrier-001")
+            except Exception as error:  # noqa: BLE001 - the refusal is the result
+                outcome["a"] = {"error": str(error)}
+            finally:
+                connection.close()
+
+        b_thread = threading.Thread(target=run_b)
+        a_thread = threading.Thread(target=run_a)
+        with patch.object(opencode_lifecycle, "_locked_intent", side_effect=intent), \
+             patch.object(opencode_lifecycle, "_record_provisioning", side_effect=record):
+            b_thread.start()
+            self.assertTrue(b_snapshot.wait(60), "B never took its snapshot")
+            a_thread.start()
+            self.assertTrue(a_effect.wait(120), "A never reached its native effect")
+            # B resumes with the snapshot it took before A's effect.
+            release_b.set()
+            b_thread.join(60)
+            self.assertIn("error", outcome["b"], "B did not refuse the taken-over request")
+            self.assertIn("in progress", outcome["b"]["error"])
+            # Exactly one native session was created: B created nothing.
+            self.assertEqual(len(self.creations()), 1)
+            # B wrote no roster entry and left the request's row alone.
+            self.assertEqual(len(paths.config()["opencode"]), 1)
+            row = opencode_lifecycle._provisioning_row(self.db, "w5-barrier-001")
+            self.assertEqual(row[7], "creating")
+            # A finishes its registration.
+            release_a.set()
+            a_thread.join(120)
+        self.assertNotIn("error", outcome["a"])
+        self.assertEqual(len(self.creations()), 1)
+        self.assertEqual(len(paths.config()["opencode"]), 2)
+        row = opencode_lifecycle._provisioning_row(self.db, "w5-barrier-001")
+        self.assertEqual(row[7], "registered")
+        receipts = opencode_lifecycle._session_receipts(self.db, "w5-barrier-001")
+        self.assertEqual([receipt["status"] for receipt in receipts], ["registered"])
 
 
 if __name__ == "__main__":

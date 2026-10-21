@@ -93,9 +93,13 @@ never invents a session id, so the id in a receipt is always the id the native s
   worker that is gone. Every roster write is a compare-and-swap against the configuration the
   writer started from: a writer that takes the lock is never overwritten, and a writer that ignores
   it is not protected.
-  The initial intent for a request key rechecks the bound payload and the terminal state under
-  the writer lock: a stale caller returns idempotently or refuses, and it never overwrites a
-  request another caller has already completed as registered.
+  The decision for a request key is taken under the writer lock, against the row, its payload
+  digest and every session receipt as they are there, and the number of sessions to create is
+  counted there as well. A stale caller that planned from an earlier snapshot returns idempotently
+  or refuses: it never creates an extra session or a subset, never takes over a live creator
+  because that creator has receipts, and never overwrites a request another caller completed or
+  left uncertain. An uncertain request stays blocked until the exact identities are named and
+  verified.
 - A dry run writes nothing at all: no receipt, no provisioning row, no roster entry, no native
   state. A dry run that reconciles an uncertain attempt verifies but never records.
 - An interrupted attempt is only recoverable when the exact identities it holds — the sessions it

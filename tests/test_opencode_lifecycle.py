@@ -1112,6 +1112,10 @@ class CrashWindowTests(Sandbox):
         with patch.object(opencode_lifecycle, "_record_session", side_effect=fail_once):
             with self.assertRaises(KeyboardInterrupt):
                 self.add(count=1, request_key="w5-crash-001")
+        # The process that recorded the intent is gone, exactly as after a crash.
+        self.db.execute("UPDATE opencode_provisioning SET creator_pid=? WHERE request_key=?",
+                        (999999, "w5-crash-001"))
+        self.db.commit()
         self.assertEqual(len(self.creations()), 1)
         self.assertEqual(len(self.roster()), 2)
         resumed = self.add(count=1, request_key="w5-crash-001")
