@@ -15,9 +15,11 @@ behaviour and the smallest owned-path patch suggestion for the source owner.
 | --- | --- |
 | Repository | `/Users/amf/Developer/.codex/fleet` (remote `0xPlayerOne/fleet`) |
 | **Pinned base (the head this qualification was asked to complete)** | **`0cca1b35fa76fccde3bc8d11a6dd9bdfe6838462`** — "fix(fleet): close the seven reviewed lifecycle findings" |
-| **Current published PR #8 head** | **`709dfcb1733fdd86fe4f1bd866aa636de436979a`** — "fix(fleet): hold the queue evidence, the snapshot and the stale caller"; `origin/feat/opencode-session-lifecycle-add-remove` and the local owner branch both name it. It was published **during** this run, and the suite was re-run against it (§1.1) |
+| **Head this qualification was asked to complete** | `709dfcb1733fdd86fe4f1bd866aa636de436979a` — "fix(fleet): hold the queue evidence, the snapshot and the stale caller"; verified as the published head before the qualification started, and qualified as such (42 pass / 1 fail) |
+| **Current published PR #8 head** | **`20670971fc84709ca85b5d60e2f06dd5e51a4543`** — "fix(fleet): decide the request under the writer lock"; `origin/feat/opencode-session-lifecycle-add-remove` and the local owner branch both name it. It was published **during** this run, and the same suite was carried onto it and re-run there: **43 pass / 0 fail** (§1.1) |
 | **Qualification branch at the pinned base** | `codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` @ `8ea3e6650149d68c1b857e6ee67f5b10dab88367` — 35 pass, 5 fail |
-| **Qualification branch at the current published head** | `codex/20261021-w8-independent-lifecycle-qualification-at-709dfcb` @ `520bbbb` — **40 pass, 0 fail** |
+| **Qualification branch at the current published head** | `codex/20261021-w8-independent-lifecycle-qualification-at-20670971` @ `2a32fd8` — **43 pass, 0 fail** |
+| **Qualification branch at `709dfcb`** | `codex/20261021-w8-independent-lifecycle-qualification-at-709dfcb` @ `e75e6ce` — 42 pass, 1 fail (D14) |
 | **Qualification worktrees** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-0cca1b35` and `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-709dfcb` — each created clean from exactly its base |
 | **Previous base (the comparison)** | `9d2bd8db9432fe51c3848c8e143c50f3272be662` — the head the previous report ran on; every invariant is compared against it (§3) |
 | **Previous branch (preserved, untouched)** | `codex/20261021-w8-independent-lifecycle-qualification` @ `6e3454ffd632bb1177821d5b4a08d93d82c5de0b` — the four earlier commits, the two artifacts and every earlier receipt are left exactly as they were |
@@ -42,7 +44,8 @@ clean worktree and branch and re-run there:
 | Head | Branch | Suite |
 | --- | --- | --- |
 | `0cca1b35` (pinned) | `…-at-0cca1b35` @ `8ea3e66` | 40 tests: **35 pass, 5 fail** (D9–D13) |
-| `709dfcb` (current published) | `…-at-709dfcb` @ `520bbbb` | 40 tests: **40 pass, 0 fail** |
+| `709dfcb` (the head this qualification was asked to complete) | `…-at-709dfcb` @ `e75e6ce` | 43 tests: **42 pass, 1 fail** (D14) |
+| `20670971` (current published) | `…-at-20670971` @ `2a32fd8` | 43 tests: **43 pass, 0 fail** |
 
 The repair is visible in the diff: `model_selection._apply` now reads the digest **before** the
 configuration and hands that digest to `roster.write_config_cas` (D11, D12), and `roster.py` and
@@ -144,7 +147,7 @@ owner to accept, reject or re-shape.
 | D11 — a configuration change after the model writer's snapshot is overwritten | — | **FAIL** | not fixed: the compare-and-swap digest is read again at write time |
 | D12 — the compare-and-swap does not use the digest captured with the snapshot | — | **FAIL** | the same cause as D11, observed directly |
 | D13 — a late same-key request creates a second native session and overwrites the registered intent | — | **FAIL** | not fixed at `0cca1b35`: the guard reads the intent's status only when it is `creating` |
-| **D14 — a late same-key request that resumes after an uncertain attempt creates a second native session and overwrites the uncertain intent** | — | — (first seen at `709dfcb`) | **FAIL at `709dfcb`**: the lock-time checks cover `registered` and `creating`, but not `uncertain` |
+| **D14 — a late same-key request that resumes after an uncertain attempt creates a second native session and overwrites the uncertain intent** | — | — (first seen at `709dfcb`) | **FAIL at `709dfcb`** (the lock-time checks covered `registered` and `creating`, but not `uncertain`) → **pass at `20670971`**: the request is now decided under the writer lock |
 
 **At the owner's current published head `709dfcb` every one of these passes** (§1.1): the suite is
 40 tests, 40 pass, 0 fail. The table above is the record of what each finding was, so the repair
@@ -544,12 +547,11 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **One invariant does not hold at the published head `709dfcb`.** The suite is 43 tests: 42 pass
-   and **1 fail** — D14, the late same-key caller that resumes after an uncertain attempt
-   (§3). The other two race cases, and every earlier finding, hold. The fail-closed property for an
-   uncertain intent is decided from the caller's early snapshot instead of the durable row read
-   under the writer lock, so a late caller can create a second native session and overwrite the
-   uncertain state.
+1. **No invariant of this qualification fails at the current published head `20670971`** — 43
+   tests, 43 pass. D14, which failed at `709dfcb`, is repaired there by deciding the request under
+   the writer lock, and the repair is covered by the regression that found it. The `709dfcb` result
+   (42 pass, 1 fail) and the `0cca1b35` result (35 pass, 5 fail) are retained separately and are
+   not evidence for a later head.
 2. **The published head is not green in the owner's own suite.** Without this qualification the
    repository is 475 tests with **30 errors** (§6.3): the new `manager.import_queue` reads the
    configuration through `paths.all_slots()`, whose legacy no-config-file guard is unreachable, so
