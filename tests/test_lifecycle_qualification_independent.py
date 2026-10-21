@@ -1544,5 +1544,69 @@ class ExactHeadInvariantTests(QualificationSandbox):
                          "a registered receipt must never be downgraded to created")
 
 
+class ReceiptLifecycleTests(QualificationSandbox):
+    """The receipt trail of a worker that is added, drained and removed.
+
+    The `registered` guard exists so that a stale write cannot un-register a
+    session. It must not also swallow the lifecycle's own transitions: a drained
+    worker and a removed worker are states the receipt has to record, and a
+    result must never report a worker that is not in the roster.
+    """
+
+    def test_the_receipt_follows_the_worker_from_registered_to_draining_to_removed(self):
+        """add -> registered -> drain -> removed, and the receipt says so."""
+        key = "w8-receipt-lifecycle-001"
+        added = self.add(count=1, request_key=key)
+        self.assertEqual(added["status"], "registered")
+        identifier = added["sessions"][0]["sessionId"]
+        self.assertEqual(self.receipt_status(identifier), "registered")
+        drained = opencode_lifecycle.drain_session(self.db, identifier)
+        self.assertTrue(drained["draining"])
+        self.assertEqual(self.receipt_status(identifier), "draining",
+                         "a drained worker must be recorded as draining")
+        opencode_lifecycle.remove_session(self.db, identifier, allow_unverified_native=True)
+        self.assertNotIn(identifier, self.roster_ids(),
+                         "the removal must have taken the worker out of the roster")
+        self.assertEqual(self.receipt_status(identifier), "removed",
+                         "a removed worker must be recorded as removed")
+
+    def test_a_same_key_retry_after_a_removal_never_reports_a_worker_that_is_gone(self):
+        """The retry's result must agree with the roster."""
+        key = "w8-receipt-lifecycle-002"
+        added = self.add(count=1, request_key=key)
+        identifier = added["sessions"][0]["sessionId"]
+        opencode_lifecycle.remove_session(self.db, identifier, allow_unverified_native=True)
+        self.assertNotIn(identifier, self.roster_ids())
+        retry = self.add(count=1, request_key=key)
+        reported = {item["sessionId"] for item in retry.get("sessions", [])}
+        for session_id in reported:
+            self.assertIn(session_id, self.roster_ids(),
+                          "a result must not report a worker that is not in the roster")
+        self.assertEqual(retry.get("registered", 0), len(reported),
+                         "the result's own counts must agree with the sessions it lists")
+
+    def test_a_stale_write_does_not_downgrade_a_registered_receipt(self):
+        """The guard's legitimate case: a stale write must not un-register a session.
+
+        This is the distinction the finding turns on: the guard must keep a
+        `created` or `unverified` write from overwriting a `registered` receipt,
+        while the lifecycle's own transitions must still be recorded.
+        """
+        key, digest = self.request_parts(count=1)
+        identifier = "ses_REGISTERED00000002"
+        self.seed_native_session(identifier)
+        self.seed_receipt(identifier, key, "registered", "in the roster")
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree), "dispatchEnabled": False}
+        opencode_lifecycle._record_session(self.db, identifier, key, request, "created",
+                                           "a stale write")
+        self.assertEqual(self.receipt_status(identifier), "registered",
+                         "a stale created write must not un-register a session")
+        opencode_lifecycle._record_session_locked(self.db, identifier, key, request,
+                                                  "unverified", "a stale write")
+        self.assertEqual(self.receipt_status(identifier), "registered",
+                         "a stale unverified write must not un-register a session")
+
+
 if __name__ == "__main__":
     unittest.main()

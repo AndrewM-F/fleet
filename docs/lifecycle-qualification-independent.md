@@ -463,3 +463,79 @@ re-run against `8ef01717`.
    process id that cannot exist; the out-of-band configuration change is written by the test
    itself, bypassing the writer lock; the head could not be re-fetched from the remote here.
 6. **Root review of the two owned paths is separate** and has not happened.
+
+## 8. Focused finding at `8ef01717` — the receipt-transition guard
+
+This section is **additive**. The completed exact-head result in §6 — 47 tests, 47 pass — stands as
+recorded; this is a narrowly scoped addition for the finding root raised against that head, and it
+does not re-run or restate the matrix.
+
+**Target:** the immutable head `8ef01717d9810196a5d84416be8c54386812814e`, the same branch and
+worktree as §6 (`codex/20261021-w8-independent-lifecycle-qualification-at-8ef01717`).
+
+**Root's finding.** The `registered` guard appears to reject the lifecycle's own transitions: a
+`registered` receipt can only be updated to `registered`, so the writes that record a worker as
+`draining` and as `removed` are refused, while the roster mutation that removed the worker goes
+through. Root's inspection of the guard and the drain/remove callers is confirmed by the source and
+by the three tests below.
+
+### 8.1 The mechanism, read from the source
+
+`_record_session` (line 526) writes the receipt with
+
+```
+ON CONFLICT(session_id) DO UPDATE SET status=excluded.status, updated=excluded.updated,
+ detail=excluded.detail
+ WHERE opencode_sessions.status<>'registered' OR excluded.status='registered'
+```
+
+An existing `registered` receipt therefore accepts only another `registered` write. The two
+callers that move a worker on are exactly the two it refuses:
+
+* `drain_session` (line 1140) writes `("draining", "draining")` — refused;
+* `_remove_session` (line 1249) writes `("removed", "removed from the roster")` — refused.
+
+`_record_session_locked` (line 555) makes the same decision explicitly and returns `"registered"`
+without writing. Neither call is an error: the roster write is a separate statement and it
+proceeds.
+
+### 8.2 The three focused tests
+
+| Test | What it asserts | Result at `8ef01717` |
+| --- | --- | --- |
+| `test_the_receipt_follows_the_worker_from_registered_to_draining_to_removed` | the add → `registered` → drain → remove lifecycle, and the receipt records `draining` and then `removed` | **FAIL** — `AssertionError: 'registered' != 'draining'` |
+| `test_a_same_key_retry_after_a_removal_never_reports_a_worker_that_is_gone` | a same-key retry after the removal must not report a worker that is not in the roster, and its counts must agree with the sessions it lists | **FAIL** — `AssertionError: 'ses_NEW000000000000000-2' not found in ['ses_EXISTING000000000001']` |
+| `test_a_stale_write_does_not_downgrade_a_registered_receipt` | the guard's legitimate case: a stale `created` or `unverified` write must not un-register a session | **pass** |
+
+The third test is the distinction the finding turns on: the guard's stated purpose holds, and what
+fails is the lifecycle's own transitions.
+
+### 8.3 Why it matters
+
+The receipt is the durable record of what happened to a worker. After a drain the receipt still
+says `registered`; after a removal it still says `registered` while the worker is gone from the
+roster. A later same-key retry then reports that removed worker as registered — a result that
+disagrees with the roster, which is the property the status report is supposed to guarantee. The
+failure is silent: neither the drain nor the removal reports an error, and the roster mutation
+succeeds.
+
+### 8.4 The smallest suggestion (owner's path)
+
+`src/fleet/opencode_lifecycle.py` — let the guard refuse only the writes it is meant to refuse, and
+let the lifecycle's own forward transitions through. Either
+
+* admit a transition out of `registered` when the new state is a later state of the same lifecycle
+  (`draining`, `removed`) and refuse only a downgrade to `created` or `unverified`; or
+* have the drain and the removal record their transition with a statement that is not subject to
+  the monotonic guard, and keep the guard for the reconciliation writes it protects.
+
+The receipt's own transition order — `created` → `registered` → `draining` → `removed` — is the
+natural rule; the guard as written forbids two of those three steps.
+
+### 8.5 The limits of this focused addition
+
+It is three tests over synthetic temporary state, on one head, for one property. It does not re-run
+the matrix, does not measure the owner's own suite, and does not exercise the native server, a
+provider, a live manager, a live fleet, a real session or a real worktree. The whole suite at this
+head is now **50 tests: 48 pass, 2 fail** — the 47 tests of the completed exact-head result all
+still pass, and the two failures are the finding above.
