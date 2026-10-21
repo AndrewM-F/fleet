@@ -144,9 +144,10 @@ command prints JSON on stdout and exits non-zero on failure.
   creates nothing. Once the command has launched, a nonzero exit or an unusable returned session id
   is an **ambiguous committed effect**: the request becomes uncertain and is not retried without a
   verified reconciliation. Only a failure **before** the command starts is a definite, retryable
-  failure. A retry takes the request's ownership atomically, and a session receipt never moves
-  backwards: a receipt that is already `registered` is never downgraded to `created` by a later
-  reconciliation.
+  failure. A retry takes the request's ownership atomically, and a session receipt only ever
+  moves forward, in the order `unverified` → `created` → `registered` → `draining` → `removed`:
+  a stale write never moves a receipt backwards, and a valid transition — registered to draining,
+  draining to removed — is never refused.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the

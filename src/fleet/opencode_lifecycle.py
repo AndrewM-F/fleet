@@ -523,13 +523,26 @@ def _creator_alive(pid):
     return True
 
 
+# The receipt lifecycle, in order. A receipt only ever moves forward: an
+# unverified session may be reconciled into a created one, a created one is
+# registered, a registered one is drained and then removed. A stale write never
+# moves a receipt backwards, and a valid transition is never refused.
+_RECEIPT_RANK = {"unverified": -1, "created": 0, "registered": 1, "draining": 2, "removed": 3}
+_RECEIPT_RANK_SQL = ("CASE excluded.status "
+                     "WHEN 'unverified' THEN -1 WHEN 'created' THEN 0 WHEN 'registered' THEN 1 "
+                     "WHEN 'draining' THEN 2 WHEN 'removed' THEN 3 ELSE -2 END >= "
+                     "CASE opencode_sessions.status "
+                     "WHEN 'unverified' THEN -1 WHEN 'created' THEN 0 WHEN 'registered' THEN 1 "
+                     "WHEN 'draining' THEN 2 WHEN 'removed' THEN 3 ELSE -2 END")
+
+
 def _record_session(db, session_id, request_key, request, status, detail=""):
     """Record a session receipt.
 
-    The transition is monotonic: a receipt that is already ``registered`` is
-    never downgraded to ``created``, so a reconciliation that runs after a
-    registration cannot un-register a session. The rule is in the statement
-    itself, so it holds whoever writes.
+    The transition is monotonic, in the order of the receipt lifecycle, so a
+    stale reconciliation cannot move a receipt backwards, while a valid
+    transition — registered to draining, draining to removed — is always
+    accepted. The rule is in the statement itself, so it holds whoever writes.
     """
     now = time.time()
     db.execute(
@@ -537,7 +550,7 @@ def _record_session(db, session_id, request_key, request, status, detail=""):
         "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session_id) DO UPDATE SET status=excluded.status,"
         "updated=excluded.updated,detail=excluded.detail "
-        "WHERE opencode_sessions.status<>'registered' OR excluded.status='registered'",
+        "WHERE " + _RECEIPT_RANK_SQL,
         (session_id, request_key, session_id, request["model"], request["account"],
          request["cwd"], request["root"], status, now, now, detail))
     db.commit()
@@ -550,13 +563,12 @@ def _record_session_locked(db, session_id, request_key, request, status, detail=
     registration that happened in between is seen and the monotonic rule holds.
     """
     with roster.roster_lock():
-        row = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
-                         (session_id,)).fetchone()
-        if row is not None and row[0] == "registered" and status != "registered":
-            # The session is already in the roster: the receipt stays registered.
-            return "registered"
+        before = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                            (session_id,)).fetchone()
         _record_session(db, session_id, request_key, request, status, detail)
-        return status
+        after = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                           (session_id,)).fetchone()
+        return after[0] if after is not None else status
 
 
 def _registered_result(db, key, request, count, entries, dispatch_enabled, note=""):

@@ -134,8 +134,9 @@ never invents a session id, so the id in a receipt is always the id the native s
   **ambiguous committed effect**: the request becomes uncertain and is not retried without a
   verified reconciliation. A failure **before** the command starts is a definite, retryable
   failure. A retry takes the request's ownership atomically, so two retries never own one request.
-  A session receipt never moves backwards: a receipt that is already `registered` is never
-  downgraded to `created` by a later reconciliation.
+  A session receipt only ever moves forward, in the order `unverified` → `created` →
+  `registered` → `draining` → `removed`: a stale write never moves a receipt backwards, and a
+  valid transition — registered to draining, draining to removed — is never refused.
 - The staged activation and rollback plan is
   [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
   manager, which reloads the roster and the admission limit on every cycle but does not honour
