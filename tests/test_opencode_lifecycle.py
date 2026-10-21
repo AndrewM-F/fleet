@@ -131,6 +131,16 @@ if data:
     with sqlite3.connect(DATABASE) as database:
         database.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
                          (session_id, directory, "project-test", recorded))
+    if mode == "commitThenFail":
+        # The session is committed and the command then fails: the effect is
+        # ambiguous.
+        sys.stderr.write("the command failed after the session was committed" + chr(10))
+        raise SystemExit(3)
+    if mode == "commitThenGarbage":
+        # The session is committed and the command then answers with nothing
+        # usable: the effect is ambiguous.
+        print("not json at all")
+        raise SystemExit(0)
 print(json.dumps({{"data": {{"id": session_id, "directory": directory,
                           "model": (data or {{}}).get("model")}}}}))
 '''

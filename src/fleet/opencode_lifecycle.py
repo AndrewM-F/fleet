@@ -333,10 +333,17 @@ def session_create_payload(cwd, model):
 
 
 def _parse_session(output):
-    """Read the session the native server returned; never invent one."""
+    """Read the session the native server returned; never invent one.
+
+    The command has already run, so an empty or malformed answer is an ambiguous
+    committed effect, not a plain failure: the request stays uncertain and is not
+    retried without a verified reconciliation.
+    """
     text = (output or "").strip()
     if not text:
-        raise ProvisioningError("The OpenCode CLI returned no session")
+        raise ProvisioningUncertain("The OpenCode CLI returned no session, so a native session "
+                                    "may have been committed. The outcome is unknown; the session "
+                                    "is not created again without a verified reconciliation.")
     candidates = [text]
     for line in reversed(text.splitlines()):
         line = line.strip()
@@ -353,7 +360,9 @@ def _parse_session(output):
         identifier = session.get("id")
         if isinstance(identifier, str) and _SESSION_ID.fullmatch(identifier):
             return session
-    raise ProvisioningError("The OpenCode CLI did not return a native session id")
+    raise ProvisioningUncertain("The OpenCode CLI did not return a usable native session id, so "
+                                "a session may have been committed. The outcome is unknown; the "
+                                "session is not created again without a verified reconciliation.")
 
 
 def _terminate(process):
@@ -405,8 +414,12 @@ def create_native_session(executable, account, cwd, model, scratch, timeout=None
             "The native session creation did not answer in time; whether the session "
             "exists is unknown, so no roster entry was written") from None
     if process.returncode != 0:
-        raise ProvisioningError("The OpenCode CLI could not create a native session: "
-                                + (stderr or "").strip()[:400])
+        # The command ran: a session may have been committed before it failed, so
+        # the effect is ambiguous and the request is not retryable.
+        raise ProvisioningUncertain(
+            "The OpenCode CLI failed after it started, so a native session may have been "
+            "committed: " + (stderr or "").strip()[:400] + ". The outcome is unknown; the "
+            "session is not created again without a verified reconciliation.")
     return _parse_session(stdout)
 
 
@@ -487,7 +500,8 @@ def _record_provisioning(db, request_key, request, status, detail="", count=None
         "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,"
         "updated=excluded.updated,detail=excluded.detail,"
-        "payload_digest=excluded.payload_digest",
+        "payload_digest=excluded.payload_digest,"
+        "creator_pid=excluded.creator_pid",
         (request_key, request["model"], request["account"], request["cwd"], request["root"],
          request["count"] if count is None else count, int(request["dispatchEnabled"]),
          status, now, now, detail, payload_digest, int(creator_pid)))
@@ -510,15 +524,39 @@ def _creator_alive(pid):
 
 
 def _record_session(db, session_id, request_key, request, status, detail=""):
+    """Record a session receipt.
+
+    The transition is monotonic: a receipt that is already ``registered`` is
+    never downgraded to ``created``, so a reconciliation that runs after a
+    registration cannot un-register a session. The rule is in the statement
+    itself, so it holds whoever writes.
+    """
     now = time.time()
     db.execute(
         "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
         "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session_id) DO UPDATE SET status=excluded.status,"
-        "updated=excluded.updated,detail=excluded.detail",
+        "updated=excluded.updated,detail=excluded.detail "
+        "WHERE opencode_sessions.status<>'registered' OR excluded.status='registered'",
         (session_id, request_key, session_id, request["model"], request["account"],
          request["cwd"], request["root"], status, now, now, detail))
     db.commit()
+
+
+def _record_session_locked(db, session_id, request_key, request, status, detail=""):
+    """Record a session receipt under the writer lock, against the current state.
+
+    A reconciliation re-reads the receipt under the lock before it writes, so a
+    registration that happened in between is seen and the monotonic rule holds.
+    """
+    with roster.roster_lock():
+        row = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                         (session_id,)).fetchone()
+        if row is not None and row[0] == "registered" and status != "registered":
+            # The session is already in the roster: the receipt stays registered.
+            return "registered"
+        _record_session(db, session_id, request_key, request, status, detail)
+        return status
 
 
 def _registered_result(db, key, request, count, entries, dispatch_enabled, note=""):
@@ -611,7 +649,7 @@ def _locked_intent(db, key, request, count, entries, digest, reconciled, current
             needed = 0
         if needed == 0 and not pending:
             _record_provisioning(db, key, request, "registered", "nothing to add",
-                                 payload_digest=digest)
+                                 payload_digest=digest, creator_pid=os.getpid())
             return {"result": {"action": "add-opencode", "idempotent": True,
                                 "requestKey": key, "created": 0,
                                 "registered": len(registered), "requested": count,
@@ -796,8 +834,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                                  + "): " + str(error)
                                  + ". It is not ignored and no new session is created.") from error
             if not dry_run:
-                _record_session(db, receipt["session_id"], key, request, "created",
-                                "reconciled: the native identity was read back")
+                _record_session_locked(db, receipt["session_id"], key, request, "created",
+                                       "reconciled: the native identity was read back")
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     for identifier in reconciled:
         _reject_duplicate_identity(db, cfg, identifier, pending)
@@ -812,8 +850,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
             raise ValueError("The named native session " + identifier + " does not match this "
                              "request: " + str(error)) from error
         if not dry_run:
-            _record_session(db, identifier, key, request, "created",
-                            "reconciled explicitly by the operator")
+            _record_session_locked(db, identifier, key, request, "created",
+                                   "reconciled explicitly by the operator")
     receipts = _session_receipts(db, key)
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
@@ -883,7 +921,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                     # proof that it was not created, so the outcome is unknown.
                     _record_session(db, identifier, key, request, "unverified", str(error))
                     _record_provisioning(db, key, request, "uncertain", str(error),
-                                         payload_digest=digest)
+                                         payload_digest=digest, creator_pid=os.getpid())
                     emit(db, "needs_attention", category="opencode-provisioning",
                          requestKey=key, error=str(error), sessionId=identifier, uncertain=True)
                     return {**plan, "created": len(created), "registered": 0,
@@ -900,7 +938,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     except ProvisioningUncertain as error:
         # The outcome is unknown. It stays unknown: it is not an ordinary failure
         # and the request is not retryable until the native identity is reconciled.
-        _record_provisioning(db, key, request, "uncertain", str(error), payload_digest=digest)
+        _record_provisioning(db, key, request, "uncertain", str(error), payload_digest=digest,
+                             creator_pid=os.getpid())
         emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
              error=str(error), created=created, uncertain=True)
         return {**plan, "created": len(created), "registered": 0,
@@ -909,7 +948,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                 "status": "uncertain", "uncertain": True, "retryable": False,
                 "failed": str(error), "rosterChanged": False}
     except ProvisioningError as error:
-        _record_provisioning(db, key, request, "failed", str(error), payload_digest=digest)
+        _record_provisioning(db, key, request, "failed", str(error), payload_digest=digest,
+                             creator_pid=os.getpid())
         emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
              error=str(error), created=created)
         return {**plan, "created": len(created), "registered": 0,
@@ -930,7 +970,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
             _record_provisioning(db, key, request,
                                  "uncertain" if kind == "uncertain" else "failed",
                                  "a previously created native session no longer verifies: "
-                                 + str(error), payload_digest=digest)
+                                 + str(error), payload_digest=digest, creator_pid=os.getpid())
             emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
                  error="a previously created native session no longer verifies: " + str(error),
                  sessionId=receipt["session_id"], uncertain=(kind == "uncertain"))
@@ -988,7 +1028,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
         for identifier in to_register:
             _record_session(db, identifier, key, request, "registered", "in the roster")
         _record_provisioning(db, key, request, "registered", "roster updated",
-                             payload_digest=digest)
+                             payload_digest=digest, creator_pid=os.getpid())
         emit(db, "opencode_sessions_added", requestKey=key, sessions=to_register,
              model=request["model"], account=request["account"], note=note)
         proof = _prove_registration(db, updated, key, request, to_register)

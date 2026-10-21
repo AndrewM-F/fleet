@@ -130,6 +130,12 @@ never invents a session id, so the id in a receipt is always the id the native s
   and `providerID`, the location as a `Location.PublicRef` object with a required `directory`, and
   nothing else. The evidence and its limits are in
   [opencode-native-api-evidence.md](opencode-native-api-evidence.md).
+- Once the command has launched, a nonzero exit or an unusable returned session id is an
+  **ambiguous committed effect**: the request becomes uncertain and is not retried without a
+  verified reconciliation. A failure **before** the command starts is a definite, retryable
+  failure. A retry takes the request's ownership atomically, so two retries never own one request.
+  A session receipt never moves backwards: a receipt that is already `registered` is never
+  downgraded to `created` by a later reconciliation.
 - The staged activation and rollback plan is
   [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
   manager, which reloads the roster and the admission limit on every cycle but does not honour

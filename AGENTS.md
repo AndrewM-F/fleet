@@ -141,7 +141,12 @@ command prints JSON on stdout and exits non-zero on failure.
   the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare the
   resolved shape — the model as a `Model.Ref` object with a required `id` and `providerID`, the
   location as a `Location.PublicRef` object with a required `directory`, and no other property —
-  creates nothing.
+  creates nothing. Once the command has launched, a nonzero exit or an unusable returned session id
+  is an **ambiguous committed effect**: the request becomes uncertain and is not retried without a
+  verified reconciliation. Only a failure **before** the command starts is a definite, retryable
+  failure. A retry takes the request's ownership atomically, and a session receipt never moves
+  backwards: a receipt that is already `registered` is never downgraded to `created` by a later
+  reconciliation.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the
