@@ -142,6 +142,15 @@ if payload is not None:
 if mode == "refuseCreate":
     sys.stderr.write("fake native server refused the request\\n")
     raise SystemExit(3)
+if mode == "failAfterCreate":
+    # the effect was committed and the command then failed: the outcome is
+    # ambiguous, exactly as a post-launch failure is in production
+    sys.stderr.write("fake native server failed after the session was created\\n")
+    raise SystemExit(3)
+if mode == "garbage":
+    # the effect was committed and the answer cannot be read
+    print("not a session at all")
+    raise SystemExit(0)
 print(json.dumps({{"data": {{"id": identifier, "directory": directory,
                            "model": (payload or {{}}).get("model")}}}}))
 '''
@@ -269,6 +278,18 @@ class QualificationSandbox(unittest.TestCase):
         """The durable status of a request's intent."""
         row = self.db.execute("SELECT status FROM opencode_provisioning WHERE request_key=?",
                               (key,)).fetchone()
+        return row[0] if row else None
+
+    def intent_owner(self, key):
+        """The creator pid and the payload digest a request's intent records."""
+        row = self.db.execute("SELECT creator_pid,payload_digest FROM opencode_provisioning "
+                               "WHERE request_key=?", (key,)).fetchone()
+        return row if row else (None, None)
+
+    def receipt_status(self, session_id):
+        """The durable status of a session receipt."""
+        row = self.db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                              (session_id,)).fetchone()
         return row[0] if row else None
 
     def session_receipts(self):
@@ -1428,6 +1449,99 @@ def result_status(result):
     if "error" in result:
         return "error"
     return result.get("status")
+
+
+class ExactHeadInvariantTests(QualificationSandbox):
+    """The invariants root named for this exact head.
+
+    * a native create that fails, or answers, after it started is an ambiguous
+      effect: it is uncertain and not retryable without positive proof that
+      nothing was committed;
+    * a safe retry takes over the request, so the intent's owner changes;
+    * a receipt never moves backwards.
+    """
+
+    def test_a_native_create_that_fails_after_it_started_is_uncertain_and_not_retryable(self):
+        """A failure after the command started is an ambiguous effect."""
+        self.write_control({"mode": "failAfterCreate", "idPrefix": "ses_POSTLAUNCH00000001"})
+        result = self.add(count=1, request_key="w8-postlaunch-001")
+        self.assertEqual(result["status"], "uncertain",
+                         "a post-launch failure is not a plain failure")
+        self.assertTrue(result["uncertain"])
+        self.assertFalse(result["retryable"],
+                         "an ambiguous effect must not be an ordinary retry")
+        self.assertFalse(result["rosterChanged"])
+        self.assertEqual(self.intent_status("w8-postlaunch-001"), "uncertain")
+        self.assertEqual(self.roster_ids(), [self.existing])
+        # The effect may exist; a retry must not create a second one.
+        with self.assertRaises(ValueError) as error:
+            self.add(count=1, request_key="w8-postlaunch-001")
+        self.assertIn("uncertain", str(error.exception).lower())
+        self.assertEqual(len(self.native_creates()), 1,
+                         "a retry must not create a second native session")
+
+    def test_a_malformed_native_answer_after_the_command_ran_is_uncertain(self):
+        """An answer that cannot be read is an ambiguous effect too."""
+        self.write_control({"mode": "garbage", "idPrefix": "ses_GARBAGE000000000001"})
+        result = self.add(count=1, request_key="w8-garbage-001")
+        self.assertEqual(result["status"], "uncertain")
+        self.assertTrue(result["uncertain"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(self.intent_status("w8-garbage-001"), "uncertain")
+        self.assertEqual(self.roster_ids(), [self.existing])
+        with self.assertRaises(ValueError) as error:
+            self.add(count=1, request_key="w8-garbage-001")
+        self.assertIn("uncertain", str(error.exception).lower())
+        self.assertEqual(len(self.native_creates()), 1,
+                         "a retry must not create a second native session")
+
+    def test_a_safe_retry_takes_over_the_request_and_changes_its_owner(self):
+        """A retry that is safe takes the request over, and the intent says so.
+
+        The intent names the attempt that currently holds the key. An intent
+        that still names a dead creator would leave the single-attempt guard
+        blind for that key.
+        """
+        key, digest = self.request_parts(count=1)
+        earlier = "ses_EARLIER00000000001"
+        # A native session the interrupted attempt created and never receipted:
+        # the effect exists, the receipt does not.
+        self.seed_native_session(earlier)
+        self.seed_intent(key, "creating", digest, creator_pid=DEAD_PID,
+                         detail="intent recorded before the native creation", count=1)
+        owner_before, token_before = self.intent_owner(key)
+        self.assertEqual(owner_before, DEAD_PID)
+        result = self.add(count=1, request_key=key, reconciled_sessions=[earlier])
+        self.assertEqual(result["registered"], 1)
+        owner_after, token_after = self.intent_owner(key)
+        self.assertEqual(owner_after, os.getpid(),
+                         "a safe retry must take the request over and name itself as the owner")
+        self.assertNotEqual(owner_after, DEAD_PID)
+        self.assertEqual(token_after, token_before,
+                         "the request token must still bind the same request")
+        self.assertEqual(token_after, digest)
+
+    def test_a_registered_receipt_is_never_downgraded(self):
+        """A receipt moves forward only.
+
+        A reconciliation that runs after a registration must not un-register the
+        session: the receipt stays `registered`.
+        """
+        key, digest = self.request_parts(count=1)
+        identifier = "ses_REGISTERED00000001"
+        self.seed_native_session(identifier)
+        self.seed_receipt(identifier, key, "registered", "in the roster")
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree), "dispatchEnabled": False}
+        self.assertEqual(self.receipt_status(identifier), "registered")
+        opencode_lifecycle._record_session_locked(self.db, identifier, key, request, "created",
+                                                  "reconciled: the native identity was read back")
+        self.assertEqual(self.receipt_status(identifier), "registered",
+                         "a registered receipt must never be downgraded to created")
+        opencode_lifecycle._record_session(self.db, identifier, key, request, "created",
+                                           "reconciled again")
+        self.assertEqual(self.receipt_status(identifier), "registered",
+                         "a registered receipt must never be downgraded to created")
 
 
 if __name__ == "__main__":

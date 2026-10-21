@@ -13,44 +13,20 @@ behaviour and the smallest owned-path patch suggestion for the source owner.
 
 | Field | Value |
 | --- | --- |
-| Repository | `/Users/amf/Developer/.codex/fleet` (remote `0xPlayerOne/fleet`) |
-| **Pinned base (the head this qualification was asked to complete)** | **`0cca1b35fa76fccde3bc8d11a6dd9bdfe6838462`** — "fix(fleet): close the seven reviewed lifecycle findings" |
-| **Head this qualification was asked to complete** | `709dfcb1733fdd86fe4f1bd866aa636de436979a` — "fix(fleet): hold the queue evidence, the snapshot and the stale caller"; verified as the published head before the qualification started, and qualified as such (42 pass / 1 fail) |
-| **Current published PR #8 head** | **`20670971fc84709ca85b5d60e2f06dd5e51a4543`** — "fix(fleet): decide the request under the writer lock"; `origin/feat/opencode-session-lifecycle-add-remove` and the local owner branch both name it. It was published **during** this run, and the same suite was carried onto it and re-run there: **43 pass / 0 fail** (§1.1) |
-| **Qualification branch at the pinned base** | `codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` @ `8ea3e6650149d68c1b857e6ee67f5b10dab88367` — 35 pass, 5 fail |
-| **Qualification branch at the current published head** | `codex/20261021-w8-independent-lifecycle-qualification-at-20670971` @ `2a32fd8` — **43 pass, 0 fail** |
-| **Qualification branch at `709dfcb`** | `codex/20261021-w8-independent-lifecycle-qualification-at-709dfcb` @ `e75e6ce` — 42 pass, 1 fail (D14) |
-| **Qualification worktrees** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-0cca1b35` and `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-709dfcb` — each created clean from exactly its base |
-| **Previous base (the comparison)** | `9d2bd8db9432fe51c3848c8e143c50f3272be662` — the head the previous report ran on; every invariant is compared against it (§3) |
-| **Previous branch (preserved, untouched)** | `codex/20261021-w8-independent-lifecycle-qualification` @ `6e3454ffd632bb1177821d5b4a08d93d82c5de0b` — the four earlier commits, the two artifacts and every earlier receipt are left exactly as they were |
-| Carry-forward | the four W8 commits were carried onto the new base with `git cherry-pick` (`927f855`, `f7eca20`, `b6d6de3`, `6e3454ff` → `b10a617`, `88693b7`, `bc0de8a`, `1b34baa`). They touch **only** the two owned paths, so nothing of W5's source is rewritten or duplicated |
-| Owned delta against the base | exactly two new paths: `tests/test_lifecycle_qualification_independent.py`, `docs/lifecycle-qualification-independent.md` |
-| W5's branch and worktree | **untouched.** `feat/opencode-session-lifecycle-add-remove` still names `0cca1b35`; their worktree's uncommitted tree was not read, copied, merged or stashed — only the fact that it carries uncommitted work was observed |
-| Operations not performed | no fetch, no pull, no reset, no stash, no prune, no rebase of the previous branch, no mutation of W5's branch, no publication |
+| **Target head** | **`8ef01717d9810196a5d84416be8c54386812814e`** — "fix(fleet): treat an ambiguous native effect as uncertain, and keep the receipt monotonic" |
+| **Live PR head** | the same commit: `origin/feat/opencode-session-lifecycle-add-remove` = `8ef01717d9810196a5d84416be8c54386812814e` and the local owner branch names it. The remote itself could **not** be queried — `git ls-remote https://github.com/0xPlayerOne/fleet.git` fails with `fatal: could not read Username for 'https://github.com': Device not configured` — so the commit object is the reference |
+| **PR draft / auto-merge state** | **unknown from any local record.** No local registry, event, receipt or handoff carries this pull request's draft or auto-merge state, and the GitHub API is not reachable from this worker (no authorization, nothing probed or changed). The state is therefore reported as unknown rather than assumed |
+| **Isolated exact-head checkout** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-8ef01717`, branch `codex/20261021-w8-independent-lifecycle-qualification-at-8ef01717`, created clean from that commit. The owner's implementation and existing runtime tests were not edited |
+| Owned delta against the target | exactly two new paths: `tests/test_lifecycle_qualification_independent.py`, `docs/lifecycle-qualification-independent.md`; **0** owner paths touched |
+| Earlier heads, retained as historical evidence | `0cca1b35` (35 pass / 5 fail), `709dfcb` (42 pass / 1 fail), `20670971` (43 pass / 0 fail) — each on its own branch with its own patch and logs. **None of them is evidence for this head**; every row of the matrix below was re-run against `8ef01717` |
+| Operations not performed | no fetch, no pull, no reset, no stash, no prune, no mutation of the owner's branch, no publication |
 
-The base moved because the owner published the repair of the seven reviewed findings. This
-qualification therefore starts a **separate clean worktree and branch from exactly that commit** and
-carries its own artifacts forward, so the previous branch, its commits and its receipts stay
-intact and independently checkable.
-
-### 1.1 The published head moved during the run, and the suite was re-run there
-
-While the qualification was running, the owner published `709dfcb`. Its subject — "hold the queue
-evidence, the snapshot and the stale caller" — touches the code behind the findings that were still
-open at `0cca1b35`, so the standing rule (re-run the same suite against the published checked head)
-applies. The same suite, unchanged, was carried onto `709dfcb` with `git cherry-pick` into its own
-clean worktree and branch and re-run there:
-
-| Head | Branch | Suite |
-| --- | --- | --- |
-| `0cca1b35` (pinned) | `…-at-0cca1b35` @ `8ea3e66` | 40 tests: **35 pass, 5 fail** (D9–D13) |
-| `709dfcb` (the head this qualification was asked to complete) | `…-at-709dfcb` @ `e75e6ce` | 43 tests: **42 pass, 1 fail** (D14) |
-| `20670971` (current published) | `…-at-20670971` @ `2a32fd8` | 43 tests: **43 pass, 0 fail** |
-
-The repair is visible in the diff: `model_selection._apply` now reads the digest **before** the
-configuration and hands that digest to `roster.write_config_cas` (D11, D12), and `roster.py` and
-`opencode_lifecycle.py` changed for the queue evidence, the snapshot and the stale caller (D9, D10,
-D13).
+The owner's delta from the last qualified head (`20670971`) to this one is `src/fleet/opencode_lifecycle.py`
+(+74/−18) and a new `tests/test_ambiguous_effects.py` (344 lines): an empty or malformed native
+answer and a native create that fails **after it started** are now an ambiguous effect (uncertain,
+not retryable) instead of a plain failure; a receipt's transition is monotonic, so a `registered`
+receipt is never downgraded; and the provisioning intent's creator is refreshed on every write, so
+a safe retry takes the request over.
 
 ## 2. What the suite covers, and what it deliberately does not
 
@@ -73,56 +49,66 @@ from the host. The fake server accepts either model shape on purpose, so that **
 defect does not mask the other twenty-eight invariants; the strict shape is asserted by exactly one
 dedicated test (§3, D1).
 
-### Coverage matrix
+### The full candidate matrix, at `8ef01717`
 
-| Invariant | Test | Race / fault | Result at `f4f26de` |
-| --- | --- | --- | --- |
-| Native request carries the model and the directory and nothing else | `test_the_native_call_carries_only_the_model_and_the_directory` | — | pass |
-| **The request body conforms to the schema the runtime itself proved** | `test_the_native_request_body_conforms_to_the_schema_the_runtime_proved` | — | **FAIL (D1)** |
-| The created session is read back from the native identity row | `test_the_created_session_is_read_back_from_the_synthetic_identity_row` | — | pass |
-| Duplicate native identity is refused; the roster stays exact and distinct | `test_a_duplicate_native_identity_is_refused_and_the_roster_stays_exact` | — | pass |
-| Distinct count and registration proof are exact | `test_the_registration_proof_counts_distinct_sessions_exactly` | — | pass |
-| Dry run: no native call, no receipt, no event, no roster change | `test_a_dry_run_makes_no_native_call_and_writes_no_receipt` | — | pass |
-| Dry run of a target total writes nothing | `test_a_dry_run_of_a_target_total_writes_nothing` | — | pass |
-| The same key with a different payload is refused before any native call | `test_the_same_key_with_a_different_payload_is_refused_before_any_native_call` | — | pass |
-| The same key with the same payload is idempotent | `test_the_same_key_with_the_same_payload_is_idempotent` | — | pass |
-| **Crash between the native effect and the receipt creates no second session** | `test_a_crash_between_the_native_effect_and_its_receipt_creates_no_second_session` | fault injection | pass |
-| **A crashed creator leaves the request uncertain and not retryable** | `test_a_crashed_creator_leaves_the_request_uncertain_and_not_retryable` | fault injection | pass |
-| An explicitly named session is registered without a second creation | `test_an_explicitly_named_session_is_registered_without_a_second_creation` | fault injection | pass |
-| A native effect that cannot be read back stays uncertain | `test_a_native_effect_that_cannot_be_read_back_stays_uncertain` | fault injection | pass |
-| **A malformed queue file does not let a removal pass unseen** | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | — | **FAIL (D2)** |
-| An unreadable task ledger refuses the removal and keeps the roster | `test_an_unreadable_task_ledger_refuses_the_removal_and_keeps_the_roster` | fault injection | pass |
-| **A terminal task in the queue history does not block the removal** | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | — | **FAIL (D3)** |
-| A queue entry that names the worker is never lost by a drain | `test_a_queue_entry_that_names_the_worker_is_never_lost_by_a_drain` | — | pass |
-| A running worker is never removed | `test_a_running_worker_is_never_removed` | — | pass |
-| A removal keeps the native session and every hold | `test_a_removal_keeps_the_native_session_and_every_hold` | — | pass |
-| **A removal leaves a dirty, unpublished worktree byte-identical** | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | — | pass |
-| An active worker with unpublished work is never removed | `test_an_active_worker_with_unpublished_work_is_never_removed` | — | pass |
-| **Concurrent same-key creation makes exactly one native call** | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | barrier | pass |
-| **Concurrent same-key requests with different payloads conflict** | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | barrier | pass |
-| A drain and a removal of one worker cannot both take effect | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | barrier | pass |
-| **A stale import never binds a task to a removed worker** | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | barrier | **FAIL (D4)** |
-| **A model-selection write never loses a roster entry** | `test_a_model_selection_write_never_loses_a_roster_entry` | barrier | **FAIL (D5)** |
-| **The same key never creates a second native session after a takeover** | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | barrier | **FAIL (D6)** |
-| **A partial-create crash leaves the request uncertain instead of creating again** | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | fault injection | **FAIL (D7)** |
-| **A dry run does not mutate a receipt** | `test_a_dry_run_does_not_mutate_a_receipt` | fault injection | **FAIL (D8)** |
-| **An existing empty or whitespace-only queue file refuses the removal** | `test_an_existing_empty_queue_file_refuses_the_removal` | fault injection | **FAIL (D9)** |
-| **An existing queue file without a tasks list refuses the removal** | `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal` | fault injection | **FAIL (D10)** |
-| **A truncated queue file refuses the removal** | `test_a_truncated_queue_file_refuses_the_removal` | fault injection | pass |
-| **A missing queue file is distinguished from an unreadable one** | `test_a_missing_queue_file_is_distinguished_from_an_unreadable_one` | fault injection | pass |
-| **An out-of-band configuration change after the snapshot is rejected** | `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | fault injection | **FAIL (D11)** |
-| **The compare-and-swap uses the digest captured with the snapshot** | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot` | fault injection | **FAIL (D12)** |
-| **A concurrent same-key request registers the worker exactly once** | `test_a_concurrent_same_key_request_registers_the_worker_exactly_once` | barrier | pass |
-| **A final intent never overwrites a registered request** | `test_a_final_intent_never_overwrites_a_registered_request` | — | pass |
-| The status report counts the roster and the receipts truthfully | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | — | pass |
-| **A recovery receipt refuses a turn whose cleanup is not confirmed** | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | fault injection | pass |
-| **A recovery receipt refuses a turn whose process is still live** | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | fault injection | pass |
+Every row was re-run against this exact head. "Result" is the outcome of that run.
 
-Barrier cases use `threading.Barrier(2)` so the two writers meet at a known point instead of
-depending on scheduling; the fault injections replace the native call, the identity row and the
-ledger with controlled failures. The suite asserts, in every case, that **no duplicate native
-call** was made, that **no queue entry was lost**, that **no unsafe registration or removal**
-happened, and that the reported status matches what actually occurred.
+| # | Invariant (root's wording) | Test | Class | Result |
+| --- | --- | --- | --- | --- |
+| 1 | The native request carries the model and the directory and nothing else | `test_the_native_call_carries_only_the_model_and_the_directory` | `NativeEffectTests` | pass |
+| 2 | The created session is read back from the native identity row | `test_the_created_session_is_read_back_from_the_synthetic_identity_row` | `NativeEffectTests` | pass |
+| 3 | The request body conforms to the schema the runtime itself proved | `test_the_native_request_body_conforms_to_the_schema_the_runtime_proved` | `NativeEffectTests` | pass |
+| 4 | A duplicate native identity is refused; the roster stays exact and distinct | `test_a_duplicate_native_identity_is_refused_and_the_roster_stays_exact` | `NativeEffectTests` | pass |
+| 5 | The registration proof counts the sessions exactly | `test_the_registration_proof_counts_distinct_sessions_exactly` | `NativeEffectTests` | pass |
+| 6 | A dry run makes no native call and writes no receipt, event or roster change | `test_a_dry_run_makes_no_native_call_and_writes_no_receipt` | `DryRunTests` | pass |
+| 7 | A dry run of a target total writes nothing | `test_a_dry_run_of_a_target_total_writes_nothing` | `DryRunTests` | pass |
+| 8 | A dry run does not mutate a receipt | `test_a_dry_run_does_not_mutate_a_receipt` | `ReviewFindingReproductionTests` | pass |
+| 9 | The same key with a different payload is refused before any native call | `test_the_same_key_with_a_different_payload_is_refused_before_any_native_call` | `RequestKeyBindingTests` | pass |
+| 10 | The same key with the same payload is idempotent | `test_the_same_key_with_the_same_payload_is_idempotent` | `RequestKeyBindingTests` | pass |
+| 11 | A crash between the native effect and its receipt creates no second session | `test_a_crash_between_the_native_effect_and_its_receipt_creates_no_second_session` | `CrashAndUncertaintyTests` | pass |
+| 12 | A crashed creator leaves the request uncertain and not retryable | `test_a_crashed_creator_leaves_the_request_uncertain_and_not_retryable` | `CrashAndUncertaintyTests` | pass |
+| 13 | A named session is registered without a second creation | `test_an_explicitly_named_session_is_registered_without_a_second_creation` | `CrashAndUncertaintyTests` | pass |
+| 14 | A native effect that cannot be read back stays uncertain | `test_a_native_effect_that_cannot_be_read_back_stays_uncertain` | `CrashAndUncertaintyTests` | pass |
+| 15 | **A native create that fails after it started is uncertain and not retryable** | `test_a_native_create_that_fails_after_it_started_is_uncertain_and_not_retryable` | `ExactHeadInvariantTests` | pass |
+| 16 | **A malformed native answer after the command ran is uncertain and not retryable** | `test_a_malformed_native_answer_after_the_command_ran_is_uncertain` | `ExactHeadInvariantTests` | pass |
+| 17 | **A safe retry takes the request over and changes the provisioning owner** | `test_a_safe_retry_takes_over_the_request_and_changes_its_owner` | `ExactHeadInvariantTests` | pass |
+| 18 | **A registered receipt is never downgraded** | `test_a_registered_receipt_is_never_downgraded` | `ExactHeadInvariantTests` | pass |
+| 19 | **A malformed existing queue file refuses the removal** | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | `QueueAndLedgerIntegrityTests` | pass |
+| 20 | **A truncated existing queue file refuses the removal** | `test_a_truncated_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
+| 21 | **An existing empty or whitespace queue file refuses the removal** | `test_an_existing_empty_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
+| 22 | **An existing queue file without a tasks list refuses the removal** | `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
+| 23 | A missing queue file is distinguished from an unreadable one | `test_a_missing_queue_file_is_distinguished_from_an_unreadable_one` | `QueueAndLedgerIntegrityTests` | pass |
+| 24 | An unreadable task ledger refuses the removal and keeps the roster | `test_an_unreadable_task_ledger_refuses_the_removal_and_keeps_the_roster` | `QueueAndLedgerIntegrityTests` | pass |
+| 25 | Terminal queue history does not block the removal | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
+| 26 | A queue entry that names the worker is never lost by a drain | `test_a_queue_entry_that_names_the_worker_is_never_lost_by_a_drain` | `QueueAndLedgerIntegrityTests` | pass |
+| 27 | A running worker is never removed | `test_a_running_worker_is_never_removed` | `RemovalBarrierTests` | pass |
+| 28 | A removal keeps the native session and every hold | `test_a_removal_keeps_the_native_session_and_every_hold` | `RemovalBarrierTests` | pass |
+| 29 | A removal leaves a dirty, unpublished worktree byte-identical | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | `RemovalBarrierTests` | pass |
+| 30 | An active worker with unpublished work is never removed | `test_an_active_worker_with_unpublished_work_is_never_removed` | `RemovalBarrierTests` | pass |
+| 31 | Concurrent same-key creation makes exactly one native call | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | `BarrierRaceTests` | pass |
+| 32 | Concurrent same-key requests with different payloads conflict | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | `BarrierRaceTests` | pass |
+| 33 | A drain and a removal of one worker cannot both take effect | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | `BarrierRaceTests` | pass |
+| 34 | A stale import never binds a task to a removed worker | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | `BarrierRaceTests` | pass |
+| 35 | A model selection never loses a roster entry | `test_a_model_selection_write_never_loses_a_roster_entry` | `BarrierRaceTests` | pass |
+| 36 | **The CAS digest is captured with the configuration snapshot** | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot` | `BarrierRaceTests` | pass |
+| 37 | **An out-of-band configuration change after the snapshot is rejected** | `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | `BarrierRaceTests` | pass |
+| 38 | A concurrent same-key request creates one session and keeps the final intent | `test_a_concurrent_same_key_request_creates_one_session_and_keeps_the_final_intent` | `BarrierRaceTests` | pass |
+| 39 | The same key never creates a second session after a takeover | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | `ReviewFindingReproductionTests` | pass |
+| 40 | A partial-create crash leaves the request uncertain instead of creating again | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | `ReviewFindingReproductionTests` | pass |
+| 41 | The status report counts the roster and the receipts truthfully | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | `ReceiptTruthfulnessTests` | pass |
+| 42 | A recovery receipt refuses a turn whose cleanup is not confirmed | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | `ReceiptTruthfulnessTests` | pass |
+| 43 | A recovery receipt refuses a turn whose process is still live | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | `ReceiptTruthfulnessTests` | pass |
+| 44 | **A stale caller that resumes after the key was registered gets the idempotent result** | `test_a_stale_caller_that_resumes_after_the_key_was_registered_gets_the_idempotent_result` | `InitialIntentRaceTests` | pass |
+| 45 | **A stale caller that resumes while the creator is alive creates nothing extra** | `test_a_stale_caller_that_resumes_while_the_creator_is_alive_creates_nothing_extra` | `InitialIntentRaceTests` | pass |
+| 46 | **A stale caller that resumes after an uncertain attempt fails closed** | `test_a_stale_caller_that_resumes_after_an_uncertain_attempt_fails_closed` | `InitialIntentRaceTests` | pass |
+| 47 | **Complete reconciliation of all partial native effects is required** | the accounted-set rule is exercised by rows 12, 14, 40 and 46 — a continuation is refused unless the exact identities account for every session the request was going to create | `CrashAndUncertaintyTests`, `InitialIntentRaceTests` | pass |
+
+Every fixture is synthetic and disposable: a temporary fleet root, a temporary native identity
+inventory, the sandbox's fake native server (with a post-launch failure mode and a malformed-answer
+mode), and a real local git worktree carrying a dirty tracked file, an untracked file and an
+unpublished commit. The race cases use events as barriers, so the order is chosen rather than
+hoped for; the owner-PID case uses a process id that cannot exist, so the dead creator is modelled
+without weakening the runtime's own liveness check.
 
 ## 3. The published defects and the open review findings (retained as failing acceptance evidence)
 
@@ -435,141 +421,45 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 
 ## 6. Commands and results
 
-| Command | Scope | Result |
+| Command | Scope | Result at `8ef01717` |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **this suite at the published head `0cca1b35`** | **40 tests: 35 pass, 5 fail** — D9, D10, D11, D12, D13. Identical on two consecutive runs (the concurrent case forces its interleaving) |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository **without** this file | **475 tests: 30 errors, 4 skipped, 0 failures** — the owner's own state at this head (§6.1) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `0cca1b35`, including this suite | **529 tests: 5 failures, 30 errors, 4 skipped** — the 5 failures are this suite's retained evidence, the 30 errors are the owner's (§6.1) |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | the previous base `9d2bd8db` (the comparison) | 32 tests: 25 pass, 6 assertion failures, 1 error — D2–D8 |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the previous base `9d2bd8db`, without this file | 475 tests: 7 failures |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the same suite at the current published head `709dfcb`** | **40 tests: 40 pass, 0 fail** |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `709dfcb`, including this suite | see §6.3 |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the repository at `709dfcb` **without** this file | see §6.3 |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **this suite** | **47 tests: 47 pass, 0 fail** — 32.8 s, every fixture in a temporary directory |
+| `python3 -m unittest tests.test_lifecycle_qualification_independent.ExactHeadInvariantTests tests.test_lifecycle_qualification_independent.InitialIntentRaceTests tests.test_lifecycle_qualification_independent.QueueAndLedgerIntegrityTests tests.test_lifecycle_qualification_independent.BarrierRaceTests` | the focused groups for this task's invariants | **24 tests, 0 fail** — 17.1 s |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
-| `git diff --stat 0cca1b35...codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` | the owned delta against the published head | two new paths only |
+| `git diff --name-status 8ef01717...codex/20261021-w8-independent-lifecycle-qualification-at-8ef01717` | the owned delta | two new paths only; 0 owner paths touched |
+| **No broad aggregate run and no whole-repository run** | this task ran only bounded focused synthetic tests. The owner's own suite at this head was **not** measured, so its baseline here is **unknown** — see §7 | — |
 
-### 6.1 The owner's own suite at `0cca1b35` — a regression, preserved as a failure
+### 6.1 The earlier heads — historical evidence, kept separate
 
-The owner's suite, **without** this qualification, is **475 tests with 30 errors** at this head
-(0 failures; the seven `tests/test_queue_runway.py` failures of the previous head are gone). The
-thirty errors are all one cause: the new `manager.import_queue` reads the roster with
-`paths.all_slots()`, which reads the configuration file, and the recovery, queued-holds and fleet
-fixtures do not have one — so `import_queue` raises `FileNotFoundError` before it can do anything:
-
-```
-File ".../src/fleet/manager.py", line 120, in import_queue
-    current = {slot["sessionId"] for slot in paths.all_slots()}
-File ".../src/fleet/paths.py", line 43, in slots
-    cfg = config() if cfg is None else cfg
-File ".../src/fleet/paths.py", line 27, in config
-    return json.loads(Path(path or CONFIG).read_text())
-FileNotFoundError: .../config/fleet.local.json
-```
-
-`paths.all_slots()` has a guard for exactly this case ("Legacy unit fixtures often replace the
-provider pair without creating a config file"), but it is unreachable: `slots(cfg)` is called
-before the guard, and it is `slots()` that reads the file. **This qualification does not touch the
-owner's tests or the owner's source; the failures are preserved and reported here for root.**
-
-### 6.2 The focused runs of this task, and the heavy-run admission
-
-This task ran **only bounded focused synthetic tests**: the qualification suite itself (43 tests,
-31 seconds, every fixture in a temporary directory) and the focused race class. **The heavy
-whole-repository run was not repeated** — the one heavy-run admission for this fleet was spent on
-the run already recorded above (543 tests at `709dfcb`, 475 for the remaining modules, 30 owner
-errors). The numbers in §6.1 and §6.3 are therefore from that run, with the suite then at 40
-tests; the suite has since grown by the three race cases, of which two pass and one fails (D14).
-
-### 6.3 The owner's own suite at `709dfcb`
-
-Without this qualification the repository's own suite is **475 tests with 30 errors, 4 skipped and
-0 failures** at `709dfcb` — the same 30 errors as at `0cca1b35`, one cause, unchanged by the
-owner's new commit: `manager.import_queue` still reads the roster with `paths.all_slots()`, whose
-legacy no-config-file guard is unreachable, so every fixture without a configuration file fails
-before the import can run. With this qualification the repository is **543 tests with 30 errors, 4
-skipped and 0 failures**: every one of this suite's 40 tests passes, and all 30 errors belong to
-the owner's own suite.
-
-**The qualification is green and the head is not.** This suite's 40 invariants all hold at the
-published head; the repository's own 30 errors are the owner's and are outside this qualification's
-two paths. They are preserved as failures and are reported for root: they block a merge of the
-head independently of this qualification.
-
-### 6.4 Per-test receipt at the published head `0cca1b35`
-
-| # | Test | Class | Result |
+| Head | Owner commit | Suite | Branch |
 | --- | --- | --- | --- |
-| 1 | `test_the_native_call_carries_only_the_model_and_the_directory` | `NativeEffectTests` | pass |
-| 2 | `test_the_created_session_is_read_back_from_the_synthetic_identity_row` | `NativeEffectTests` | pass |
-| 3 | `test_the_native_request_body_conforms_to_the_schema_the_runtime_proved` | `NativeEffectTests` | pass (D1, repaired) |
-| 4 | `test_a_duplicate_native_identity_is_refused_and_the_roster_stays_exact` | `NativeEffectTests` | pass |
-| 5 | `test_the_registration_proof_counts_distinct_sessions_exactly` | `NativeEffectTests` | pass |
-| 6 | `test_a_dry_run_makes_no_native_call_and_writes_no_receipt` | `DryRunTests` | pass |
-| 7 | `test_a_dry_run_of_a_target_total_writes_nothing` | `DryRunTests` | pass |
-| 8 | `test_the_same_key_with_a_different_payload_is_refused_before_any_native_call` | `RequestKeyBindingTests` | pass |
-| 9 | `test_the_same_key_with_the_same_payload_is_idempotent` | `RequestKeyBindingTests` | pass |
-| 10 | `test_a_crash_between_the_native_effect_and_its_receipt_creates_no_second_session` | `CrashAndUncertaintyTests` | pass |
-| 11 | `test_a_crashed_creator_leaves_the_request_uncertain_and_not_retryable` | `CrashAndUncertaintyTests` | pass |
-| 12 | `test_an_explicitly_named_session_is_registered_without_a_second_creation` | `CrashAndUncertaintyTests` | pass |
-| 13 | `test_a_native_effect_that_cannot_be_read_back_stays_uncertain` | `CrashAndUncertaintyTests` | pass |
-| 14 | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | `QueueAndLedgerIntegrityTests` | pass (D2, repaired) |
-| 15 | `test_an_unreadable_task_ledger_refuses_the_removal_and_keeps_the_roster` | `QueueAndLedgerIntegrityTests` | pass |
-| 16 | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | `QueueAndLedgerIntegrityTests` | pass (D3, repaired) |
-| 17 | `test_a_queue_entry_that_names_the_worker_is_never_lost_by_a_drain` | `QueueAndLedgerIntegrityTests` | pass |
-| 18 | `test_an_existing_empty_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | **FAIL (D9)** |
-| 19 | `test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | **FAIL (D10)** |
-| 20 | `test_a_truncated_queue_file_refuses_the_removal` | `QueueAndLedgerIntegrityTests` | pass |
-| 21 | `test_a_missing_queue_file_is_distinguished_from_an_unreadable_one` | `QueueAndLedgerIntegrityTests` | pass |
-| 22 | `test_a_running_worker_is_never_removed` | `RemovalBarrierTests` | pass |
-| 23 | `test_a_removal_keeps_the_native_session_and_every_hold` | `RemovalBarrierTests` | pass |
-| 24 | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | `RemovalBarrierTests` | pass |
-| 25 | `test_an_active_worker_with_unpublished_work_is_never_removed` | `RemovalBarrierTests` | pass |
-| 26 | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | `BarrierRaceTests` | pass |
-| 27 | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | `BarrierRaceTests` | pass |
-| 28 | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | `BarrierRaceTests` | pass |
-| 29 | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | `BarrierRaceTests` | pass (D4, repaired) |
-| 30 | `test_a_model_selection_write_never_loses_a_roster_entry` | `BarrierRaceTests` | pass (D5, repaired) |
-| 31 | `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | `BarrierRaceTests` | **FAIL (D11)** |
-| 32 | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot` | `BarrierRaceTests` | **FAIL (D12)** |
-| 33 | `test_a_concurrent_same_key_request_creates_one_session_and_keeps_the_final_intent` | `BarrierRaceTests` | **FAIL (D13)** |
-| 34 | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | `ReviewFindingReproductionTests` | pass (D6, repaired) |
-| 35 | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | `ReviewFindingReproductionTests` | pass (D7, repaired) |
-| 36 | `test_a_dry_run_does_not_mutate_a_receipt` | `ReviewFindingReproductionTests` | pass (D8, repaired) |
-| 37 | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | `ReceiptTruthfulnessTests` | pass |
-| 38 | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | `ReceiptTruthfulnessTests` | pass |
-| 39 | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | `ReceiptTruthfulnessTests` | pass |
+| `0cca1b35` | fix(fleet): close the seven reviewed lifecycle findings | 35 pass / 5 fail | `…-at-0cca1b35` @ `37a47e1` |
+| `709dfcb` | fix(fleet): hold the queue evidence, the snapshot and the stale caller | 42 pass / 1 fail (D14) | `…-at-709dfcb` @ `e75e6ce` |
+| `20670971` | fix(fleet): decide the request under the writer lock | 43 pass / 0 fail | `…-at-20670971` @ `fafdf5b` |
+| **`8ef01717`** | **fix(fleet): treat an ambiguous native effect as uncertain, and keep the receipt monotonic** | **47 pass / 0 fail** | `…-at-8ef01717` |
 
-The repository has no separate lint or format tool (no CI workflow, no packaging configuration);
-the documented check is the unittest discovery above, plus a byte-compile of the owned file. The
-owned file follows the repository's style (module docstring, `unittest.TestCase` classes, no
-third-party imports, the same source-layout path bootstrap as the repository's own tests) and stays
-within 100 columns.
+Those results are retained on their own branches with their own patches and logs. **They are
+evidence for the head they were run on and not for this one**: every row of the matrix in §2 was
+re-run against `8ef01717`.
 
 ## 7. Exact remaining gaps
 
-1. **No invariant of this qualification fails at the current published head `20670971`** — 43
-   tests, 43 pass. D14, which failed at `709dfcb`, is repaired there by deciding the request under
-   the writer lock, and the repair is covered by the regression that found it. The `709dfcb` result
-   (42 pass, 1 fail) and the `0cca1b35` result (35 pass, 5 fail) are retained separately and are
-   not evidence for a later head.
-2. **The published head is not green in the owner's own suite.** Without this qualification the
-   repository is 475 tests with **30 errors** (§6.3): the new `manager.import_queue` reads the
-   configuration through `paths.all_slots()`, whose legacy no-config-file guard is unreachable, so
-   every fixture without a configuration file fails before the import can run. That is the owner's
-   to fix; this qualification changed nothing of theirs, and the failures are preserved as failures.
-   **It blocks a merge of the head independently of this qualification.**
-3. **The qualification was pinned to `0cca1b35`, which the owner has since moved past.** The
-   results at both heads are recorded (§1.1); the pinned branch shows the five findings that were
-   open there and the current branch shows the repair.
-4. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
-   disposable native CLI and a disposable fleet, which are outside this outcome's scope and outside
-   its authority.
-5. **The out-of-band change in D11 and D12 was written by the test itself**, bypassing the writer
-   lock, because that is what out of band means; a change that respects the lock cannot reach that
-   window.
-6. **The published head could not be re-fetched.** This worker has no GitHub authorization, so
-   `git ls-remote` fails; the head this qualification ran against is the commit `709dfcb` itself,
-   and the local remote-tracking ref `origin/feat/opencode-session-lifecycle-add-remove` names it.
-7. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
-   documentation file was modified, W5's branch and worktree were not touched, and no live manager,
-   session, configuration, registered worktree or resource was changed.
+1. **This qualification's suite is green at the exact head `8ef01717`** — 47 tests, 47 pass, 0 fail
+   (§6). Every invariant in the matrix is covered by a regression that passes on this head.
+2. **The owner's own suite at this head is not measured.** This task ran only bounded focused
+   synthetic tests, so the repository's own state here is **unknown**. The last measurement (543
+   tests at `709dfcb`, with 30 errors in the owner's recovery, queued-holds and fleet fixtures) is
+   historical evidence for that head; the owner has since rewritten `opencode_lifecycle.py` and
+   added `tests/test_ambiguous_effects.py` and a new `tests/test_lifecycle_findings.py`, so the
+   baseline at this head must be measured before any merge. **Unverified and pristine baseline
+   failures are kept distinct from this suite's results.**
+3. **The pull request's draft and auto-merge state is unknown from any local record** (§1); the
+   GitHub API is not reachable from this worker.
+4. **Publication is blocked in this worker**: no GitHub authorization; no credential was probed or
+   changed and no alternate route was used.
+5. **The native and production limits in §5 are not closed by this suite** — no real CLI, native
+   database, provider or turn; no live manager, fleet, configuration, session, worktree or
+   resource; no Docker; the crash windows are injected and the dead creator is modelled with a
+   process id that cannot exist; the out-of-band configuration change is written by the test
+   itself, bypassing the writer lock; the head could not be re-fetched from the remote here.
+6. **Root review of the two owned paths is separate** and has not happened.
