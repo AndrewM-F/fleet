@@ -12,13 +12,15 @@ from .store import database
 def enqueue(db, supplied):
     if not supplied:
         return []
-    slots = paths.all_slots()
     with paths.QUEUE_LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         # The queue lock is taken first and the roster writer lock second,
         # which is the order every writer uses, so an enqueue cannot slip
-        # between a removal's checks and its write.
+        # between a removal's checks and its write. The roster is read inside
+        # the locks: a roster a concurrent removal has already changed must
+        # not be used to accept a task for a worker that is gone.
         with roster.roster_lock():
+            slots = paths.all_slots()
             queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
                      else {"author": "root", "tasks": []})
             if queue.get("author") != "root":

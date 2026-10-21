@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import time
 
-from . import opencode, paths
+from . import opencode, paths, roster
 from .store import database
 
 # The legacy default stays the default. The approved set is never widened or
@@ -240,27 +240,32 @@ def apply(cfg, model, session_id=None, dry_run=False, db=None):
 
 
 def _apply(db, model, session_id, dry_run):
-    with model_lock():
-        cfg = paths.config()
-        planned = plan(cfg, model, session_id, db)
-        if dry_run:
-            return {"applied": False, "dryRun": True, **planned}
-        updated = False
-        for change in planned["changes"]:
-            if change["action"] != "select":
-                continue
-            entry = _worker_entry(cfg, change["sessionId"])
-            previous = entry.get("model")
-            entry["model"] = change["model"]
-            entry["modelSelection"] = {
-                "model": change["model"],
-                "previous": previous,
-                "requestedAt": time.time(),
-                "by": "opencode-model",
-            }
-            updated = True
-        if updated:
-            paths.write_config(cfg)
-        deferred = [change["sessionId"] for change in planned["changes"] if change.get("busy")]
-        return {"applied": updated, "dryRun": False, **planned,
-                "deferredUntilIdle": deferred}
+    # The roster writer lock comes before the model lock, which is the order
+    # every writer uses. A selection that changed the configuration without
+    # that lock could overwrite a roster change made at the same time, and the
+    # configuration is written only if nobody else changed it meanwhile.
+    with roster.roster_lock():
+        with model_lock():
+            cfg = paths.config()
+            planned = plan(cfg, model, session_id, db)
+            if dry_run:
+                return {"applied": False, "dryRun": True, **planned}
+            updated = False
+            for change in planned["changes"]:
+                if change["action"] != "select":
+                    continue
+                entry = _worker_entry(cfg, change["sessionId"])
+                previous = entry.get("model")
+                entry["model"] = change["model"]
+                entry["modelSelection"] = {
+                    "model": change["model"],
+                    "previous": previous,
+                    "requestedAt": time.time(),
+                    "by": "opencode-model",
+                }
+                updated = True
+            if updated:
+                roster.write_config_cas(cfg, roster.config_digest())
+            deferred = [change["sessionId"] for change in planned["changes"] if change.get("busy")]
+            return {"applied": updated, "dryRun": False, **planned,
+                    "deferredUntilIdle": deferred}

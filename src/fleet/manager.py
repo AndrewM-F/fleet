@@ -113,10 +113,16 @@ def import_queue(db, slots, queue=None):
     drained or removed at that moment.
     """
     with roster.roster_lock():
-        return _import_queue(db, slots, queue)
+        # The roster is read again inside the lock. The caller's snapshot is
+        # still the authority for what a task may target, but a worker it holds
+        # that the roster no longer has was removed after the snapshot was
+        # taken, and a task for it is not imported.
+        current = {slot["sessionId"] for slot in paths.all_slots()}
+        removed = {sid for sid in slots if sid not in current}
+        return _import_queue(db, slots, queue, removed)
 
 
-def _import_queue(db, slots, queue=None):
+def _import_queue(db, slots, queue=None, removed=()):
     queue_path = Path(queue or paths.QUEUE)
     if not queue_path.exists():
         return
@@ -134,6 +140,8 @@ def _import_queue(db, slots, queue=None):
             continue
         if task.get("rootAuthorized") is not True or sid not in slots or not task.get("message"):
             raise ValueError("Unapproved or unknown task target")
+        if sid in removed:
+            raise ValueError("The worker was removed from the roster while the task was queued")
         if task.get("recoveryId") and not recovery.recovery_for_task(
                 db, task["recoveryId"], task["id"], sid, task.get("previousTaskId")):
             pending = db.execute("SELECT status FROM recoveries WHERE id=?",

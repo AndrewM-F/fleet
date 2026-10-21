@@ -83,26 +83,47 @@ def write_config_cas(cfg, expected_digest):
     paths.write_config(cfg)
 
 
-def queued_tasks_for(session_id):
-    """The root-authored tasks that are waiting to be imported for a worker.
+class QueueUnreadable(RuntimeError):
+    """The root-authored queue could not be read, so the work in it is unknown."""
+
+
+def queued_tasks_for(session_id, db=None):
+    """The root-authored tasks that are still waiting to be imported for a worker.
 
     A task in the queue file is not in the task ledger yet, so it is easy to
-    miss: a task that names this worker is reported, so a removal never drops
-    work that has not been imported yet.
+    miss: a task that names this worker and is not in the ledger is reported,
+    so a removal never drops work that has not been imported yet. A task that
+    **is** in the ledger was already imported: it is history, and it does not
+    block anything.
+
+    An unreadable or malformed queue is **not** an empty queue. The work in it
+    is unknown, so this refuses instead of reporting nothing.
 
     The caller holds the queue lock: this reads the file under it and never
     takes the lock itself, because a second lock on the same file in one
     process waits for itself.
     """
     try:
-        queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
-                 else {"tasks": []})
-    except (OSError, ValueError):
+        raw = paths.QUEUE.read_text() if paths.QUEUE.exists() else ""
+    except OSError as error:
+        raise QueueUnreadable("the root-authored queue could not be read: "
+                              + error.__class__.__name__) from error
+    if not raw.strip():
         return []
+    try:
+        queue = json.loads(raw)
+    except ValueError as error:
+        raise QueueUnreadable("the root-authored queue is malformed") from error
+    if not isinstance(queue, dict) or not isinstance(queue.get("tasks", []), list):
+        raise QueueUnreadable("the root-authored queue is malformed")
     found = []
     for task in queue.get("tasks", []):
-        if not isinstance(task, dict):
+        if not isinstance(task, dict) or task.get("sessionId") != session_id:
             continue
-        if task.get("sessionId") == session_id:
-            found.append({"taskId": task.get("id"), "state": "awaiting-import"})
+        task_id = task.get("id")
+        if db is not None and task_id and db.execute(
+                "SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
+            # Already imported: terminal history, not work waiting to arrive.
+            continue
+        found.append({"taskId": task_id, "state": "awaiting-import"})
     return found

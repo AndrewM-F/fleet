@@ -87,6 +87,19 @@ never invents a session id, so the id in a receipt is always the id the native s
 - The request key is bound to the request, the roster write is compared with the configuration the
   request started from, and provisioning and roster writes are serialized across processes. A
   concurrent writer is never overwritten and two requests for the same key cannot both create.
+  One writer lock serializes the roster, the queue enqueue, the queue import, the model selection
+  and the dispatch claim, in that order; the enqueue and the import read the roster inside the
+  lock, so a roster a concurrent removal has already changed is never used to accept a task for a
+  worker that is gone.
+- A dry run writes nothing at all: no receipt, no provisioning row, no roster entry, no native
+  state. A dry run that reconciles an uncertain attempt verifies but never records.
+- An interrupted attempt is only recoverable when the sessions it accounted for cover every
+  session the request was going to create. A receipt for an earlier creation does not prove that a
+  later one did not happen without a receipt, so the request stays uncertain until the exact
+  identities are named with `--reconciled-session`.
+- A root-authored queue that cannot be read, or that is malformed, is not an empty queue: the
+  removal refuses, because the work in it is unknown. A queue entry that is already in the task
+  ledger was imported: it is history, and it does not block a removal.
 - One request may add up to thirty-two sessions, so a whole scale-up (for example eight to
   twenty-five sessions) is one bounded request rather than several manual calls. `--target-total`
   states the size the roster should reach, so that request adds exactly the difference and the

@@ -115,15 +115,21 @@ command prints JSON on stdout and exits non-zero on failure.
   account, working directory, model, dispatch flag or admission limit is refused, never silently
   reshaped. One bounded request covers a whole scale-up (a request may add up to thirty-two
   sessions, so eight to twenty-five is one request of seventeen additions). One writer lock
-  serializes the roster, the queue and the dispatch claim, and every roster write is a
-  compare-and-swap against the configuration the writer started from, so a concurrent writer is
-  never overwritten. A creation whose answer never arrived stays **uncertain**: it is not an
+  serializes the roster, the queue enqueue, the queue import, the model selection and the dispatch
+  claim, and every roster write is a compare-and-swap against the configuration the writer started
+  from, so a concurrent writer is never overwritten. The enqueue and the import read the roster
+  inside that lock, so a roster a concurrent removal has already changed is never used to accept a
+  task for a worker that is gone. A creation whose answer never arrived stays **uncertain**: it is not an
   ordinary retryable failure, the intent is recorded before the first native call, and the
   request stops. The native inventory is never scanned and nothing is adopted: absence and
   unreadability are no proof that no session was created, so the operator names the session with
   `--reconciled-session` and that exact id is verified — id, working directory and model — before
   it is registered. A session whose receipt says it was never verified is never ignored: it is
-  reconciled first, and an unresolved one refuses the request. The creation call is proved against
+  reconciled first, and an unresolved one refuses the request. An interrupted attempt is only
+  recoverable when the sessions it accounted for cover every session the request was going to
+  create: a receipt for an earlier creation does not prove that a later one did not happen
+  without a receipt, so the request stays uncertain until the exact identities are named. A dry run
+  writes nothing at all, not even the receipt a reconciliation would have made. The creation call is proved against
   the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare the
   resolved shape — the model as a `Model.Ref` object with a required `id` and `providerID`, the
   location as a `Location.PublicRef` object with a required `directory`, and no other property —

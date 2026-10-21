@@ -461,8 +461,26 @@ def _session_receipts(db, request_key=None):
 
 
 def _record_provisioning(db, request_key, request, status, detail="", count=None,
-                         payload_digest="", creator_pid=0):
+                         payload_digest="", creator_pid=0, keep_registered=False):
+    """Record the state of a provisioning request.
+
+    ``keep_registered`` refuses to move a request that is already registered
+    back to an earlier state: a final intent must never overwrite the fact
+    that the request was registered.
+    """
     now = time.time()
+    if keep_registered:
+        db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
+            "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(request_key) DO UPDATE SET detail=excluded.detail,"
+            "updated=excluded.updated",
+            (request_key, request["model"], request["account"], request["cwd"], request["root"],
+             request["count"] if count is None else count, int(request["dispatchEnabled"]),
+             status, now, now, detail, payload_digest, int(creator_pid)))
+        db.commit()
+        return
     db.execute(
         "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
         "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
@@ -685,15 +703,26 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                                  "identity could never be verified (" + receipt["session_id"]
                                  + "): " + str(error)
                                  + ". It is not ignored and no new session is created.") from error
-            _record_session(db, receipt["session_id"], key, request, "created",
-                            "reconciled: the native identity was read back")
-    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled \
-            and not _recorded_sessions(existing):
+            if not dry_run:
+                _record_session(db, receipt["session_id"], key, request, "created",
+                                "reconciled: the native identity was read back")
+    # The sessions the interrupted attempt recorded for itself. The set is only
+    # a proof of what the attempt did when it covers every session the request
+    # was going to create: a pending receipt alone does not prove that a later
+    # creation did not happen without a receipt.
+    recorded = _recorded_sessions(existing)
+    # The sessions this request can account for: the ones it receipted and the
+    # ones it recorded before its roster write. A continuation is safe only when
+    # that set covers every session the request was going to create; a receipt
+    # for an earlier creation does not prove that a later one did not happen
+    # without a receipt.
+    accounted = {receipt["session_id"] for receipt in receipts
+                 if receipt["status"] == "created"} | set(recorded)
+    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled:
         # The previous attempt's outcome is unknown: nothing is adopted on
         # speculation. The operator names the native session that was created and
-        # that exact id is verified before it is registered. A recorded session
-        # is the one exception: it proves what the attempt did.
-        if existing[7] == "uncertain" or not pending:
+        # that exact id is verified before it is registered.
+        if existing[7] == "uncertain" or len(accounted) < count:
             raise ValueError("The previous attempt of this request is uncertain: whether a "
                              "native session was created is unknown, and absence is no proof. "
                              "Name the native session id that was created with "
@@ -712,13 +741,13 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                                  "so it is not registered and no session was created.") from error
             raise ValueError("The named native session " + identifier + " does not match this "
                              "request: " + str(error)) from error
-        _record_session(db, identifier, key, request, "created",
-                        "reconciled explicitly by the operator")
+        if not dry_run:
+            _record_session(db, identifier, key, request, "created",
+                            "reconciled explicitly by the operator")
     # The sessions an interrupted attempt of this request created are recovered
     # from the record it left behind and verified again before they are
     # registered. They are this request's own sessions, so this is a recovery and
     # not an adoption of an unrostered session.
-    recorded = _recorded_sessions(existing)
     for identifier in recorded:
         if any(receipt["session_id"] == identifier for receipt in receipts):
             continue
@@ -728,8 +757,9 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
             raise ValueError("A native session this request created before it was interrupted "
                              "no longer verifies (" + identifier + "): " + str(error)
                              + ". It is not ignored and no new session is created.") from error
-        _record_session(db, identifier, key, request, "created",
-                        "recovered from the request's own record")
+        if not dry_run:
+            _record_session(db, identifier, key, request, "created",
+                            "recovered from the request's own record")
     receipts = _session_receipts(db, key)
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
@@ -879,7 +909,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     # sessions instead of creating a second set.
     _record_provisioning(db, key, request, "creating",
                          json.dumps({"sessions": to_register}), payload_digest=digest,
-                         creator_pid=os.getpid())
+                         creator_pid=os.getpid(), keep_registered=True)
     with roster.roster_lock():
         updated = paths.config()
         for identifier in to_register:
@@ -980,7 +1010,15 @@ def drain_session(db, session_id, note=""):
             config_digest = roster.config_digest()
             entry = _roster_entry(cfg, session_id)
             outstanding = _outstanding_tasks(db, session_id)
-            awaiting = roster.queued_tasks_for(session_id)
+            try:
+                awaiting = roster.queued_tasks_for(session_id, db)
+            except roster.QueueUnreadable as error:
+                # The queue could not be read, so the work in it is unknown. The
+                # drain still stops new work, and it says what it could not see.
+                awaiting = []
+                queue_error = str(error)
+            else:
+                queue_error = None
             state = _native_state(cfg, entry)
             draining = bool(entry.get("draining", False))
             if not draining:
@@ -1002,6 +1040,7 @@ def drain_session(db, session_id, note=""):
             return {"action": "drain-opencode", "sessionId": session_id, "draining": True,
                     "alreadyDraining": draining, "outstanding": outstanding,
                     "awaitingImport": awaiting,
+                    "queueUnreadable": queue_error,
                     "nativeState": state.get("state"), "removed": False,
                     "note": "the native session and its history are untouched",
                     "honouredByThisBuild": _manager_honours_draining(),
@@ -1052,7 +1091,13 @@ def _remove_session(db, session_id, note, allow_unverified_native):
     config_digest = roster.config_digest()
     entry = _roster_entry(cfg, session_id)
     outstanding = _outstanding_tasks(db, session_id)
-    awaiting = roster.queued_tasks_for(session_id)
+    try:
+        awaiting = roster.queued_tasks_for(session_id, db)
+    except roster.QueueUnreadable as error:
+        # An unreadable queue is not an empty queue: the removal refuses,
+        # because the work in it is unknown.
+        raise ValueError("The root-authored queue could not be read, so the work in it is "
+                         "unknown: " + str(error) + ". The removal is refused.") from error
     if outstanding:
         raise ValueError("The worker still owns outstanding work: "
                          + ", ".join(f"{item['taskId']}({item['state']})"

@@ -385,9 +385,10 @@ class UncertainOutcomeTests(Sandbox):
         original = opencode_lifecycle._record_provisioning
 
         def record(db, key, request, status, detail="", count=None, payload_digest="",
-                   creator_pid=0):
+                   creator_pid=0, keep_registered=False):
             seen.append(status)
-            return original(db, key, request, status, detail, count, payload_digest, creator_pid)
+            return original(db, key, request, status, detail, count, payload_digest,
+                            creator_pid, keep_registered)
 
         with patch.object(opencode_lifecycle, "_record_provisioning", side_effect=record):
             self.add(count=1, request_key="w5-uncertain-002")
