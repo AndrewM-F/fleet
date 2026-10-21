@@ -3,9 +3,9 @@
 **Author:** W8 (independent qualification; not the runtime owner)
 **Runtime owner:** W5 — this document qualifies their implementation and changes none of it
 **Qualification suite:** `tests/test_lifecycle_qualification_independent.py` (one owned file)
-**Status:** **not qualified.** Five invariants fail against the published base. Each failure is
-recorded below with its exact test name, command, observed behaviour and the smallest owned-path
-patch suggestion for the source owner.
+**Status:** **not qualified.** Five invariants do not pass against the published base (four
+assertion failures and one error). Each failure is recorded below with its exact test name,
+command, observed behaviour and the smallest owned-path patch suggestion for the source owner.
 
 ## 1. The exact source base
 
@@ -222,21 +222,40 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 
 | Command | Scope | Result at `f4f26de` |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite only | **29 tests, 24 pass, 5 fail** (D1–D5) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository, including this suite | see §7 |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite only | **29 tests: 24 pass, 4 assertion failures, 1 error** — 5 not passing (D1–D5) |
+| `python3 -m unittest discover -s tests -t .` | the whole repository, including this suite | **492 tests: 11 failures, 1 error** — 5 of them are D1–D5, **7 are pre-existing** (below) |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository **without** this file (it is the only `test_l*` module) | **463 tests: 7 failures** — the pre-existing baseline |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
 | `git diff --stat f4f26de...codex/20261021-w8-independent-lifecycle-qualification` | the owned delta | two new paths only |
+
+**This suite adds no failure to the repository's own tests.** The 7 failures in the baseline run are
+present with or without this file, all in `tests/test_queue_runway.py`
+(`QueueRunwayTests`): `test_active_is_not_reserve`,
+`test_cycle_returns_early_when_runway_is_low`,
+`test_default_remains_nonblocking_snapshot_with_timeout_zero`,
+`test_pending_import_is_distinct_and_deduplicated`, `test_queued_successors_cover_both_workers`,
+`test_unapproved_or_unknown_targets_do_not_cover_workers` and
+`test_uncertain_and_finished_never_count`. They belong to the runtime owner's area and are
+**pre-existing at the published base**; the observed symptom is a *session id* appearing in a
+report's task list where a task id was expected
+(`['b', 'ses_EXISTING000000000001'] != ['b']`). That is the same queue-history area as D3, and it
+is reported here as context for the owner, not as a finding of this qualification.
 
 The repository has no separate lint or format tool (no CI workflow, no packaging configuration);
 the documented check is the unittest discovery above, plus a byte-compile of the owned file. The
 owned file follows the repository's style (module docstring, `unittest.TestCase` classes, no
-third-party imports, the same source-layout path bootstrap as the repository's own tests).
+third-party imports, the same source-layout path bootstrap as the repository's own tests) and stays
+within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite does not pass on the published base.** Five invariants fail (§3). Until the source
-   owner repairs them — or records why the invariant is wrong — this branch cannot be qualified.
-2. **The final-head re-run has not happened.** W5's task08 was still `working` when this ran, so
+1. **The suite does not pass on the published base.** Five invariants do not pass (§3). Until the
+   source owner repairs them — or records why the invariant is wrong — this branch cannot be
+   qualified.
+2. **The published base is not green in the repository's own suite either.** 7 tests in
+   `tests/test_queue_runway.py` fail at `f4f26de` with or without this qualification (§6). They
+   are the runtime owner's, and they are in the same queue-history area as D3.
+3. **The final-head re-run has not happened.** W5's task08 was still `working` when this ran, so
    the reconciliation onto their final reviewed head is outstanding. **Qualification is not
    declared**, and the suite is expected to be re-run unchanged against that head.
 3. **D1–D5 are observations, not verdicts.** The owner may show that an invariant is wrong; this
