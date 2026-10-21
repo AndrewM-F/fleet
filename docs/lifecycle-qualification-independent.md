@@ -3,30 +3,29 @@
 **Author:** W8 (independent qualification; not the runtime owner)
 **Runtime owner:** W5 — this document qualifies their implementation and changes none of it
 **Qualification suite:** `tests/test_lifecycle_qualification_independent.py` (one owned file)
-**Status:** **not qualified.** Five invariants do not pass against the published base (four
-assertion failures and one error). Each failure is recorded below with its exact test name,
-command, observed behaviour and the smallest owned-path patch suggestion for the source owner.
+**Status:** **not qualified.** Against the owner's final reviewed head `9d2bd8db`, four invariants
+still do not pass (three assertion failures and one error); a fifth, found at the admission base,
+was repaired by the owner and is kept as a passing regression. Each failure is recorded below with
+its exact test name, command, observed behaviour and the smallest owned-path patch suggestion for
+the source owner.
 
 ## 1. The exact source base
 
 | Field | Value |
 | --- | --- |
-| Repository | `/Users/amf/Developer/.codex/fleet` (remote `adea-ai/fleet`) |
-| **Immutable test base** | **`f4f26de14359d2f3b220fe5195f65c91a82c7b9f`** — "feat(fleet): one command to a total roster size, with a single writer lock" |
-| Base branch | `feat/opencode-session-lifecycle-add-remove` (published, `origin/feat/opencode-session-lifecycle-add-remove` = `f4f26de`) |
-| Base owner worktree | `/Users/amf/Developer/.worktrees/fleet-opencode-session-lifecycle` — read only by this qualification |
-| Qualification branch | `codex/20261021-w8-independent-lifecycle-qualification` (W8-owned) |
+| Repository | `/Users/amf/Developer/.codex/fleet` (remote `0xPlayerOne/fleet`) |
+| **Admission base** | **`f4f26de14359d2f3b220fe5195f65c91a82c7b9f`** — "feat(fleet): one command to a total roster size, with a single writer lock" — the head W5 published at admission, treated as a provisional immutable test base |
+| **Owner final head** | **`9d2bd8db9432fe51c3848c8e143c50f3272be662`** — "feat(fleet): match the resolved session-create contract, and prove the reload" — published as `origin/feat/opencode-session-lifecycle-add-remove`, submitted for review by W5 at 2026-10-21T09:23:56Z (`review_ready`, task `20261021-w5-fleet-lifecycle-final-add-only-and-native-contract-proof-08`, state `done`) |
+| Owner branch | `feat/opencode-session-lifecycle-add-remove` (published; the local owner worktree `/Users/amf/Developer/.worktrees/fleet-opencode-session-lifecycle` is read-only for this qualification) |
+| **Qualification branch** | `codex/20261021-w8-independent-lifecycle-qualification`, head **`f7eca207d2c8b554dc16265163f77d54f3d1eaee`** (two commits on the owner final head) |
 | Qualification worktree | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8` |
-| Branch base | created from `f4f26de` itself, so it contains **only** the two qualification paths and can target W5's branch without rewriting or duplicating their source |
-| Base provenance | the head W5 published at admission; W5's task `20261021-w5-fleet-lifecycle-final-add-only-and-native-contract-proof-08` was **still `working`** when this qualification ran (live manager view, session `ses_a028b8fd0eed4f2c985ed1e0fa`, updated 2026-10-21T09:23:17Z) |
+| Branch base | the two qualification commits were first built on `f4f26de` and then **rebased onto the owner final head** `9d2bd8db` once the owner's task reported terminal. The rebase replays **only W8's two commits**; no owner path was changed, and the diff against the owner branch is still exactly the two new paths |
+| Base provenance | W5's task was `working` when the suite was first built, so the qualification did not wait: it was built, checked and run against `f4f26de`, and the defects were routed back before the owner's task finished |
 
-The base is treated as **provisional and immutable**. W5's branch had already moved to
-`9d2bd8db9432fe51c3848c8e143c50f3272be662` in their own worktree by the time this suite ran, but
-their owner has **not** reported task08 terminal, so this qualification stays on `f4f26de` and the
-reconciliation onto their final reviewed head has **not** been performed. The suite is written
-against the public behaviour of the lifecycle module, so it is expected to be re-runnable unchanged
-against the final head; that re-run is the remaining gate, and **qualification is not declared
-until the same suite passes on that head**.
+The admission base and the owner final head are both reported because the evidence has two parts:
+what the published base did (§3, D1–D5) and what the owner's final reviewed head still does (§3,
+final-head status). **Qualification is not declared: the same suite does not pass on the final
+head** (§3, §6).
 
 ## 2. What the suite covers, and what it deliberately does not
 
@@ -94,6 +93,10 @@ happened, and that the reported status matches what actually occurred.
 Each item is a failing test in the committed suite. **No production fix is implemented or copied
 here**; the suggestion is the smallest change in the source owner's own paths, offered for the
 owner to accept, reject or re-shape.
+
+**Status against the owner final head `9d2bd8db`:** D1 is **repaired** by the owner's commit
+"match the resolved session-create contract, and prove the reload" — its test now passes. **D2, D3,
+D4 and D5 still fail**, unchanged, and they are retained here as the open regressions.
 
 ### D1 — the session-create body does not conform to the schema the runtime proved
 
@@ -220,13 +223,15 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 
 ## 6. Commands and results
 
-| Command | Scope | Result at `f4f26de` |
+| Command | Scope | Result |
 | --- | --- | --- |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite only | **29 tests: 24 pass, 4 assertion failures, 1 error** — 5 not passing (D1–D5) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository, including this suite | **492 tests: 11 failures, 1 error** — 5 of them are D1–D5, **7 are pre-existing** (below) |
-| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository **without** this file (it is the only `test_l*` module) | **463 tests: 7 failures** — the pre-existing baseline |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite, at the **admission base** `f4f26de` | **29 tests: 24 pass, 4 assertion failures, 1 error** — 5 not passing (D1–D5) |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `f4f26de`, including this suite | **492 tests: 11 failures, 1 error** — 5 of them are D1–D5, **7 are pre-existing** (below) |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository at `f4f26de` **without** this file (it is the only `test_l*` module) | **463 tests: 7 failures** — the pre-existing baseline |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the same suite at the owner final head `9d2bd8db`** | **29 tests: 25 pass, 3 assertion failures, 1 error** — 4 not passing (D2–D5); D1 now passes |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `9d2bd8db`, including this suite | **504 tests: 10 failures, 1 error** — 4 of them are D2–D5, 7 pre-existing (unchanged) |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
-| `git diff --stat f4f26de...codex/20261021-w8-independent-lifecycle-qualification` | the owned delta | two new paths only |
+| `git diff --stat 9d2bd8db...codex/20261021-w8-independent-lifecycle-qualification` | the owned delta against the owner branch | two new paths only |
 
 **This suite adds no failure to the repository's own tests.** The 7 failures in the baseline run are
 present with or without this file, all in `tests/test_queue_runway.py`
@@ -249,21 +254,20 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite does not pass on the published base.** Five invariants do not pass (§3). Until the
-   source owner repairs them — or records why the invariant is wrong — this branch cannot be
-   qualified.
-2. **The published base is not green in the repository's own suite either.** 7 tests in
-   `tests/test_queue_runway.py` fail at `f4f26de` with or without this qualification (§6). They
-   are the runtime owner's, and they are in the same queue-history area as D3.
-3. **The final-head re-run has not happened.** W5's task08 was still `working` when this ran, so
-   the reconciliation onto their final reviewed head is outstanding. **Qualification is not
-   declared**, and the suite is expected to be re-run unchanged against that head.
-3. **D1–D5 are observations, not verdicts.** The owner may show that an invariant is wrong; this
+1. **The suite does not pass on the owner final head either.** Four invariants still do not pass at
+   `9d2bd8db` — D2, D3, D4 and D5 (§3). Until the source owner repairs them — or records why the
+   invariant is wrong — this branch cannot be qualified.
+2. **The owner final head is not green in the repository's own suite either.** 7 tests in
+   `tests/test_queue_runway.py` fail at both `f4f26de` and `9d2bd8db` (§6). They are the runtime
+   owner's, and they are in the same queue-history area as D3.
+3. **D1 is repaired and kept as a regression.** Its test stays in the suite and now passes on
+   `9d2bd8db`; it is not deleted, so the repair remains covered.
+4. **D1–D5 are observations, not verdicts.** The owner may show that an invariant is wrong; this
    document then records that, exactly as the earlier Fleet audits record withdrawn claims
    instead of editing them away.
-4. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
+5. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
    disposable native CLI and a disposable fleet, which are outside this outcome's scope and outside
    its authority.
-5. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
+6. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
    documentation file was modified, and no live manager, session, configuration, registered
    worktree or resource was touched.
