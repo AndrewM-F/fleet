@@ -37,10 +37,9 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet recover-opencode --direct-turn-receipt PATH` | ownership source for a genuine native turn that predates the task ledger: a durable receipt in `data/recovery/` recording the original session, canonical worktree, branch and initial head, proved against the native completed turn and the unchanged checkout |
 | `bin/fleet reconcile-recovery --task ID` | release a claimed recovery reservation after verified native stop |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |
-| `bin/fleet add-opencode --count N --model PROVIDER/MODEL --cwd PATH --root PATH [--request-key KEY] [--enable-dispatch] [--max-concurrent N] [--dry-run\|--status]` | create and register OpenCode sessions on demand, idempotently per request key |
+| `bin/fleet add-opencode (--count N \|--target-total N) --model PROVIDER/MODEL --cwd PATH --root PATH [--request-key KEY] [--enable-dispatch] [--max-concurrent N] [--reconciled-session SID] [--dry-run\|--status]` | create and register OpenCode sessions on demand, idempotently per request key |
 | `bin/fleet drain-opencode --session SID --note "..."` | stop dispatching to one worker and report the work it still owns (nothing is dropped) |
 | `bin/fleet remove-opencode --session SID --note "..."` | remove one worker from the roster, keeping its native session and history |
-| `bin/fleet rollback-opencode --request-key KEY --note "..."` | withdraw one provisioned request from the roster, keeping its native sessions |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |
 | `bin/fleet run` / `wait` / `ack --event-id N` | foreground manager / any-event wait (was `fleet.py`) |
 

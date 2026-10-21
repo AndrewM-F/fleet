@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS opencode_provisioning (
   requested_count INTEGER NOT NULL, dispatch_enabled INTEGER NOT NULL,
   status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
   detail TEXT NOT NULL DEFAULT '',
-  payload_digest TEXT NOT NULL DEFAULT '');
+  payload_digest TEXT NOT NULL DEFAULT '',
+  creator_pid INTEGER NOT NULL DEFAULT 0);
 """
 _OPENCODE_SESSIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS opencode_sessions (
@@ -85,6 +86,22 @@ def _upgrade_opencode_provisioning(db):
         return
     db.execute("ALTER TABLE opencode_provisioning ADD COLUMN payload_digest "
                "TEXT NOT NULL DEFAULT ''")
+    db.commit()
+
+
+def _upgrade_opencode_creator_pid(db):
+    """Add the creator pid to a provisioning table created by an earlier build.
+
+    The pid tells a live attempt from an interrupted one: a request that finds
+    a live creator is told that the request is in progress, while a request
+    that finds a dead one knows the attempt was interrupted and that its
+    outcome has to be reconciled explicitly.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(opencode_provisioning)")}
+    if not columns or "creator_pid" in columns:
+        return
+    db.execute("ALTER TABLE opencode_provisioning ADD COLUMN creator_pid "
+               "INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -183,6 +200,7 @@ def database(path=None):
     db.executescript(_OPENCODE_PROVISIONING_TABLE)
     db.executescript(_OPENCODE_SESSIONS_TABLE)
     _upgrade_opencode_provisioning(db)
+    _upgrade_opencode_creator_pid(db)
     _upgrade_recovery_adoptions(db)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}

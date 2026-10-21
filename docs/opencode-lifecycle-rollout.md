@@ -3,7 +3,7 @@
 This plan is **not executed**. It describes how the on-demand OpenCode session lifecycle is
 activated on a live fleet and how it is withdrawn again, for root review.
 
-Two facts about the live deployment shape the plan and are stated here rather than assumed:
+Three facts about the live deployment shape the plan and are stated here rather than assumed:
 
 - **The running manager is a pinned older build.** It does not know the `draining` flag, so a
   drained worker keeps receiving queued work from it. The drain is therefore *advisory* against
@@ -13,6 +13,11 @@ Two facts about the live deployment shape the plan and are stated here rather th
   `opencode_sessions` are additive: the new code creates them on the first `database()` call, an
   older manager ignores unknown tables, and no existing row is rewritten. The migration is a
   one-command step and it must run **before** any provisioning request.
+- **There is one removal path.** A worker leaves the roster only through
+  `bin/fleet remove-opencode`, with its barriers: no queued, in-flight, uncertain,
+  awaiting-import or recovery-owned work, and a verifiable native identity. There is no second,
+  faster path that skips those barriers, so there is nothing to roll back around: a withdrawn
+  request is withdrawn by draining and removing its workers, one by one, with the same proof.
 
 ## Stage 0 — root review
 
@@ -33,98 +38,78 @@ against the same file; the extra tables are invisible to it. Confirm afterwards 
 ## Stage 2 — read-only plan against the live root
 
 ```
-bin/fleet add-opencode --count 17 --model opencode-go/minimax-m3.1-flash-free \
+bin/fleet add-opencode --target-total 25 --model opencode-go/minimax-m3.1-flash-free \
   --cwd <worktree> --root <fleet root> --request-key <key> --dry-run
 ```
 
-The dry run writes nothing and creates nothing. It confirms the account, the model, the working
-directory, the number of sessions that would be added and the admission limit that would apply.
+`--target-total` states the size the roster should reach, so one command reaches it: from eight
+workers it adds exactly seventeen and the roster ends at twenty-five, not twenty-six. The dry
+run writes nothing at all — no receipt, no roster entry, no native state — and it also consults
+the installed CLI's own schema, so the report says whether the creation call is proved
+provider-free before anything is created.
 
-## Stage 3 — canary (one session, dispatch disabled)
+## Stage 3 — the creation path is proved against the installed CLI
 
-```
-bin/fleet add-opencode --count 1 --model opencode-go/minimax-m3.1-flash-free \
-  --cwd <worktree> --root <fleet root> --request-key <canary-key>
-```
+The command consults the OpenAPI document the installed OpenCode CLI serves itself
+(`opencode api --standalone GET /openapi.json`) before it creates anything. The evidence is
+quoted in [opencode-native-api-evidence.md](opencode-native-api-evidence.md): `POST /api/session`
+(`session.create`), an all-optional body with no prompt-shaped field and no security scheme, so
+the call records the model and the directory and reaches no provider. If the installed CLI does
+not declare that operation, **no session is created** and the command refuses.
 
-The new worker is added with `dispatchEnabled: false`, so it takes no work. Verify:
-
-- the native session exists in the account and its identity row names the intended directory and
-  the approved model (`bin/fleet doctor` reports it);
-- the roster grew by exactly one entry and the admission limit did not change;
-- the manager, on its next cycle, reports the new worker as idle and dispatchable only after the
-  flag is set.
-
-## Stage 4 — dispatch enablement (explicit, manual)
-
-No command owns the roster's `dispatchEnabled` flag. Enabling the canary is an explicit edit of
-`config/fleet.local.json` for that one worker, after root confirms the canary's native identity
-and model. This is the one activation step that is not a Fleet command, and it stays that way
-until a dedicated command is authorized.
-
-## Stage 5 — scale in one bounded request
+## Stage 4 — the one bounded request
 
 ```
-bin/fleet add-opencode --count 17 --model opencode-go/minimax-m3.1-flash-free \
-  --cwd <worktree> --root <fleet root> --request-key <scale-key> [--max-concurrent N]
+bin/fleet add-opencode --target-total 25 --model opencode-go/minimax-m3.1-flash-free \
+  --cwd <worktree> --root <fleet root> --request-key <key> [--max-concurrent N]
 ```
 
-One bounded request covers the whole scale-up (eight to twenty-five sessions is seventeen
-additions, inside the bound of thirty-two per request). The request key is bound to the complete
-request: reusing it with a different count, account, working directory, model, dispatch flag or
-admission limit is refused, so a scale step is never silently reshaped. The admission limit is
-changed only when it is asked for and only inside the validated limits.
+One request reaches the target size. The request key is bound to the complete request — the
+total, the account, the working directory, the model, the dispatch flag and the admission
+limit — so a key reused with any of them changed is refused rather than silently reshaped. The
+admission limit changes only when it is asked for and only inside the validated limits. The new
+workers are dispatch-disabled unless `--enable-dispatch` is given, so a new session can be
+canaried before it takes work.
+
+## Stage 5 — an uncertain attempt is reconciled explicitly
+
+If a creation does not answer, the request stops with an **uncertain** state and says so. The
+native inventory is not scanned and nothing is adopted: absence and unreadability are never proof
+that no session was created. The operator names the native session that was created:
+
+```
+bin/fleet add-opencode --target-total 25 … --request-key <key> --reconciled-session ses_…
+```
+
+That exact id is verified — id, working directory and model — before it is registered. An
+unverified receipt is never ignored: it is reconciled first, and an unresolved one refuses the
+request.
 
 ## Stage 6 — drain and remove
 
 ```
 bin/fleet pause                      # the pinned manager would ignore `draining`
 bin/fleet drain-opencode --session <sid> --note "..."
-# resolve the outstanding work the drain reports
+# resolve the outstanding work the drain reports, including tasks awaiting import
 bin/fleet remove-opencode --session <sid> --note "..."
 bin/fleet resume
 ```
 
-The drain reports the work the worker still owns; nothing is cancelled, released or dropped. The
-removal refuses while a task or turn is queued, in flight or uncertain, while a recovery holds
-the session, and while the native identity cannot be verified. A worker that is known to be
-running is never removed. After the manager is upgraded to a build that honours `draining`, the
-pause is no longer needed for the drain window.
+The drain reports the work the worker still owns, including the tasks that are still waiting in
+the root-authored queue file; nothing is cancelled, released or dropped. The removal refuses
+while a task or turn is queued, in flight or uncertain, while a task is still awaiting import,
+while a recovery holds the session, and while the native identity cannot be verified. A worker
+that is known to be running is never removed. After the manager is upgraded to a build that
+honours `draining`, the pause is no longer needed for the drain window.
 
-## Rollback
+## Withdrawing a request
 
-```
-bin/fleet rollback-opencode --request-key <scale-key> --note "..."
-```
-
-The rollback withdraws exactly the roster entries that request added, records the request as
-rolled back and leaves every native session in the account with its history — a native session is
-never deleted. A rolled-back request key never adds again, so a retry cannot resurrect the
-sessions silently; a new request needs a new key. The receipts keep the history of what was
-created, so the audit trail survives the rollback.
-
-If the roster was changed by something else in the meantime, the write is refused: the roster is
-compared with the copy the request started from, and a changed configuration is never
-overwritten.
-
-## What the review findings changed in this plan
-
-- **The native model is verified, not only the id and the directory.** A session whose recorded
-  model is not the requested one is refused, and a session created by an earlier attempt is verified
-  again — id, directory **and** model — immediately before it is registered.
-- **A duplicated native id is rejected.** An id that is already in the roster, already owned by
-  another request, or already created earlier in this request is refused instead of being
-  registered a second time.
-- **The creation path is proved against the installed CLI, not only against synthetic tests.**
-  [opencode-native-api-evidence.md](opencode-native-api-evidence.md) quotes the OpenAPI 3.1.0 schema
-  that the installed OpenCode v2.0.29 serves from its own `GET /openapi.json`: `POST /api/session`
-  (`session.create`), an all-optional body of `{id, parentID, title, agent, model, location,
-  metadata, permissions}`, no prompt-shaped field and no security scheme, so the call is
-  provider-free. The spec and the probe are kept with the operator handoff.
+There is no rollback command, because a fast path around the removal barriers is a way to lose
+work. A request is withdrawn by draining and removing its workers, one by one, with the same
+proof, and the receipts keep the record of what was created.
 
 ## What this plan never does
 
 It creates no account, changes no credential, permission, provider or model, clears no hold,
 cancels no task, deletes no native session, starts no second manager, and never deploys or
-releases anything. Every stage is reversible except the native sessions, which are kept on
-purpose.
+releases anything.

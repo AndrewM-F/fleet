@@ -6,7 +6,7 @@ import subprocess
 import time
 
 from . import claude, pi
-from . import holds, model_selection, recovery
+from . import holds, model_selection, recovery, roster
 from .store import BUSY, emit
 
 
@@ -89,66 +89,83 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         # launch uses.
         is_opencode = slot.get("provider") == "opencode"
         model_lock = model_selection.model_lock() if is_opencode else nullcontext()
-        with model_lock:
-            claim_model = None
-            launch_slot = slot
-            if is_opencode:
-                # The roster was loaded before this claim, so a selection that
-                # landed since then is not in it. The configuration is reloaded
-                # and validated inside the shared lock, so the claim and the
-                # launch use the model that is current now. The reload is
-                # fail-closed: an unreadable configuration, a removed worker
-                # or an ambiguous one is a refusal, never a fallback to the
-                # cached roster.
-                try:
-                    launch_slot = model_selection.current_slot(slot)
-                except (ValueError, OSError) as error:
-                    _report_refusal(db, task_id, sid, error)
-                    continue  # Leave the task queued; the sender is never called.
-                if not launch_slot.get("dispatchEnabled", False):
-                    continue
-                try:
-                    claim_model = model_selection.claim_model(launch_slot)
-                    model_selection.validate_model(claim_model)
-                except ValueError:
-                    # A worker that declares no approved model cannot be launched.
-                    # The launch path refuses it; the claim keeps its existing
-                    # behaviour so nothing else is hidden by this check.
-                    claim_model = None
-                if claim_model:
-                    task["model"] = claim_model
-            db.commit()
-            db.execute("BEGIN IMMEDIATE")
-            claimed = db.execute(
-                "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued' "
-                "AND NOT EXISTS (SELECT 1 FROM task_holds WHERE task_id=? AND status='held')",
-                (json.dumps(task), time.time(), task_id, task_id))
-            recovery_record = None
-            if claimed.rowcount == 1 and recovery_id:
-                recovery_record = recovery.claim_recovery(
-                    db, recovery_id, task_id, sid, task.get("previousTaskId"))
-                if recovery_record is None:
-                    db.rollback()
-                    continue
-            db.commit()  # Crash after this point means uncertain delivery; never resend.
-            if claimed.rowcount != 1:
-                continue  # An operator cancelled this task after the queue snapshot.
-            try:
+        # The claim shares the writer lock with the roster commands, and the
+        # roster is re-read inside it: a worker that was drained after the
+        # roster was loaded takes no new work, so a stale pre-drain slot cannot
+        # launch after the drain returned.
+        writer_lock = roster.roster_lock() if is_opencode else nullcontext()
+        try:
+            with writer_lock, model_lock:
+                claim_model = None
+                launch_slot = slot
                 if is_opencode:
-                    if recovery_record:
-                        sender(launch_slot, task["message"], task_id=task_id,
-                               recovery=recovery_record, model=claim_model)
+                    # The roster was loaded before this claim, so a selection that
+                    # landed since then is not in it. The configuration is reloaded
+                    # and validated inside the shared lock, so the claim and the
+                    # launch use the model that is current now. The reload is
+                    # fail-closed: an unreadable configuration, a removed worker
+                    # or an ambiguous one is a refusal, never a fallback to the
+                    # cached roster.
+                    try:
+                        launch_slot = model_selection.current_slot(slot)
+                    except (ValueError, OSError) as error:
+                        _report_refusal(db, task_id, sid, error)
+                        continue  # Leave the task queued; the sender is never called.
+                    if not launch_slot.get("dispatchEnabled", False):
+                        continue
+                    if launch_slot.get("draining"):
+                        # A drained worker takes no new work. Its queued task is not
+                        # dropped, cancelled or re-routed here: it stays bound to the
+                        # worker until an operator resolves it explicitly.
+                        continue
+                    try:
+                        claim_model = model_selection.claim_model(launch_slot)
+                        model_selection.validate_model(claim_model)
+                    except ValueError:
+                        # A worker that declares no approved model cannot be launched.
+                        # The launch path refuses it; the claim keeps its existing
+                        # behaviour so nothing else is hidden by this check.
+                        claim_model = None
+                    if claim_model:
+                        task["model"] = claim_model
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
+                claimed = db.execute(
+                    "UPDATE tasks SET state='dispatching',body=?,updated=? WHERE id=? AND state='queued' "
+                    "AND NOT EXISTS (SELECT 1 FROM task_holds WHERE task_id=? AND status='held')",
+                    (json.dumps(task), time.time(), task_id, task_id))
+                recovery_record = None
+                if claimed.rowcount == 1 and recovery_id:
+                    recovery_record = recovery.claim_recovery(
+                        db, recovery_id, task_id, sid, task.get("previousTaskId"))
+                    if recovery_record is None:
+                        db.rollback()
+                        continue
+                db.commit()  # Crash after this point means uncertain delivery; never resend.
+                if claimed.rowcount != 1:
+                    continue  # An operator cancelled this task after the queue snapshot.
+                try:
+                    if is_opencode:
+                        if recovery_record:
+                            sender(launch_slot, task["message"], task_id=task_id,
+                                   recovery=recovery_record, model=claim_model)
+                        else:
+                            sender(launch_slot, task["message"], task_id=task_id, model=claim_model)
                     else:
-                        sender(launch_slot, task["message"], task_id=task_id, model=claim_model)
+                        sender(slot, task["message"])
+                except Exception as error:
+                    db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?", (time.time(), task_id))
+                    emit(db, "task_uncertain", taskId=task_id, sessionId=sid, error=str(error))
                 else:
-                    sender(slot, task["message"])
-            except Exception as error:
-                db.execute("UPDATE tasks SET state='uncertain',updated=? WHERE id=?", (time.time(), task_id))
-                emit(db, "task_uncertain", taskId=task_id, sessionId=sid, error=str(error))
-            else:
-                db.execute("UPDATE tasks SET state='sent',updated=? WHERE id=?", (time.time(), task_id))
-                emit(db, "task_sent", taskId=task_id, sessionId=sid)
-            db.commit()
+                    db.execute("UPDATE tasks SET state='sent',updated=? WHERE id=?", (time.time(), task_id))
+                    emit(db, "task_sent", taskId=task_id, sessionId=sid)
+                    db.commit()
+        except (OSError, RuntimeError, ValueError) as error:
+            # A worker whose checkout cannot be read, or a writer lock that
+            # cannot be taken, is not claimed, and the tasks after it are still
+            # dispatched. The refusal is recorded once, so it is never silent.
+            _report_refusal(db, task_id, sid, error)
+            continue
         active += 1
         states[sid] = dict(state, state="queued")
 

@@ -92,9 +92,11 @@ command prints JSON on stdout and exits non-zero on failure.
   a capacity/quota gate, or a durable single-owner/recovery reservation.
 - `bin/fleet add-pi ...` / `add-claude ...` / `remove SID` — roster edits, validated (cwd must be a
   git worktree under `worktreeRoot`, IDs unique, nothing in flight on removal).
-- `bin/fleet add-opencode --count N --model PROVIDER/MODEL --cwd PATH --root PATH
+- `bin/fleet add-opencode (--count N | --target-total N) --model PROVIDER/MODEL --cwd PATH --root PATH
   [--database-path PATH] [--request-key KEY] [--enable-dispatch] [--max-concurrent N]
-  [--dry-run] [--status] [--note "..."]` — create and register OpenCode sessions on demand. The
+  [--reconciled-session SID] [--dry-run] [--status] [--note "..."]` — create and register OpenCode
+  sessions on demand. `--target-total` states the size the roster should reach, so one request
+  reaches it exactly; `--count` adds that many. The
   session is created by the supported OpenCode CLI (`session.create` on `POST /api/session`), which
   is the only path that may create a session; the Fleet never writes OpenCode's internal database
   and never invents a session id. Creating a session contacts no provider, so no model call and no
@@ -112,28 +114,31 @@ command prints JSON on stdout and exits non-zero on failure.
   The request key is bound to the **complete** request: reusing it with a different count,
   account, working directory, model, dispatch flag or admission limit is refused, never silently
   reshaped. One bounded request covers a whole scale-up (a request may add up to thirty-two
-  sessions, so eight to twenty-five is one request of seventeen additions). Provisioning and
-  roster writes are serialized across processes and compared with the configuration the request
-  started from, so a concurrent writer is never overwritten. A creation whose answer never
-  arrived stays **uncertain**: it is not an ordinary retryable failure, the intent is recorded
-  before the first native call, and the next run reconciles the native identity before it creates
-  anything. A session whose receipt says it was never verified is never ignored: it is reconciled
-  first, and an unresolved one refuses the request.
+  sessions, so eight to twenty-five is one request of seventeen additions). One writer lock
+  serializes the roster, the queue and the dispatch claim, and every roster write is a
+  compare-and-swap against the configuration the writer started from, so a concurrent writer is
+  never overwritten. A creation whose answer never arrived stays **uncertain**: it is not an
+  ordinary retryable failure, the intent is recorded before the first native call, and the
+  request stops. The native inventory is never scanned and nothing is adopted: absence and
+  unreadability are no proof that no session was created, so the operator names the session with
+  `--reconciled-session` and that exact id is verified — id, working directory and model — before
+  it is registered. A session whose receipt says it was never verified is never ignored: it is
+  reconciled first, and an unresolved one refuses the request. The creation call is proved against
+  the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare a
+  provider-free `session.create` creates nothing.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the
   operator resolves it. A manager that predates the draining flag keeps dispatching to the
   worker, so the drain is advisory against it: pause the fleet or upgrade the manager.
 - `bin/fleet remove-opencode --session SID --note "..."` — remove one worker from the roster. It
-  refuses while a task or turn is queued, in flight or uncertain, while a recovery holds the
-  session, and while the native identity cannot be verified. A worker whose state explicitly says
-  it is running is never removed, and `--allow-unverified-native` does not override that: it only
-  covers a native identity that cannot be read at all. The native session and its history are
-  kept, and no hold, task, queue entry, worktree or credential is touched.
-- `bin/fleet rollback-opencode --request-key KEY --note "..."` — withdraw one provisioned request
-  from the roster. The native sessions stay in the account with their history, the receipts keep
-  the audit trail, and the request key never adds again, so a retry cannot resurrect the sessions
-  silently.
+  refuses while a task or turn is queued, in flight or uncertain, while a task is still waiting to
+  be imported from the root-authored queue, while a recovery holds the session, and while the
+  native identity cannot be verified. A worker whose state explicitly says it is running is never
+  removed, and `--allow-unverified-native` does not override that: it only covers a native identity
+  that cannot be read at all. The native session and its history are kept, and no hold, task, queue
+  entry, worktree or credential is touched. There is no second removal path: a receipt-owned worker
+  leaves the roster only through this command, with these barriers.
 - The staged activation and rollback plan for a live fleet, including the pinned older manager and
   the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
   It is not executed by this command.

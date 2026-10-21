@@ -376,16 +376,21 @@ def cmd_add_opencode(args):
         if args.status:
             out(opencode_lifecycle.status(database()))
             return
-        missing = [name for name, value in (("--count", args.count), ("--model", args.model),
-                                            ("--cwd", args.cwd), ("--root", args.root))
+        missing = [name for name, value in (("--model", args.model), ("--cwd", args.cwd),
+                                            ("--root", args.root))
                    if value in (None, "")]
         if missing:
             raise SystemExit("Missing required arguments: " + ", ".join(missing))
+        if args.count is None and args.target_total is None:
+            raise SystemExit("Choose --count or --target-total")
+        if args.count is not None and args.target_total is not None:
+            raise SystemExit("Choose --count or --target-total, not both")
         out(opencode_lifecycle.add_sessions(
-            database(), count=args.count, model=args.model, cwd=args.cwd, root=args.root,
-            database_path=args.database_path, request_key=args.request_key,
-            enable_dispatch=args.enable_dispatch, max_concurrent=args.max_concurrent,
-            dry_run=args.dry_run, note=args.note or ""))
+            database(), count=args.count, target_total=args.target_total, model=args.model,
+            cwd=args.cwd, root=args.root, database_path=args.database_path,
+            request_key=args.request_key, enable_dispatch=args.enable_dispatch,
+            max_concurrent=args.max_concurrent, dry_run=args.dry_run, note=args.note or "",
+            reconciled_sessions=args.reconciled_session))
     except (ValueError, OSError) as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
         sys.exit(1)
@@ -405,15 +410,6 @@ def cmd_remove_opencode(args):
     try:
         out(opencode_lifecycle.remove_session(database(), args.session, note=args.note,
                                               allow_unverified_native=args.allow_unverified_native))
-    except (ValueError, OSError) as error:
-        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
-        sys.exit(1)
-
-
-def cmd_rollback_opencode(args):
-    """Withdraw one provisioned request from the roster, keeping native sessions."""
-    try:
-        out(opencode_lifecycle.rollback_request(database(), args.request_key, note=args.note))
     except (ValueError, OSError) as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
         sys.exit(1)
@@ -582,6 +578,8 @@ def main(argv=None):
     p = sub.add_parser("add-opencode",
                        help="add OpenCode sessions to the roster (idempotent per request key)")
     p.add_argument("--count", type=int, help="how many sessions to add")
+    p.add_argument("--target-total", type=int,
+                   help="the total roster size to reach; only the difference is added")
     p.add_argument("--model", help="the exact approved provider/model of the account")
     p.add_argument("--cwd", help="the worktree the sessions are created for")
     p.add_argument("--root", help="the fleet root this request is for")
@@ -593,6 +591,9 @@ def main(argv=None):
                    help="explicitly raise the fleet admission limit, inside the validated limits")
     p.add_argument("--dry-run", action="store_true", help="report the exact plan without writing it")
     p.add_argument("--status", action="store_true", help="report the account, roster and receipts only")
+    p.add_argument("--reconciled-session", action="append", default=[],
+                   help="a native session id a previous uncertain attempt created; it is "
+                        "verified before it is registered")
     p.add_argument("--note", default="", help="operator note recorded with the receipt")
     p.set_defaults(fn=cmd_add_opencode)
     p = sub.add_parser("drain-opencode",
@@ -607,11 +608,6 @@ def main(argv=None):
     p.add_argument("--allow-unverified-native", action="store_true",
                    help="operator override for a native identity that cannot be read back")
     p.set_defaults(fn=cmd_remove_opencode)
-    p = sub.add_parser("rollback-opencode",
-                       help="withdraw one provisioned request from the roster, keeping its sessions")
-    p.add_argument("--request-key", required=True)
-    p.add_argument("--note", default="", help="operator note recorded with the receipt")
-    p.set_defaults(fn=cmd_rollback_opencode)
     sub.add_parser("supervise", help="restart dead components every 30s (launchd runs this)").set_defaults(
         fn=lambda a: ops.supervise())
     p = sub.add_parser("supervisor", help="install/uninstall the launchd supervisor")

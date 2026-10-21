@@ -88,15 +88,19 @@ never invents a session id, so the id in a receipt is always the id the native s
   request started from, and provisioning and roster writes are serialized across processes. A
   concurrent writer is never overwritten and two requests for the same key cannot both create.
 - One request may add up to thirty-two sessions, so a whole scale-up (for example eight to
-  twenty-five sessions) is one bounded request rather than several manual calls.
+  twenty-five sessions) is one bounded request rather than several manual calls. `--target-total`
+  states the size the roster should reach, so that request adds exactly the difference and the
+  roster ends at the target instead of overshooting it.
 - An uncertain outcome stays uncertain. A creation whose answer never arrived is recorded as
   uncertain, not as an ordinary retryable failure; the intent is recorded before the first native
   call, and the next run reconciles the native identity before it creates anything. A session
   whose receipt says its identity was never verified is never ignored: it is reconciled first, and
   an unresolved one refuses the request.
-- `bin/fleet rollback-opencode --request-key KEY` withdraws one provisioned request from the
-  roster. The native sessions stay in the account with their history and the key never adds
-  again.
+- There is one removal path. A worker leaves the roster only through
+  `bin/fleet remove-opencode`, with its barriers: no queued, in-flight, uncertain or
+  awaiting-import work, no recovery claim, and a verifiable native identity. A request is
+  withdrawn by draining and removing its workers, one by one; there is no faster path that
+  skips the barriers.
 - The staged activation and rollback plan is
   [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
   manager, which does not honour `draining`, and the durable state migration that adds the

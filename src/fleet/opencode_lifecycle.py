@@ -5,11 +5,12 @@ A native session is created only through the supported OpenCode CLI API
 an operator's own CLI uses. The Fleet never writes OpenCode's internal database
 and never invents a session id: the id in a receipt is the id the native server
 returned, and the roster is written only after that id was read back from the
-native identity row.
+native identity row — with its working directory **and** its model.
 
 Creating a session does not contact a provider: the request carries the pinned
-model and the directory, and the native server records them. No model call, no
-paid resource and no credential access is involved in this path.
+model and the directory, and the native server records them. Before any live
+creation the installed CLI's own OpenAPI schema is consulted, so the call this
+module makes is proved to exist and to be provider-free rather than assumed.
 
 The roster is the only source of a worker's identity, so every addition is
 recorded in a durable receipt, every retry of the same request key is
@@ -17,34 +18,39 @@ idempotent, and a partial failure leaves the roster untouched while the native
 sessions that were created are kept and reported. Removal never deletes a native
 session and never touches a hold, a task, a queue entry or a worktree.
 
-Three properties are load bearing and are enforced here rather than assumed:
+The properties this module guarantees, and refuses to guess:
 
-* **An uncertain outcome stays uncertain.** A creation whose answer never arrived is
-  recorded as uncertain, never as an ordinary failure, and the next run reconciles
-  the native identity before it creates anything.
-* **The intent is durable before the first native call.** A crash between the native
-  create and its receipt is reconciled from the recorded intent, so a session is
-  never created twice and never left unrecorded.
-* **The request key is bound to the whole request.** A key reused with a different
-  count, account, working directory, model, dispatch flag or admission limit is
-  refused instead of silently doing something else.
+* **An uncertain outcome stays uncertain.** A creation whose answer never
+  arrived, or whose native identity cannot be read, is recorded as uncertain and
+  the request stops. The next run does not adopt anything on its own: the
+  operator names the native session that was created, and that exact id is
+  verified before it is registered. Absence and unreadability are never proof
+  that no session was created.
+* **The intent is durable before the first native call**, so a crash between the
+  native create and its receipt is recoverable instead of a duplicate.
+* **The request key is bound to the whole request**, so a key reused with a
+  different count, target, account, working directory, model, dispatch flag or
+  admission limit is refused instead of silently doing something else.
+* **One writer lock** serializes the roster, the queue and the dispatch claim,
+  and every roster write is a compare-and-swap against the configuration the
+  writer started from.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
-from contextlib import contextmanager
 from pathlib import Path
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
+import tempfile
 import time
 from urllib.parse import quote
 
-from . import heavy, model_selection, opencode, ops, paths
+from . import heavy, model_selection, opencode, ops, paths, roster
 from .store import emit
 
 # One request may add up to this many sessions. The bound keeps a single command
@@ -57,6 +63,9 @@ MAX_ADD_COUNT = 32
 MAX_CONCURRENT_CAP = 64
 # A native creation is bounded so a hung CLI cannot hold the operator's shell.
 CREATE_TIMEOUT_SECONDS = 120
+# The installed CLI's own schema is consulted before a creation; it is bounded
+# too, because it starts a private server.
+API_PROBE_TIMEOUT_SECONDS = 120
 # A task in any of these states is outstanding for a session: it is work that
 # must not be dropped by a drain or a removal.
 OUTSTANDING_STATES = ("queued", "dispatching", "sent", "running", "uncertain")
@@ -67,8 +76,12 @@ ACTIVE_RECOVERY_STATES = ("preparing", "authorized", "claimed")
 # an unverifiable native identity never applies to a worker that is known to be
 # running.
 ACTIVE_STATES = ("running", "working", "streaming", "queued", "active")
+# The body properties the installed CLI's schema declares for a session create.
+# A payload outside this set is not sent: the call is proved against the schema
+# before it is made.
 _SESSION_ID = re.compile(r"ses_[A-Za-z0-9_-]+\Z")
 _REQUEST_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+_PROMPT_SHAPED = ("prompt", "message", "text", "content", "input")
 
 
 class ProvisioningError(RuntimeError):
@@ -80,50 +93,8 @@ class ProvisioningUncertain(ProvisioningError):
 
     This is not an ordinary retryable failure. The outcome stays unknown until
     the native identity is reconciled, so the request is recorded as uncertain
-    and the next run reconciles it before it creates anything.
+    and the next run stops for an explicit, verified reconciliation.
     """
-
-
-# --- serialization ----------------------------------------------------------
-
-@contextmanager
-def _provision_lock():
-    """Serialize provisioning and roster writes across processes.
-
-    The lock is advisory and shared by every writer of the roster through this
-    module. A second process asking for the same request key waits here and then
-    finds the request already provisioned, so the request is idempotent instead
-    of racing.
-    """
-    paths.DATA.mkdir(parents=True, exist_ok=True)
-    path = Path(paths.DATA) / "opencode.provision.lock"
-    handle = path.open("a+")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield handle
-    finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
-
-
-def _config_digest():
-    try:
-        return hashlib.sha256(paths.CONFIG.read_bytes()).hexdigest()
-    except OSError:
-        return ""
-
-
-def _write_config_cas(cfg, expected_digest):
-    """Write the configuration only if nobody else changed it meanwhile.
-
-    The roster is the identity source, so a concurrent writer must never be
-    overwritten: the digest taken when the request started is compared again
-    immediately before the write, and a changed configuration is a refusal.
-    """
-    if _config_digest() != expected_digest:
-        raise ValueError("The configuration changed while the request was running; "
-                         "nothing was written. Inspect the roster and retry.")
-    paths.write_config(cfg)
 
 
 # --- validation ------------------------------------------------------------
@@ -205,24 +176,29 @@ def validate_max_concurrent(current, requested, logical_sessions):
     return requested
 
 
-def derive_request_key(root, account, model, cwd, count, enable_dispatch, max_concurrent):
-    """A deterministic key for the same request, so a retry is idempotent."""
-    return "opencode-" + _payload_digest(root, account, model, cwd, count, enable_dispatch,
-                                          max_concurrent)[:32]
-
-
-def _payload_digest(root, account, model, cwd, count, enable_dispatch, max_concurrent):
+def _payload_digest(request, count, target_total, enable_dispatch, max_concurrent):
     """The digest of the complete request, bound to the idempotency key.
 
     Every option that changes what the request does is part of the digest, so a
-    key reused with a different count, account, working directory, model, dispatch
-    flag or admission limit is a conflict and not a retry.
+    key reused with a different count, target, account, working directory, model,
+    dispatch flag or admission limit is a conflict and not a retry.
     """
-    material = json.dumps([str(root), str(account), str(model), str(cwd), int(count),
+    # A request for a total binds the total, not the difference it derives:
+    # the difference depends on the roster at the time, and the same request
+    # has to stay the same request when it is retried.
+    wanted = ("total", int(target_total)) if target_total is not None else ("count", int(count))
+    material = json.dumps([request["root"], request["account"], request["model"],
+                           request["cwd"], wanted,
                            bool(enable_dispatch),
                            None if max_concurrent is None else int(max_concurrent)],
                           sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(material.encode()).hexdigest()
+
+
+def derive_request_key(request, count, target_total, enable_dispatch, max_concurrent):
+    """A deterministic key for the same request, so a retry is idempotent."""
+    digest = _payload_digest(request, count, target_total, enable_dispatch, max_concurrent)
+    return "opencode-" + digest[:32]
 
 
 def validate_request_key(value):
@@ -231,6 +207,91 @@ def validate_request_key(value):
     if not isinstance(value, str) or not _REQUEST_KEY.fullmatch(value):
         raise ValueError("The request key must be 1-128 characters of A-Z a-z 0-9 . _ : -")
     return value
+
+
+def validate_reconciled_sessions(values):
+    """The native session ids an operator names for an explicit reconciliation."""
+    if not values:
+        return []
+    seen = []
+    for value in values:
+        if not isinstance(value, str) or not _SESSION_ID.fullmatch(value):
+            raise ValueError("A reconciled native session id must be an existing native ses_ ID")
+        if value in seen:
+            raise ValueError("The same native session id was named twice: " + value)
+        seen.append(value)
+    return seen
+
+
+# --- the installed CLI's own schema ----------------------------------------
+
+def verify_native_api_support(executable, timeout=API_PROBE_TIMEOUT_SECONDS):
+    """Require the installed CLI's own schema to declare a provider-free create.
+
+    The evidence is the OpenAPI document the installed CLI serves itself. The
+    probe runs with an isolated HOME and a scratch database, so the real native
+    account is never opened and no session is created. The call this module
+    makes is only made when the schema declares it, and declares it without a
+    prompt and without a security scheme.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="fleet-opencode-api-"))
+    try:
+        for name in ("home", "tmp", "config", "data", "cache", "state"):
+            (scratch / name).mkdir(parents=True, exist_ok=True)
+        environment = {
+            "HOME": str(scratch / "home"),
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "OPENCODE_DB": str(scratch / "opencode.db"),
+            "TMPDIR": str(scratch / "tmp"),
+            "XDG_CONFIG_HOME": str(scratch / "config"),
+            "XDG_DATA_HOME": str(scratch / "data"),
+            "XDG_CACHE_HOME": str(scratch / "cache"),
+            "XDG_STATE_HOME": str(scratch / "state"),
+        }
+        try:
+            result = subprocess.run([str(executable), "api", "--standalone", "GET",
+                                     "/openapi.json"], env=environment,
+                                    capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise ProvisioningError("The installed OpenCode CLI did not answer its own schema "
+                                    "in time; no session was created") from error
+        except OSError as error:
+            raise ProvisioningError("The installed OpenCode CLI could not be started: "
+                                    + error.__class__.__name__) from error
+        if result.returncode != 0:
+            raise ProvisioningError("The installed OpenCode CLI did not serve its schema; "
+                                    "no session was created")
+        try:
+            spec = json.loads(result.stdout)
+        except ValueError as error:
+            raise ProvisioningError("The installed OpenCode CLI served an unreadable schema; "
+                                    "no session was created") from error
+    finally:
+        shutil.rmtree(str(scratch), ignore_errors=True)
+    operation = (spec.get("paths", {}).get("/api/session", {}) or {}).get("post") or {}
+    if operation.get("operationId") != "session.create":
+        raise ProvisioningError("The installed OpenCode CLI does not expose session.create on "
+                                "POST /api/session; no session was created")
+    body = (operation.get("requestBody", {}).get("content", {})
+            .get("application/json", {}).get("schema", {}))
+    properties = body.get("properties", {}) or {}
+    if body.get("required"):
+        raise ProvisioningError("The installed OpenCode CLI requires fields for a session "
+                                "creation that this request does not send; no session was created")
+    if not {"model", "location"}.issubset(set(properties)):
+        raise ProvisioningError("The installed OpenCode CLI does not declare the model and "
+                                "location fields this request sends; no session was created")
+    if any(any(word in name.lower() for word in _PROMPT_SHAPED) for name in properties):
+        raise ProvisioningError("The installed OpenCode CLI declares a prompt-shaped field for a "
+                                "session creation; no session was created")
+    if operation.get("security"):
+        raise ProvisioningError("The installed OpenCode CLI declares a security scheme for a "
+                                "session creation; no session was created")
+    return {"source": "the installed OpenCode CLI's own OpenAPI schema",
+            "operationId": operation.get("operationId"), "path": "/api/session",
+            "openapi": spec.get("openapi"), "bodyProperties": sorted(properties),
+            "required": [], "security": [],
+            "sha256": hashlib.sha256(result.stdout.encode()).hexdigest()}
 
 
 # --- native session creation ----------------------------------------------
@@ -326,51 +387,25 @@ def _verify_created(session_id, cwd, account, model=None):
     return native
 
 
-def _native_candidates(account, cwd, model):
-    """Read-only: the native sessions of this account for this directory and model.
+def _identity_failure_kind(error):
+    """Whether a failed identity check means "definitely wrong" or "cannot see".
 
-    This is the reconciliation inventory. A crash between the native create and
-    its receipt leaves a session the Fleet cannot name, so the next run finds
-    the candidates here and adopts them instead of creating a second set.
+    A session row that is absent, or a native database that cannot be read, is
+    not proof that no session was created: the outcome is unknown. A session
+    that is there with the wrong directory or the wrong model is a definite
+    failure.
     """
-    try:
-        db_path = opencode._database_path(account)
-    except ValueError:
-        return []
-    if not db_path.is_file():
-        return []
-    uri = "file:" + quote(str(db_path), safe="/") + "?mode=ro"
-    try:
-        connection = sqlite3.connect(uri, uri=True, timeout=2)
-        try:
-            connection.execute("PRAGMA query_only=ON")
-            rows = connection.execute(
-                "SELECT id,directory,model FROM session_v2 WHERE directory=?",
-                (str(cwd),)).fetchall()
-        finally:
-            connection.close()
-    except sqlite3.Error:
-        return []
-    found = []
-    for identifier, directory, native_model in rows:
-        if not isinstance(identifier, str) or not _SESSION_ID.fullmatch(identifier):
-            continue
-        try:
-            if Path(str(directory)).resolve() != _resolve(cwd):
-                continue
-        except (TypeError, OSError, RuntimeError):
-            continue
-        provider, name = opencode._native_model_parts(native_model)
-        if provider and name and f"{provider}/{name}" == model:
-            found.append(identifier)
-    return found
+    message = str(error)
+    if "could not be read safely" in message or "does not exist" in message:
+        return "uncertain"
+    return "failed"
 
 
 # --- receipts ---------------------------------------------------------------
 
 def _provisioning_row(db, request_key):
     return db.execute("SELECT request_key,model,account,cwd,root,requested_count,"
-                      "dispatch_enabled,status,created,updated,detail,payload_digest "
+                      "dispatch_enabled,status,created,updated,detail,payload_digest,creator_pid "
                       "FROM opencode_provisioning WHERE request_key=?",
                       (request_key,)).fetchone()
 
@@ -390,19 +425,34 @@ def _session_receipts(db, request_key=None):
 
 
 def _record_provisioning(db, request_key, request, status, detail="", count=None,
-                         payload_digest=""):
+                         payload_digest="", creator_pid=0):
     now = time.time()
     db.execute(
         "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
-        "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
+        "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,"
         "updated=excluded.updated,detail=excluded.detail,"
         "payload_digest=excluded.payload_digest",
         (request_key, request["model"], request["account"], request["cwd"], request["root"],
          request["count"] if count is None else count, int(request["dispatchEnabled"]),
-         status, now, now, detail, payload_digest))
+         status, now, now, detail, payload_digest, int(creator_pid)))
     db.commit()
+
+
+def _creator_alive(pid):
+    """Whether the process that recorded an intent is still running.
+
+    A row without a creator was written by an earlier build or by hand, so it
+    is never a live attempt.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, PermissionError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _record_session(db, session_id, request_key, request, status, detail=""):
@@ -426,7 +476,7 @@ def _receipted_session_ids(db):
     return {receipt["session_id"] for receipt in _session_receipts(db)}
 
 
-def _reject_duplicate_identity(db, cfg, identifier, request_key, created):
+def _reject_duplicate_identity(db, cfg, identifier, created):
     """Refuse a native session id that is already owned.
 
     A returned id that is already in the roster, already receipted by another
@@ -476,62 +526,99 @@ def status(db, root=None):
 
 # --- add --------------------------------------------------------------------
 
-def add_sessions(db, count, model, cwd, root, database_path=None, request_key=None,
-                 enable_dispatch=False, max_concurrent=None, dry_run=False, note=""):
+def add_sessions(db, count=None, target_total=None, model=None, cwd=None, root=None,
+                 database_path=None, request_key=None, enable_dispatch=False,
+                 max_concurrent=None, dry_run=False, note="", reconciled_sessions=None):
     """Add OpenCode sessions to the roster, idempotently.
 
-    The request is validated in full before anything is created. The intent is
-    recorded before the first native call, so a crash between the native create
-    and its receipt is reconciled on the next run instead of creating a second
-    session. The roster is written once, after every session was created and
-    read back from the native identity row, so a partial failure leaves the
-    roster exactly as it was.
+    ``count`` adds that many sessions. ``target_total`` instead states the total
+    roster size the request wants to reach, and only the difference is added, so
+    one command reaches a target fleet size instead of a canary plus a scale
+    that overshoots it.
+
+    The request is validated in full before anything is created, the intent is
+    recorded before the first native call, and the roster is written once, after
+    every session was created and read back from the native identity row. A
+    partial failure leaves the roster exactly as it was.
     """
-    with _provision_lock():
-        return _add_sessions(db, count, model, cwd, root, database_path, request_key,
-                             enable_dispatch, max_concurrent, dry_run, note)
+    if (count is None) == (target_total is None):
+        raise ValueError("Choose exactly one of a number of sessions to add or a total roster "
+                         "size to reach")
+    # The writer lock is never held while a native session is created: the
+    # creation takes minutes, and the dispatcher and the operator commands must
+    # not wait behind it. The lock is taken to record the intent and to commit
+    # the roster, and the roster write is a compare-and-swap in between.
+    return _add_sessions(db, count, target_total, model, cwd, root, database_path,
+                         request_key, enable_dispatch, max_concurrent, dry_run, note,
+                         reconciled_sessions)
 
 
-def _add_sessions(db, count, model, cwd, root, database_path, request_key, enable_dispatch,
-                   max_concurrent, dry_run, note):
+def _add_sessions(db, count, target_total, model, cwd, root, database_path, request_key,
+                   enable_dispatch, max_concurrent, dry_run, note, reconciled_sessions):
     cfg = paths.config()
-    config_digest = _config_digest()
+    config_digest = roster.config_digest()
+    entries = [entry for entry in cfg.get("opencode", []) if isinstance(entry, dict)]
+    current_total = len(entries)
+    if target_total is not None:
+        if type(target_total) is not int or target_total < 1:
+            raise ValueError("The total roster size must be a positive whole number")
+        count = target_total - current_total
+        if count < 0:
+            raise ValueError(f"The roster already holds {current_total} OpenCode workers, "
+                             f"which is more than the requested total {target_total}")
+        if count == 0:
+            # The target is already reached: nothing is created and the request
+            # is a no-op that says so.
+            return {"action": "add-opencode", "idempotent": True, "requestKey": None,
+                    "requested": 0, "requestedTotal": target_total,
+                    "rosterTotalBefore": current_total, "toCreate": 0, "created": 0,
+                    "registered": 0, "sessions": [], "model": model,
+                    "account": str(_account_of(entries, database_path)), "cwd": str(cwd),
+                    "root": str(_resolve(root)), "logicalSessions": current_total,
+                    "admissionLimit": int(cfg.get("maxConcurrent", 0)),
+                    "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
+                    "status": "already-reached", "uncertain": False, "retryable": False,
+                    "rosterChanged": False,
+                    "note": "the roster already holds the requested total"}
     request = validate_request(cfg, count, model, cwd, root, database_path)
     request["dispatchEnabled"] = bool(enable_dispatch)
-    digest = _payload_digest(request["root"], request["account"], request["model"],
-                              request["cwd"], count, enable_dispatch, max_concurrent)
+    reconciled = validate_reconciled_sessions(reconciled_sessions)
+    digest = _payload_digest(request, count, target_total, enable_dispatch, max_concurrent)
     key = validate_request_key(request_key) or derive_request_key(
-        request["root"], request["account"], request["model"], request["cwd"],
-        count, enable_dispatch, max_concurrent)
-    entries = [entry for entry in cfg.get("opencode", []) if isinstance(entry, dict)]
+        request, count, target_total, enable_dispatch, max_concurrent)
     existing = _provisioning_row(db, key)
     if existing is not None:
         recorded = existing[11] or ""
-        if recorded and recorded != digest:
+        if not recorded:
+            # A request recorded before the payload binding cannot be verified,
+            # so it fails closed instead of being accepted as a retry.
+            raise ValueError("The recorded request predates the payload binding and cannot be "
+                             "verified; it is refused instead of being reused. Use a new key.")
+        if recorded != digest:
             raise ValueError("The request key was already used for a different request "
-                             "(count, account, working directory, model, dispatch flag or "
-                             "admission limit). Use a new key for a different request.")
-        if existing[7] == "rolled-back":
-            raise ValueError("The request key belongs to a rolled-back request; it never "
-                             "adds again. Use a new key for a new request.")
+                             "(count, total, account, working directory, model, dispatch flag "
+                             "or admission limit). Use a new key for a different request.")
     receipts = _session_receipts(db, key)
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
-    if existing is not None and existing[7] == "registered" and not registered:
-        # The request was recorded as registered but no session receipt survived;
-        # the roster is the authority, so the sessions are counted from it.
-        registered = [{"session_id": entry.get("sessionId"), "status": "registered"}
-                      for entry in entries if entry.get("sessionId")]
+    pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     if existing is not None and existing[7] == "registered":
+        # The request is recorded as registered. Its receipts are its sessions: a
+        # request whose receipts are missing claims nothing, and it never claims
+        # the whole roster.
         return {"action": "add-opencode", "idempotent": True, "requestKey": key,
                 "created": 0, "registered": len(registered), "requested": count,
                 "sessions": [{"sessionId": receipt["session_id"],
                               "dispatchEnabled": bool(existing[6])} for receipt in registered],
                 "model": request["model"], "account": request["account"],
                 "cwd": request["cwd"], "root": request["root"],
-                "logicalSessions": len(entries),
+                "logicalSessions": current_total,
                 "admissionLimit": int(cfg.get("maxConcurrent", 0)),
                 "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
+                "status": "registered", "uncertain": False, "retryable": False,
                 "note": existing[10]}
+    receipts = _session_receipts(db, key)
+    registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
+    pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     # A receipt whose native identity was never verified is never ignored: it is
     # reconciled first, and an unresolved one refuses the request.
     unresolved = [receipt for receipt in receipts if receipt["status"] == "unverified"]
@@ -547,35 +634,50 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
                                  + ". It is not ignored and no new session is created.") from error
             _record_session(db, receipt["session_id"], key, request, "created",
                             "reconciled: the native identity was read back")
+    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled:
+        # The previous attempt's outcome is unknown: nothing is adopted on
+        # speculation. The operator names the native session that was created and
+        # that exact id is verified before it is registered. A recorded session
+        # is the one exception: it proves what the attempt did.
+        if existing[7] == "uncertain" or not pending:
+            raise ValueError("The previous attempt of this request is uncertain: whether a "
+                             "native session was created is unknown, and absence is no proof. "
+                             "Name the native session id that was created with "
+                             "--reconciled-session, or reconcile it explicitly. No session was "
+                             "created now.")
+    # The operator's named sessions are verified before they are registered.
+    for identifier in reconciled:
+        _reject_duplicate_identity(db, cfg, identifier, pending)
+        try:
+            _verify_created(identifier, request["cwd"], request["account"], request["model"])
+        except (ValueError, OSError) as error:
+            kind = _identity_failure_kind(error)
+            if kind == "uncertain":
+                raise ValueError("The named native session " + identifier + " cannot be read: "
+                                 + str(error) + ". Absence is no proof that it does not exist, "
+                                 "so it is not registered and no session was created.") from error
+            raise ValueError("The named native session " + identifier + " does not match this "
+                             "request: " + str(error)) from error
+        _record_session(db, identifier, key, request, "created",
+                        "reconciled explicitly by the operator")
     receipts = _session_receipts(db, key)
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
-    reconciled = []
-    if existing is not None and existing[7] in {"creating", "uncertain", "failed"}:
-        # The recorded intent may already have produced native sessions whose
-        # receipt was lost to a crash. They are adopted instead of recreated.
-        known = _roster_session_ids(cfg) | {receipt["session_id"] for receipt in receipts}
-        for candidate in _native_candidates(request["account"], request["cwd"], request["model"]):
-            if candidate in known:
-                continue
-            _record_session(db, candidate, key, request, "created",
-                            "reconciled from the recorded intent")
-            reconciled.append(candidate)
-        if reconciled:
-            receipts = _session_receipts(db, key)
-            pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     needed = count - len(pending) - len(registered)
     if needed < 0:
         needed = 0
     plan = {"action": "add-opencode", "idempotent": False, "requestKey": key,
-            "requested": count, "toCreate": needed,
+            "requested": count,
+            "requestedTotal": target_total,
+            "rosterTotalBefore": current_total,
+            "toCreate": needed,
             "created": 0, "registered": len(registered),
             "alreadyRegistered": len(registered), "pendingNative": len(pending),
-            "reconciled": reconciled,
+            "reconciled": [identifier for identifier in reconciled],
             "model": request["model"], "account": request["account"],
             "cwd": request["cwd"], "root": request["root"],
             "dispatchEnabled": request["dispatchEnabled"],
-            "logicalSessions": len(entries) + needed,
+            "logicalSessions": current_total + needed,
             "admissionLimit": int(cfg.get("maxConcurrent", 0)),
             "heavyJobSlots": heavy.SLOT_COUNT,
             "maxConcurrent": {"before": int(cfg.get("maxConcurrent", 0)),
@@ -586,18 +688,31 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
     if limit is not None:
         plan["maxConcurrent"]["after"] = limit
     if dry_run:
+        # A dry run writes nothing at all: no receipt, no roster, no native state.
         return plan
     if needed == 0 and not pending:
         _record_provisioning(db, key, request, "registered", "nothing to add",
                              payload_digest=digest)
-        return {**plan, "created": 0, "registered": len(registered), "sessions": []}
+        return {**plan, "created": 0, "registered": len(registered), "sessions": [],
+                "status": "registered", "uncertain": False, "retryable": False,
+                "rosterChanged": False}
     executable = paths.executable("opencode", cfg)
+    # The creation call is proved against the installed CLI's own schema before
+    # it is made: the request is only sent when the schema declares it.
+    api_support = verify_native_api_support(executable)
     scratch = paths.DATA / "opencode" / "provision" / key
     scratch.mkdir(parents=True, exist_ok=True)
     # The intent is durable before the first native call, so a crash between the
-    # create and its receipt is reconciled on the next run.
-    _record_provisioning(db, key, request, "creating", "intent recorded before the native "
-                         "creation", payload_digest=digest)
+    # create and its receipt is recoverable instead of a duplicate. The writer
+    # lock is held only for this short step.
+    with roster.roster_lock():
+        current = _provisioning_row(db, key)
+        if current is not None and current[7] == "creating" and _creator_alive(current[12]):
+            raise ValueError("Another request with this key is in progress; retry after it "
+                             "finishes. No session was created now.")
+        _record_provisioning(db, key, request, "creating",
+                             "intent recorded before the native creation", payload_digest=digest,
+                             creator_pid=os.getpid())
     created = []
     try:
         for _ in range(needed):
@@ -606,15 +721,28 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
             identifier = session["id"]
             # A returned id that is already owned is rejected instead of being
             # registered a second time.
-            _reject_duplicate_identity(db, paths.config(), identifier, key, created)
+            _reject_duplicate_identity(db, paths.config(), identifier, created + pending)
             try:
                 _verify_created(identifier, request["cwd"], request["account"], request["model"])
             except (ValueError, OSError) as error:
-                # The session exists but its identity is not proven: it is recorded
-                # as unverified and never counted as created.
+                kind = _identity_failure_kind(error)
+                if kind == "uncertain":
+                    # The native inventory cannot see the session. That is not
+                    # proof that it was not created, so the outcome is unknown.
+                    _record_session(db, identifier, key, request, "unverified", str(error))
+                    _record_provisioning(db, key, request, "uncertain", str(error),
+                                         payload_digest=digest)
+                    emit(db, "needs_attention", category="opencode-provisioning",
+                         requestKey=key, error=str(error), sessionId=identifier, uncertain=True)
+                    return {**plan, "created": len(created), "registered": 0,
+                            "createdNotRegistered": created + [identifier], "sessions": [],
+                            "logicalSessions": current_total,
+                            "status": "uncertain", "uncertain": True, "retryable": False,
+                            "failed": str(error), "rosterChanged": False}
                 _record_session(db, identifier, key, request, "unverified", str(error))
                 raise ProvisioningError(
-                    "The created native session could not be read back: " + str(error)) from error
+                    "The created native session does not match this request: "
+                    + str(error)) from error
             _record_session(db, identifier, key, request, "created", "native session created")
             created.append(identifier)
     except ProvisioningUncertain as error:
@@ -625,7 +753,7 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
              error=str(error), created=created, uncertain=True)
         return {**plan, "created": len(created), "registered": 0,
                 "createdNotRegistered": created, "sessions": [],
-                "logicalSessions": len(entries),
+                "logicalSessions": current_total,
                 "status": "uncertain", "uncertain": True, "retryable": False,
                 "failed": str(error), "rosterChanged": False}
     except ProvisioningError as error:
@@ -634,7 +762,7 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
              error=str(error), created=created)
         return {**plan, "created": len(created), "registered": 0,
                 "createdNotRegistered": created, "sessions": [],
-                "logicalSessions": len(entries),
+                "logicalSessions": current_total,
                 "status": "failed", "uncertain": False, "retryable": True,
                 "failed": str(error), "rosterChanged": False}
     # The sessions created by an earlier attempt of this request are verified
@@ -646,43 +774,79 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
             _verify_created(receipt["session_id"], request["cwd"], request["account"],
                             request["model"])
         except (ValueError, OSError) as error:
-            _record_provisioning(db, key, request, "failed",
+            kind = _identity_failure_kind(error)
+            _record_provisioning(db, key, request,
+                                 "uncertain" if kind == "uncertain" else "failed",
                                  "a previously created native session no longer verifies: "
                                  + str(error), payload_digest=digest)
             emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
                  error="a previously created native session no longer verifies: " + str(error),
-                 sessionId=receipt["session_id"])
+                 sessionId=receipt["session_id"], uncertain=(kind == "uncertain"))
             return {**plan, "created": len(created), "registered": 0,
                     "createdNotRegistered": created + [receipt["session_id"]],
-                    "sessions": [], "logicalSessions": len(entries),
-                    "status": "failed", "uncertain": False, "retryable": False,
+                    "sessions": [], "logicalSessions": current_total,
+                    "status": "uncertain" if kind == "uncertain" else "failed",
+                    "uncertain": kind == "uncertain", "retryable": False,
                     "failed": "a previously created native session no longer verifies: "
                               + str(error),
                     "rosterChanged": False}
-    updated = paths.config()
-    for identifier in [receipt["session_id"] for receipt in pending] + created:
-        if any(entry.get("sessionId") == identifier for entry in updated.get("opencode", [])):
-            continue
-        updated.setdefault("opencode", []).append({
-            "sessionId": identifier, "cwd": request["cwd"], "sessionCwd": request["cwd"],
-            "databasePath": request["account"], "model": request["model"],
-            "provider": "opencode", "dispatchEnabled": request["dispatchEnabled"]})
-    if limit is not None:
-        updated["maxConcurrent"] = limit
-    _write_config_cas(updated, config_digest)
-    for identifier in [receipt["session_id"] for receipt in pending] + created:
-        _record_session(db, identifier, key, request, "registered", "in the roster")
-    _record_provisioning(db, key, request, "registered", "roster updated", payload_digest=digest)
-    emit(db, "opencode_sessions_added", requestKey=key, sessions=created,
-         model=request["model"], account=request["account"], note=note)
+    # The exact set that is about to be registered is proved before the roster is
+    # written: the requested number of distinct ids, each with the expected
+    # model, none of them owned twice.
+    to_register = [receipt["session_id"] for receipt in pending] + created
+    if len(to_register) != count:
+        raise ProvisioningError("The request would register " + str(len(to_register))
+                                 + " sessions but asked for " + str(count) + "; nothing was "
+                                 "written")
+    if len(set(to_register)) != len(to_register):
+        raise ProvisioningError("The request would register the same native session twice; "
+                                 "nothing was written")
+    with roster.roster_lock():
+        updated = paths.config()
+        for identifier in to_register:
+            if any(entry.get("sessionId") == identifier for entry in updated.get("opencode", [])):
+                continue
+            updated.setdefault("opencode", []).append({
+                "sessionId": identifier, "cwd": request["cwd"], "sessionCwd": request["cwd"],
+                "databasePath": request["account"], "model": request["model"],
+                "provider": "opencode", "dispatchEnabled": request["dispatchEnabled"]})
+        if limit is not None:
+            updated["maxConcurrent"] = limit
+        roster.write_config_cas(updated, config_digest)
+        for identifier in to_register:
+            _record_session(db, identifier, key, request, "registered", "in the roster")
+        _record_provisioning(db, key, request, "registered", "roster updated",
+                             payload_digest=digest)
+        emit(db, "opencode_sessions_added", requestKey=key, sessions=to_register,
+             model=request["model"], account=request["account"], note=note)
+        proof = _prove_registration(db, updated, key, request, to_register)
     return {**plan, "created": len(created),
-            "registered": len([receipt["session_id"] for receipt in pending]) + len(created),
+            "registered": len(to_register),
             "sessions": [{"sessionId": identifier,
                           "dispatchEnabled": request["dispatchEnabled"]}
-                         for identifier in ([receipt["session_id"] for receipt in pending]
-                                             + created)],
+                         for identifier in to_register],
             "status": "registered", "uncertain": False, "retryable": False,
-            "rosterChanged": True}
+            "rosterChanged": True, "proof": proof,
+            "apiSupport": api_support}
+
+
+def _prove_registration(db, cfg, key, request, to_register):
+    """Prove the registration: the number, the distinctness and the model."""
+    receipts = [receipt for receipt in _session_receipts(db, key)
+                if receipt["status"] == "registered"]
+    roster_ids = [entry.get("sessionId") for entry in cfg.get("opencode", [])
+                  if isinstance(entry, dict)]
+    models = {entry.get("model") for entry in cfg.get("opencode", [])
+              if isinstance(entry, dict) and entry.get("sessionId") in to_register}
+    proof = {"expected": len(to_register), "receipts": len(receipts),
+             "distinct": len(set(to_register)) == len(to_register),
+             "inRoster": all(identifier in roster_ids for identifier in to_register),
+             "models": sorted(models)}
+    if (proof["receipts"] != proof["expected"] or not proof["distinct"]
+            or not proof["inRoster"] or models != {request["model"]}):
+        emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
+             error="the registration proof failed", proof=proof)
+    return proof
 
 
 # --- drain and removal -----------------------------------------------------
@@ -722,43 +886,49 @@ def drain_session(db, session_id, note=""):
     """Stop dispatching to a worker and report the work it still owns.
 
     A drain never cancels, releases or drops a task. A queued task that is bound
-    to the worker is reported as outstanding, so the operator can re-route or
-    resolve it explicitly. The native session and its history are untouched.
+    to the worker is reported as outstanding, and a task that is still in the
+    root-authored queue file is reported as awaiting import, so the operator can
+    re-route or resolve it explicitly. The native session and its history are
+    untouched.
 
-    A manager that does not know the draining flag keeps dispatching to the
-    worker, so the drain is only effective while such a manager is paused or
-    upgraded. The result says so.
+    The drain takes the same writer lock as the dispatch claim, so a claim that
+    is in flight is seen by the drain, and a claim that starts after the drain
+    sees the draining flag and does not launch the worker.
     """
-    with _provision_lock():
-        cfg = paths.config()
-        config_digest = _config_digest()
-        entry = _roster_entry(cfg, session_id)
-        outstanding = _outstanding_tasks(db, session_id)
-        state = _native_state(cfg, entry)
-        draining = bool(entry.get("draining", False))
-        if not draining:
-            updated = paths.config()
-            target = _roster_entry(updated, session_id)
-            target["draining"] = True
-            _write_config_cas(updated, config_digest)
-        receipt = db.execute("SELECT request_key FROM opencode_sessions WHERE session_id=?",
-                             (session_id,)).fetchone()
-        if receipt is not None:
-            _record_session(db, session_id, receipt[0],
-                            {"model": entry.get("model"), "account": entry.get("databasePath"),
-                             "cwd": entry.get("cwd"), "root": str(_resolve(paths.ROOT)),
-                             "dispatchEnabled": bool(entry.get("dispatchEnabled", False))},
-                            "draining", "draining")
-        emit(db, "opencode_session_draining", sessionId=session_id,
-             outstanding=len(outstanding), note=note)
-        return {"action": "drain-opencode", "sessionId": session_id, "draining": True,
-                "alreadyDraining": draining, "outstanding": outstanding,
-                "nativeState": state.get("state"), "removed": False,
-                "note": "the native session and its history are untouched",
-                "honouredByThisBuild": _manager_honours_draining(),
-                "advisory": "a manager that predates the draining flag keeps dispatching to "
-                            "this worker; pause the fleet or upgrade the manager for the "
-                            "drain to take effect"}
+    with roster.queue_lock():
+        with roster.roster_lock():
+            cfg = paths.config()
+            config_digest = roster.config_digest()
+            entry = _roster_entry(cfg, session_id)
+            outstanding = _outstanding_tasks(db, session_id)
+            awaiting = roster.queued_tasks_for(session_id)
+            state = _native_state(cfg, entry)
+            draining = bool(entry.get("draining", False))
+            if not draining:
+                updated = paths.config()
+                target = _roster_entry(updated, session_id)
+                target["draining"] = True
+                roster.write_config_cas(updated, config_digest)
+            receipt = db.execute("SELECT request_key FROM opencode_sessions WHERE session_id=?",
+                                 (session_id,)).fetchone()
+            if receipt is not None:
+                _record_session(db, session_id, receipt[0],
+                                {"model": entry.get("model"),
+                                 "account": entry.get("databasePath"),
+                                 "cwd": entry.get("cwd"), "root": str(_resolve(paths.ROOT)),
+                                 "dispatchEnabled": bool(entry.get("dispatchEnabled", False))},
+                                "draining", "draining")
+            emit(db, "opencode_session_draining", sessionId=session_id,
+                 outstanding=len(outstanding), awaitingImport=len(awaiting), note=note)
+            return {"action": "drain-opencode", "sessionId": session_id, "draining": True,
+                    "alreadyDraining": draining, "outstanding": outstanding,
+                    "awaitingImport": awaiting,
+                    "nativeState": state.get("state"), "removed": False,
+                    "note": "the native session and its history are untouched",
+                    "honouredByThisBuild": _manager_honours_draining(),
+                    "advisory": "a manager that predates the draining flag keeps dispatching to "
+                                "this worker; pause the fleet or upgrade the manager for the "
+                                "drain to take effect"}
 
 
 def _manager_honours_draining():
@@ -782,26 +952,36 @@ def remove_session(db, session_id, note="", allow_unverified_native=False):
     """Remove a worker from the roster, keeping its native session and history.
 
     The removal refuses while a task or a turn is queued, in flight or
-    uncertain, while a recovery holds the session, and while the native turn
+    uncertain, while a task for the worker is still waiting in the root-authored
+    queue file, while a recovery holds the session, and while the native turn
     state explicitly says the worker is running. The operator override only
     covers a native identity that cannot be read at all; it never overrides a
     known active worker. Nothing is cancelled, no hold is released, no queue
     entry is touched and no native session is deleted.
+
+    There is no other removal path: a receipt-owned worker leaves the roster
+    only through this command, with these barriers.
     """
-    with _provision_lock():
-        with model_selection.model_lock():
-            return _remove_session(db, session_id, note, allow_unverified_native)
+    with roster.queue_lock():
+        with roster.roster_lock():
+            with model_selection.model_lock():
+                return _remove_session(db, session_id, note, allow_unverified_native)
 
 
 def _remove_session(db, session_id, note, allow_unverified_native):
     cfg = paths.config()
-    config_digest = _config_digest()
+    config_digest = roster.config_digest()
     entry = _roster_entry(cfg, session_id)
     outstanding = _outstanding_tasks(db, session_id)
+    awaiting = roster.queued_tasks_for(session_id)
     if outstanding:
         raise ValueError("The worker still owns outstanding work: "
                          + ", ".join(f"{item['taskId']}({item['state']})"
                                      for item in outstanding))
+    if awaiting:
+        raise ValueError("The worker still has tasks waiting to be imported: "
+                         + ", ".join(f"{item['taskId']}({item['state']})"
+                                     for item in awaiting))
     recoveries = _active_recovery(db, session_id)
     if recoveries:
         raise ValueError("A recovery holds this session: "
@@ -831,7 +1011,7 @@ def _remove_session(db, session_id, note, allow_unverified_native):
     updated = paths.config()
     updated["opencode"] = [item for item in updated.get("opencode", [])
                             if item.get("sessionId") != session_id]
-    _write_config_cas(updated, config_digest)
+    roster.write_config_cas(updated, config_digest)
     receipt = db.execute("SELECT request_key FROM opencode_sessions WHERE session_id=?",
                          (session_id,)).fetchone()
     if receipt is not None:
@@ -847,48 +1027,3 @@ def _remove_session(db, session_id, note, allow_unverified_native):
             "logicalSessions": len(updated.get("opencode", [])),
             "admissionLimit": int(updated.get("maxConcurrent", 0)),
             "heavyJobSlots": heavy.SLOT_COUNT}
-
-
-# --- rollback ---------------------------------------------------------------
-
-def rollback_request(db, request_key, note=""):
-    """Withdraw a provisioned request from the roster, keeping every native session.
-
-    The rollback reverts the roster entries this request added and records the
-    request as rolled back. The native sessions are never deleted: they stay in
-    the account with their history, and the request key never adds again, so a
-    retry cannot resurrect them silently.
-    """
-    with _provision_lock():
-        cfg = paths.config()
-        config_digest = _config_digest()
-        row = _provisioning_row(db, request_key)
-        if row is None:
-            raise ValueError("The request key has no provisioning record")
-        receipts = _session_receipts(db, request_key)
-        added = {receipt["session_id"] for receipt in receipts
-                 if receipt["status"] in {"created", "registered"}}
-        updated = paths.config()
-        updated["opencode"] = [entry for entry in updated.get("opencode", [])
-                               if entry.get("sessionId") not in added]
-        _write_config_cas(updated, config_digest)
-        for receipt in receipts:
-            _record_session(db, receipt["session_id"], request_key,
-                            {"model": receipt["model"], "account": receipt["account"],
-                             "cwd": receipt["cwd"], "root": receipt["root"],
-                             "dispatchEnabled": False},
-                            "rolled-back", "withdrawn from the roster")
-        _record_provisioning(db, request_key,
-                             {"model": row[1], "account": row[2], "cwd": row[3],
-                              "root": row[4], "count": row[5],
-                              "dispatchEnabled": bool(row[6])},
-                             "rolled-back", note or "rolled back", payload_digest=row[11] or "")
-        emit(db, "opencode_request_rolled_back", requestKey=request_key, sessions=sorted(added),
-             note=note)
-        return {"action": "rollback-opencode", "requestKey": request_key,
-                "removedFromRoster": sorted(added),
-                "nativeSessionsKept": sorted(added),
-                "note": "the native sessions and their history are untouched",
-                "logicalSessions": len(updated.get("opencode", [])),
-                "admissionLimit": int(updated.get("maxConcurrent", 0)),
-                "heavyJobSlots": heavy.SLOT_COUNT}

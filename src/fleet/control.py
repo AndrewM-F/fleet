@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from . import events, paths
+from . import events, paths, roster
 from .recovery import recovery_for_task, task_recovery_conflict
 from .store import database
 
@@ -15,62 +15,66 @@ def enqueue(db, supplied):
     slots = paths.all_slots()
     with paths.QUEUE_LOCK.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
-                 else {"author": "root", "tasks": []})
-        if queue.get("author") != "root":
-            raise ValueError("Root queue required")
-        by_id = {t["id"]: t for t in queue["tasks"]}
-        added = []
-        for task in supplied:
-            if task.get("rootAuthorized") is not True or not task.get("id") or not task.get("message"):
-                raise ValueError("Explicit root task required")
-            selectors = [k for k in ("sessionId", "lane", "previousTaskId") if task.get(k)]
-            if len(selectors) != 1:
-                raise ValueError("Exactly one target selector required")
-            sid = task.get("sessionId")
-            if task.get("lane"):
-                matches = [s for s in slots if s.get("lane") == task["lane"]]
+        # The queue lock is taken first and the roster writer lock second,
+        # which is the order every writer uses, so an enqueue cannot slip
+        # between a removal's checks and its write.
+        with roster.roster_lock():
+            queue = (json.loads(paths.QUEUE.read_text()) if paths.QUEUE.exists()
+                     else {"author": "root", "tasks": []})
+            if queue.get("author") != "root":
+                raise ValueError("Root queue required")
+            by_id = {t["id"]: t for t in queue["tasks"]}
+            added = []
+            for task in supplied:
+                if task.get("rootAuthorized") is not True or not task.get("id") or not task.get("message"):
+                    raise ValueError("Explicit root task required")
+                selectors = [k for k in ("sessionId", "lane", "previousTaskId") if task.get(k)]
+                if len(selectors) != 1:
+                    raise ValueError("Exactly one target selector required")
+                sid = task.get("sessionId")
+                if task.get("lane"):
+                    matches = [s for s in slots if s.get("lane") == task["lane"]]
+                    if len(matches) != 1:
+                        raise ValueError("Lane is not unique")
+                    sid = matches[0]["sessionId"]
+                if task.get("previousTaskId"):
+                    row = db.execute("SELECT sid FROM tasks WHERE id=?", (task["previousTaskId"],)).fetchone()
+                    if not row:
+                        raise ValueError("Previous task not found")
+                    sid = row[0]
+                matches = [s for s in slots if s["sessionId"] == sid]
                 if len(matches) != 1:
-                    raise ValueError("Lane is not unique")
-                sid = matches[0]["sessionId"]
-            if task.get("previousTaskId"):
-                row = db.execute("SELECT sid FROM tasks WHERE id=?", (task["previousTaskId"],)).fetchone()
-                if not row:
-                    raise ValueError("Previous task not found")
-                sid = row[0]
-            matches = [s for s in slots if s["sessionId"] == sid]
-            if len(matches) != 1:
-                raise ValueError("Target is not in current roster")
-            old = by_id.get(task["id"])
-            normalized = {"id": task["id"], "sessionId": sid, "message": task["message"],
-                          "rootAuthorized": True}
-            if task.get("previousTaskId"):
-                normalized["previousTaskId"] = task["previousTaskId"]
-            recovery_id = task.get("recoveryId")
-            if recovery_id:
-                statuses = ("authorized", "claimed", "completed") if old else ("authorized",)
-                if not task.get("previousTaskId") or not recovery_for_task(
-                        db, recovery_id, task["id"], sid, task["previousTaskId"], statuses):
-                    raise ValueError("Recovery task does not match an authorized durable handoff")
-                normalized["recoveryId"] = recovery_id
-            elif db.execute("SELECT 1 FROM recoveries WHERE owner_task_id=? LIMIT 1",
-                            (task["id"],)).fetchone():
-                raise ValueError("Task ID is reserved for a durable recovery handoff")
-            conflict = task_recovery_conflict(db, normalized, sid, slots)
-            if conflict:
-                raise ValueError(f"Task conflicts with active recovery {conflict}")
-            if old and any(old.get(k) != v for k, v in normalized.items()):
-                raise ValueError("Task ID content conflict")
-            if not old:
-                queue["tasks"].append(normalized)
-                by_id[task["id"]] = normalized
-            added.append({"taskId": task["id"],
-                          "target": task.get("lane") or task.get("previousTaskId") or sid,
-                          "alreadyQueued": bool(old)})
-        tmp = paths.QUEUE.with_name(paths.QUEUE.name + ".control.tmp")
-        tmp.write_text(json.dumps(queue, indent=2) + "\n")
-        os.replace(tmp, paths.QUEUE)
-        return added
+                    raise ValueError("Target is not in current roster")
+                old = by_id.get(task["id"])
+                normalized = {"id": task["id"], "sessionId": sid, "message": task["message"],
+                              "rootAuthorized": True}
+                if task.get("previousTaskId"):
+                    normalized["previousTaskId"] = task["previousTaskId"]
+                recovery_id = task.get("recoveryId")
+                if recovery_id:
+                    statuses = ("authorized", "claimed", "completed") if old else ("authorized",)
+                    if not task.get("previousTaskId") or not recovery_for_task(
+                            db, recovery_id, task["id"], sid, task["previousTaskId"], statuses):
+                        raise ValueError("Recovery task does not match an authorized durable handoff")
+                    normalized["recoveryId"] = recovery_id
+                elif db.execute("SELECT 1 FROM recoveries WHERE owner_task_id=? LIMIT 1",
+                                (task["id"],)).fetchone():
+                    raise ValueError("Task ID is reserved for a durable recovery handoff")
+                conflict = task_recovery_conflict(db, normalized, sid, slots)
+                if conflict:
+                    raise ValueError(f"Task conflicts with active recovery {conflict}")
+                if old and any(old.get(k) != v for k, v in normalized.items()):
+                    raise ValueError("Task ID content conflict")
+                if not old:
+                    queue["tasks"].append(normalized)
+                    by_id[task["id"]] = normalized
+                added.append({"taskId": task["id"],
+                              "target": task.get("lane") or task.get("previousTaskId") or sid,
+                              "alreadyQueued": bool(old)})
+            tmp = paths.QUEUE.with_name(paths.QUEUE.name + ".control.tmp")
+            tmp.write_text(json.dumps(queue, indent=2) + "\n")
+            os.replace(tmp, paths.QUEUE)
+            return added
 
 
 def cycle(request):

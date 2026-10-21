@@ -7,7 +7,7 @@ import signal
 import sqlite3
 import time
 
-from . import claude, opencode, paths, pi, pr_queue, recovery
+from . import claude, opencode, paths, pi, pr_queue, recovery, roster
 from .dispatch import dispatch, send
 from .store import BUSY, TERMINAL, database, emit
 from .util import atomic
@@ -106,6 +106,17 @@ def observe(db, sid, state, now=None):
 
 
 def import_queue(db, slots, queue=None):
+    """Import the root-authored queue under the shared roster writer lock.
+
+    The import binds a task to a worker, so it takes the same lock as the
+    roster writers: a task cannot be imported into a roster that is being
+    drained or removed at that moment.
+    """
+    with roster.roster_lock():
+        return _import_queue(db, slots, queue)
+
+
+def _import_queue(db, slots, queue=None):
     queue_path = Path(queue or paths.QUEUE)
     if not queue_path.exists():
         return
