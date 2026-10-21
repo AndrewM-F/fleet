@@ -246,6 +246,11 @@ def _apply(db, model, session_id, dry_run):
     # configuration is written only if nobody else changed it meanwhile.
     with roster.roster_lock():
         with model_lock():
+            # The digest is read before the configuration, so a change that
+            # lands between the two is detected at the write rather than
+            # overwritten. The snapshot and the digest are taken before any
+            # planning or mutation.
+            digest = roster.config_digest()
             cfg = paths.config()
             planned = plan(cfg, model, session_id, db)
             if dry_run:
@@ -265,7 +270,7 @@ def _apply(db, model, session_id, dry_run):
                 }
                 updated = True
             if updated:
-                roster.write_config_cas(cfg, roster.config_digest())
+                roster.write_config_cas(cfg, digest)
             deferred = [change["sessionId"] for change in planned["changes"] if change.get("busy")]
             return {"applied": updated, "dryRun": False, **planned,
                     "deferredUntilIdle": deferred}

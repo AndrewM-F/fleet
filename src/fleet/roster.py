@@ -104,18 +104,26 @@ def queued_tasks_for(session_id, db=None):
     process waits for itself.
     """
     try:
-        raw = paths.QUEUE.read_text() if paths.QUEUE.exists() else ""
+        present = paths.QUEUE.exists()
+        raw = paths.QUEUE.read_text() if present else ""
     except OSError as error:
         raise QueueUnreadable("the root-authored queue could not be read: "
                               + error.__class__.__name__) from error
-    if not raw.strip():
+    if not present:
+        # A genuinely missing queue file is no queue: there is nothing waiting.
         return []
+    if not raw.strip():
+        # The file exists but carries no document. That is invalid evidence, not
+        # an empty queue, so it refuses.
+        raise QueueUnreadable("the root-authored queue is empty")
     try:
         queue = json.loads(raw)
     except ValueError as error:
         raise QueueUnreadable("the root-authored queue is malformed") from error
-    if not isinstance(queue, dict) or not isinstance(queue.get("tasks", []), list):
+    if not isinstance(queue, dict) or not isinstance(queue.get("tasks"), list):
         raise QueueUnreadable("the root-authored queue is malformed")
+    if queue.get("author") != "root":
+        raise QueueUnreadable("the root-authored queue has no root author")
     found = []
     for task in queue.get("tasks", []):
         if not isinstance(task, dict) or task.get("sessionId") != session_id:

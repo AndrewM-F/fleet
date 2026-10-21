@@ -362,5 +362,209 @@ class DryRunWriteTests(FindingSandbox):
         self.assertEqual(len(paths.config()["opencode"]), 1)
 
 
+class QueueEvidenceTests(FindingSandbox):
+    """Finding 1: a missing queue is no queue; an invalid one is not evidence."""
+
+    def test_a_missing_queue_file_is_not_a_refusal(self):
+        self.assertFalse(paths.QUEUE.exists())
+        result = opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertTrue(result["removed"])
+
+    def test_an_empty_queue_file_refuses_the_removal(self):
+        paths.QUEUE.write_text("")
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("empty", str(error.exception))
+        self.assertEqual(len(paths.config()["opencode"]), 1)
+
+    def test_a_whitespace_queue_file_refuses_the_removal(self):
+        paths.QUEUE.write_text("   \n\t ")
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("empty", str(error.exception))
+        self.assertEqual(len(paths.config()["opencode"]), 1)
+
+    def test_a_truncated_queue_file_refuses_the_removal(self):
+        paths.QUEUE.write_text('{"author": "root", "tasks": [{"id": "t-1"')
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("malformed", str(error.exception))
+
+    def test_a_queue_without_a_tasks_list_refuses_the_removal(self):
+        paths.QUEUE.write_text(json.dumps({"author": "root"}))
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("malformed", str(error.exception))
+
+    def test_a_queue_that_is_not_an_object_refuses_the_removal(self):
+        paths.QUEUE.write_text(json.dumps([{"id": "t-1"}]))
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("malformed", str(error.exception))
+
+    def test_a_queue_without_the_root_author_refuses_the_removal(self):
+        paths.QUEUE.write_text(json.dumps({"author": "someone", "tasks": []}))
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.remove_session(self.db, self.existing, note="remove")
+        self.assertIn("root author", str(error.exception))
+
+
+class SnapshotDigestTests(FindingSandbox):
+    """Finding 2: the selection compares the configuration with its own snapshot."""
+
+    def test_an_out_of_band_change_at_the_boundary_is_refused_and_kept(self):
+        original = model_selection.plan
+
+        def plan_with_an_out_of_band_change(cfg, model, session_id=None, db=None):
+            planned = original(cfg, model, session_id, db)
+            # Another writer changes the configuration after the snapshot was
+            # taken and before the write.
+            changed = json.loads(paths.CONFIG.read_text())
+            changed["maxConcurrent"] = 9
+            paths.CONFIG.write_text(json.dumps(changed))
+            return planned
+
+        with patch.object(model_selection, "plan", side_effect=plan_with_an_out_of_band_change):
+            with self.assertRaises(ValueError) as error:
+                model_selection.apply(None, "opencode/minimax-m3.1-flash-free", self.existing,
+                                      dry_run=False, db=self.db)
+        self.assertIn("changed while", str(error.exception))
+        # The out-of-band change is still there: it was never overwritten.
+        self.assertEqual(paths.config()["maxConcurrent"], 9)
+        self.assertEqual(paths.config()["opencode"][0]["model"], MODEL)
+
+    def test_a_selection_without_a_change_writes_nothing(self):
+        result = model_selection.apply(None, MODEL, self.existing, dry_run=False, db=self.db)
+        self.assertFalse(result["applied"])
+        self.assertEqual(paths.config()["opencode"][0]["model"], MODEL)
+
+
+class PartialReconciliationTests(FindingSandbox):
+    """Finding 3: a partial reconciliation leaves a native effect unaccounted."""
+
+    def _uncertain_row(self, key, count):
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
+            "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, MODEL, str(self.native), str(self.wt), str(self.root), count, 0, "uncertain",
+             1, 1, "", self.digest(count), 0))
+        self.db.commit()
+
+    def _receipt(self, key, session_id):
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, key, session_id, MODEL, str(self.native), str(self.wt), str(self.root),
+             "created", 1, 1, ""))
+        self.db.commit()
+
+    def test_a_partial_reconciliation_refuses(self):
+        # Three were requested. One was receipted and the operator names a
+        # second; the third native effect is unaccounted, so the request refuses
+        # instead of succeeding with a subset or creating another.
+        self._uncertain_row("w5-partial-001", 3)
+        self._receipt("w5-partial-001", "ses_ONE000000000000000001")
+        named = "ses_TWO000000000000000001"
+        with sqlite3.connect(self.native) as db:
+            db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                       (named, str(self.wt), "p", MODEL))
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.add_sessions(
+                self.db, count=3, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                request_key="w5-partial-001", reconciled_sessions=[named])
+        self.assertIn("uncertain", str(error.exception))
+        self.assertEqual(len(paths.config()["opencode"]), 1)
+
+    def test_a_complete_reconciliation_continues(self):
+        # Every requested effect is named, so the continuation is exact.
+        self._uncertain_row("w5-partial-002", 2)
+        first = "ses_ONE000000000000000002"
+        second = "ses_TWO000000000000000002"
+        with sqlite3.connect(self.native) as db:
+            for identifier in (first, second):
+                db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                           (identifier, str(self.wt), "p", MODEL))
+        result = opencode_lifecycle.add_sessions(
+            self.db, count=2, model=MODEL, cwd=str(self.wt), root=str(self.root),
+            request_key="w5-partial-002", reconciled_sessions=[first, second])
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(len(paths.config()["opencode"]), 3)
+
+
+class StaleCallerTests(FindingSandbox):
+    """Finding 4: the initial intent rechecks the bound payload and the terminal state."""
+
+    def _registered_row(self, key, count):
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
+            "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, MODEL, str(self.native), str(self.wt), str(self.root), count, 0, "registered",
+             1, 1, "completed by another caller", self.digest(count), 0))
+        self.db.commit()
+
+    def test_a_stale_caller_returns_idempotently_and_keeps_the_registered_row(self):
+        # Another caller completed this request while this one was preparing.
+        self._registered_row("w5-stale-001", 1)
+        result = opencode_lifecycle.add_sessions(
+            self.db, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+            request_key="w5-stale-001")
+        self.assertTrue(result["idempotent"])
+        row = opencode_lifecycle._provisioning_row(self.db, "w5-stale-001")
+        self.assertEqual(row[7], "registered")
+        self.assertEqual(row[10], "completed by another caller")
+        self.assertEqual(len(paths.config()["opencode"]), 1)
+
+    def test_a_stale_caller_with_a_different_payload_is_refused(self):
+        self._registered_row("w5-stale-002", 1)
+        with self.assertRaises(ValueError) as error:
+            opencode_lifecycle.add_sessions(
+                self.db, count=2, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                request_key="w5-stale-002")
+        self.assertIn("different request", str(error.exception))
+        row = opencode_lifecycle._provisioning_row(self.db, "w5-stale-002")
+        self.assertEqual(row[7], "registered")
+        self.assertEqual(len(paths.config()["opencode"]), 1)
+
+    def test_a_two_caller_barrier_leaves_one_registered_row(self):
+        # Two callers race for the same key. The first one completes the
+        # request; the second one arrives afterwards and must return
+        # idempotently without overwriting the completed row or creating a
+        # second session.
+        finished = threading.Event()
+        first = {}
+
+        def caller_one():
+            connection = store.database(paths.DB)
+            try:
+                first["result"] = opencode_lifecycle.add_sessions(
+                    connection, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                    request_key="w5-stale-003")
+            finally:
+                connection.close()
+                finished.set()
+
+        worker = threading.Thread(target=caller_one)
+        worker.start()
+        finished.wait(60)
+        worker.join(30)
+        self.assertEqual(first["result"]["created"], 1)
+
+        connection = store.database(paths.DB)
+        try:
+            second = opencode_lifecycle.add_sessions(
+                connection, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                request_key="w5-stale-003")
+        finally:
+            connection.close()
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(second["created"], 0)
+        row = opencode_lifecycle._provisioning_row(self.db, "w5-stale-003")
+        self.assertEqual(row[7], "registered")
+        # One native session, one roster entry: the second caller added nothing.
+        self.assertEqual(len(paths.config()["opencode"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

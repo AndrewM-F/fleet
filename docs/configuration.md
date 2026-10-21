@@ -90,16 +90,23 @@ never invents a session id, so the id in a receipt is always the id the native s
   One writer lock serializes the roster, the queue enqueue, the queue import, the model selection
   and the dispatch claim, in that order; the enqueue and the import read the roster inside the
   lock, so a roster a concurrent removal has already changed is never used to accept a task for a
-  worker that is gone.
+  worker that is gone. Every roster write is a compare-and-swap against the configuration the
+  writer started from: a writer that takes the lock is never overwritten, and a writer that ignores
+  it is not protected.
+  The initial intent for a request key rechecks the bound payload and the terminal state under
+  the writer lock: a stale caller returns idempotently or refuses, and it never overwrites a
+  request another caller has already completed as registered.
 - A dry run writes nothing at all: no receipt, no provisioning row, no roster entry, no native
   state. A dry run that reconciles an uncertain attempt verifies but never records.
-- An interrupted attempt is only recoverable when the sessions it accounted for cover every
-  session the request was going to create. A receipt for an earlier creation does not prove that a
-  later one did not happen without a receipt, so the request stays uncertain until the exact
-  identities are named with `--reconciled-session`.
-- A root-authored queue that cannot be read, or that is malformed, is not an empty queue: the
-  removal refuses, because the work in it is unknown. A queue entry that is already in the task
-  ledger was imported: it is history, and it does not block a removal.
+- An interrupted attempt is only recoverable when the exact identities it holds — the sessions it
+  receipted, the ones it recorded before its roster write, and the ones the operator named — account
+  for every session the request was going to create. A receipt for an earlier creation, or a partial
+  reconciliation, leaves a native effect unaccounted, so the request stays uncertain until the
+  exact identities are named with `--reconciled-session`.
+- A root-authored queue file that is missing is no queue. A queue file that exists and is empty,
+  whitespace, truncated, malformed, without a task list or without the root author is not evidence
+  of no work: the removal refuses, because the work in it is unknown. A queue entry that is already
+  in the task ledger was imported: it is history, and it does not block a removal.
 - One request may add up to thirty-two sessions, so a whole scale-up (for example eight to
   twenty-five sessions) is one bounded request rather than several manual calls. `--target-total`
   states the size the roster should reach, so that request adds exactly the difference and the

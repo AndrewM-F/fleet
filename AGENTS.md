@@ -117,19 +117,24 @@ command prints JSON on stdout and exits non-zero on failure.
   sessions, so eight to twenty-five is one request of seventeen additions). One writer lock
   serializes the roster, the queue enqueue, the queue import, the model selection and the dispatch
   claim, and every roster write is a compare-and-swap against the configuration the writer started
-  from, so a concurrent writer is never overwritten. The enqueue and the import read the roster
-  inside that lock, so a roster a concurrent removal has already changed is never used to accept a
-  task for a worker that is gone. A creation whose answer never arrived stays **uncertain**: it is not an
+  from, so a writer that takes the lock is never overwritten; a writer that ignores it is not
+  protected. The enqueue and the import read the roster inside that lock, so a roster a concurrent
+  removal has already changed is never used to accept a task for a worker that is gone. A creation whose answer never arrived stays **uncertain**: it is not an
   ordinary retryable failure, the intent is recorded before the first native call, and the
   request stops. The native inventory is never scanned and nothing is adopted: absence and
   unreadability are no proof that no session was created, so the operator names the session with
   `--reconciled-session` and that exact id is verified — id, working directory and model — before
   it is registered. A session whose receipt says it was never verified is never ignored: it is
   reconciled first, and an unresolved one refuses the request. An interrupted attempt is only
-  recoverable when the sessions it accounted for cover every session the request was going to
-  create: a receipt for an earlier creation does not prove that a later one did not happen
-  without a receipt, so the request stays uncertain until the exact identities are named. A dry run
-  writes nothing at all, not even the receipt a reconciliation would have made. The creation call is proved against
+  recoverable when the exact identities it holds — the sessions it receipted, the ones it recorded
+  before its roster write, and the ones the operator named — account for every session the
+  request was going to create. A receipt for an earlier creation, or a partial reconciliation,
+  leaves a native effect unaccounted, so the request stays uncertain until the exact identities
+  are named. A dry run
+  writes nothing at all, not even the receipt a reconciliation would have made. The initial intent
+  for a request key rechecks the bound payload and the terminal state under the writer lock, so a
+  stale caller returns idempotently or refuses and never overwrites a request another caller has
+  already completed. The creation call is proved against
   the installed CLI's own OpenAPI schema before it is made, and a CLI that does not declare the
   resolved shape — the model as a `Model.Ref` object with a required `id` and `providerID`, the
   location as a `Location.PublicRef` object with a required `directory`, and no other property —
@@ -142,7 +147,11 @@ command prints JSON on stdout and exits non-zero on failure.
 - `bin/fleet remove-opencode --session SID --note "..."` — remove one worker from the roster. It
   refuses while a task or turn is queued, in flight or uncertain, while a task is still waiting to
   be imported from the root-authored queue, while a recovery holds the session, and while the
-  native identity cannot be verified. A worker whose state explicitly says it is running is never
+  native identity cannot be verified. A root-authored queue file that is missing is no queue, but a
+  queue file that exists and is empty, whitespace, truncated, malformed, without a task list or
+  without the root author is not evidence of no work: the removal refuses, because the work in it
+  is unknown. A queue entry that is already in the task ledger was imported: it is history, and it
+  does not block a removal. A worker whose state explicitly says it is running is never
   removed, and `--allow-unverified-native` does not override that: it only covers a native identity
   that cannot be read at all. The native session and its history are kept, and no hold, task, queue
   entry, worktree or credential is touched. There is no second removal path: a receipt-owned worker

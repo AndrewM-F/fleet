@@ -521,6 +521,28 @@ def _record_session(db, session_id, request_key, request, status, detail=""):
     db.commit()
 
 
+def _registered_result(db, key, request, count, entries, dispatch_enabled, note=""):
+    """The result of a request that is already registered.
+
+    The request's own receipts are its sessions. A request whose receipts are
+    missing claims nothing, and it never claims the whole roster.
+    """
+    registered = [receipt for receipt in _session_receipts(db, key)
+                  if receipt["status"] == "registered"]
+    return {"action": "add-opencode", "idempotent": True, "requestKey": key,
+            "created": 0, "registered": len(registered), "requested": count,
+            "sessions": [{"sessionId": receipt["session_id"],
+                          "dispatchEnabled": bool(dispatch_enabled)}
+                         for receipt in registered],
+            "model": request["model"], "account": request["account"],
+            "cwd": request["cwd"], "root": request["root"],
+            "logicalSessions": len(entries),
+            "admissionLimit": int(paths.config().get("maxConcurrent", 0)),
+            "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
+            "status": "registered", "uncertain": False, "retryable": False,
+            "note": note}
+
+
 def _recorded_sessions(row):
     """The native sessions a request recorded for itself before its roster write."""
     if row is None or not row[10]:
@@ -676,17 +698,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
         # The request is recorded as registered. Its receipts are its sessions: a
         # request whose receipts are missing claims nothing, and it never claims
         # the whole roster.
-        return {"action": "add-opencode", "idempotent": True, "requestKey": key,
-                "created": 0, "registered": len(registered), "requested": count,
-                "sessions": [{"sessionId": receipt["session_id"],
-                              "dispatchEnabled": bool(existing[6])} for receipt in registered],
-                "model": request["model"], "account": request["account"],
-                "cwd": request["cwd"], "root": request["root"],
-                "logicalSessions": current_total,
-                "admissionLimit": int(cfg.get("maxConcurrent", 0)),
-                "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
-                "status": "registered", "uncertain": False, "retryable": False,
-                "note": existing[10]}
+        return _registered_result(db, key, request, count, entries, existing[6], existing[10])
     receipts = _session_receipts(db, key)
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
@@ -711,23 +723,6 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     # was going to create: a pending receipt alone does not prove that a later
     # creation did not happen without a receipt.
     recorded = _recorded_sessions(existing)
-    # The sessions this request can account for: the ones it receipted and the
-    # ones it recorded before its roster write. A continuation is safe only when
-    # that set covers every session the request was going to create; a receipt
-    # for an earlier creation does not prove that a later one did not happen
-    # without a receipt.
-    accounted = {receipt["session_id"] for receipt in receipts
-                 if receipt["status"] == "created"} | set(recorded)
-    if existing is not None and existing[7] in {"uncertain", "creating"} and not reconciled:
-        # The previous attempt's outcome is unknown: nothing is adopted on
-        # speculation. The operator names the native session that was created and
-        # that exact id is verified before it is registered.
-        if existing[7] == "uncertain" or len(accounted) < count:
-            raise ValueError("The previous attempt of this request is uncertain: whether a "
-                             "native session was created is unknown, and absence is no proof. "
-                             "Name the native session id that was created with "
-                             "--reconciled-session, or reconcile it explicitly. No session was "
-                             "created now.")
     # The operator's named sessions are verified before they are registered.
     for identifier in reconciled:
         _reject_duplicate_identity(db, cfg, identifier, pending)
@@ -761,6 +756,28 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
             _record_session(db, identifier, key, request, "created",
                             "recovered from the request's own record")
     receipts = _session_receipts(db, key)
+    # The sessions this request can account for: the ones it receipted, the ones
+    # it recorded before its roster write, and the ones the operator named and
+    # that were verified above. A continuation is safe only when that set
+    # covers every session the request was going to create: a receipt for an
+    # earlier creation, or a partial reconciliation, does not prove that a
+    # later creation did not happen without a receipt.
+    accounted = {receipt["session_id"] for receipt in receipts
+                 if receipt["status"] == "created"} | set(recorded) | set(reconciled)
+    if existing is not None and existing[7] in {"uncertain", "creating"}:
+        # The previous attempt's outcome is unknown: nothing is adopted on
+        # speculation. The operator names the native session that was created and
+        # that exact id is verified before it is registered. The continuation is
+        # allowed only when the exact identities account for **every** session the
+        # request was going to create: a partial reconciliation, or a receipt for
+        # an earlier creation alone, leaves a native effect unaccounted and the
+        # request refuses.
+        if len(accounted) < count:
+            raise ValueError("The previous attempt of this request is uncertain: whether a "
+                             "native session was created is unknown, and absence is no proof. "
+                             "Name the native session id that was created with "
+                             "--reconciled-session, or reconcile it explicitly. No session was "
+                             "created now.")
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
     needed = count - len(pending) - len(registered)
@@ -807,12 +824,28 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     # lock is held only for this short step.
     with roster.roster_lock():
         current = _provisioning_row(db, key)
-        if (current is not None and current[7] == "creating" and _creator_alive(current[12])
-                and not _recorded_sessions(current)):
-            # A live attempt that has not named its sessions yet is in progress;
-            # a request that recorded its sessions is recoverable instead.
-            raise ValueError("Another request with this key is in progress; retry after it "
-                             "finishes. No session was created now.")
+        if current is not None:
+            bound = current[11] or ""
+            if bound and bound != digest:
+                # The row belongs to a different request: a stale caller never
+                # rewrites it.
+                raise ValueError("The request key was already used for a different request "
+                                 "(count, total, account, working directory, model, dispatch "
+                                 "flag or admission limit). Use a new key for a different "
+                                 "request.")
+            if current[7] == "registered":
+                # Another caller completed this request while this one was
+                # preparing. The result is idempotent and the completed row is
+                # never overwritten.
+                return _registered_result(db, key, request, count, entries, current[6],
+                                          current[10])
+            if (current[7] == "creating" and _creator_alive(current[12])
+                    and not _recorded_sessions(current)):
+                # A live attempt that has not named its sessions yet is in
+                # progress; a request that recorded its sessions is recoverable
+                # instead.
+                raise ValueError("Another request with this key is in progress; retry after it "
+                                 "finishes. No session was created now.")
         _record_provisioning(db, key, request, "creating",
                              "intent recorded before the native creation", payload_digest=digest,
                              creator_pid=os.getpid())
