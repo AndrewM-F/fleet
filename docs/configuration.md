@@ -43,6 +43,115 @@
   validated on its own identity and on its own persisted receipts rather than refused by a
   fleet-wide constant. Every other session, task, turn, CWD, process and cleanup check, and the
   refusal of rate-limit and quota failures, is unchanged.
+  A roster entry may also carry `draining: true` (set by `bin/fleet drain-opencode`). A draining
+  worker takes no new work: the dispatcher skips it and the queue-reserve alert ignores it, while
+  the tasks already bound to it stay queued, held and untouched until an operator resolves them.
+
+## On-demand OpenCode sessions
+
+A native OpenCode session is normally created by the operator and then rostered. When root
+authorizes on-demand sessions, `bin/fleet add-opencode` creates them through the supported
+OpenCode CLI (`session.create` on `POST /api/session`) and registers them in `opencode[]`. It is
+the only path that may create a session: the Fleet never writes OpenCode's internal database and
+never invents a session id, so the id in a receipt is always the id the native server returned.
+
+- The request is refused unless the root is this fleet's root, the native account
+  (`databasePath`) is the account the roster already uses, the model is the approved free model
+  that account's workers are configured with, the working directory is a git worktree under
+  `worktreeRoot`, and the count is a whole number inside the validated bound.
+- Creating a session contacts no provider: the request carries the pinned model and the
+  directory, and the native server records them. No model call, no paid resource and no
+  credential access is involved.
+- The roster is written once, after every created session was read back from the native identity
+  row. A partial failure therefore leaves the roster exactly as it was; the native sessions that
+  were created before the failure are kept, recorded in `opencode_sessions` and registered by a
+  retry of the same `--request-key` instead of being created a second time. The same request key
+  never adds twice.
+- New workers are dispatch-disabled unless `--enable-dispatch` is given, so a new session can be
+  canaried before it takes work.
+- `--max-concurrent` is the only way to change the admission limit, and only inside the
+  validated limits: it is never lowered, never raised implicitly, never above twice the logical
+  session count and never above the absolute ceiling. The logical session count, the admission
+  limit and the heavy-job admission (two slots) are three separate numbers, and this command
+  changes only the first two, the second only when it is asked for.
+- `bin/fleet drain-opencode` stops dispatching to a worker and reports the work it still owns.
+  `bin/fleet remove-opencode` removes it from the roster and refuses while a task or turn is
+  queued, in flight or uncertain, while a recovery holds the session, and while the native
+  identity cannot be verified. The native session and its history are kept, and no hold, task,
+  queue entry, worktree or credential is touched.
+- Both the provisioning request and every session carry a durable receipt in
+  `opencode_provisioning` and `opencode_sessions` inside `fleet.sqlite`, so ownership and
+  idempotency survive a manager restart. The receipt keeps the digest of the complete request, so
+  a key reused with a different count, account, working directory, model, dispatch flag or
+  admission limit is refused instead of silently doing something else.
+- The request key is bound to the request, the roster write is compared with the configuration the
+  request started from, and provisioning and roster writes are serialized across processes. A
+  concurrent writer is never overwritten and two requests for the same key cannot both create.
+  One writer lock serializes the roster, the queue enqueue, the queue import, the model selection
+  and the dispatch claim, in that order; the enqueue and the import read the roster inside the
+  lock, so a roster a concurrent removal has already changed is never used to accept a task for a
+  worker that is gone. Every roster write is a compare-and-swap against the configuration the
+  writer started from: a writer that takes the lock is never overwritten, and a writer that ignores
+  it is not protected. The digest of that configuration is read before the configuration itself, so
+  a change that lands between the two is detected at the write and kept, never overwritten.
+  The decision for a request key is taken under the writer lock, against the row, its payload
+  digest and every session receipt as they are there, and the number of sessions to create is
+  counted there as well. A stale caller that planned from an earlier snapshot returns idempotently
+  or refuses: it never creates an extra session or a subset, never takes over a live creator
+  because that creator has receipts, and never overwrites a request another caller completed or
+  left uncertain. An uncertain request stays blocked until the exact identities are named and
+  verified.
+- A dry run writes nothing at all: no receipt, no provisioning row, no roster entry, no native
+  state. A dry run that reconciles an uncertain attempt verifies but never records.
+- An interrupted attempt is only recoverable when the exact identities it holds — the sessions it
+  receipted, the ones it recorded before its roster write, and the ones the operator named — account
+  for every session the request was going to create. A receipt for an earlier creation, or a partial
+  reconciliation, leaves a native effect unaccounted, so the request stays uncertain until the
+  exact identities are named with `--reconciled-session`.
+- A root-authored queue file that is missing is no queue. A queue file that exists and is empty,
+  whitespace, truncated, malformed, without a task list or without the root author is not evidence
+  of no work: the removal refuses, because the work in it is unknown. A queue entry that is already
+  in the task ledger was imported: it is history, and it does not block a removal.
+- One request may add up to thirty-two sessions, so a whole scale-up (for example eight to
+  twenty-five sessions) is one bounded request rather than several manual calls. `--target-total`
+  states the size the roster should reach, so that request adds exactly the difference and the
+  roster ends at the target instead of overshooting it.
+- An uncertain outcome stays uncertain. A creation whose answer never arrived is recorded as
+  uncertain, not as an ordinary retryable failure; the intent is recorded before the first native
+  call, and the next run reconciles the native identity before it creates anything. A session
+  whose receipt says its identity was never verified is never ignored: it is reconciled first, and
+  an unresolved one refuses the request.
+- There is one removal path. A worker leaves the roster only through
+  `bin/fleet remove-opencode`, with its barriers: no queued, in-flight, uncertain or
+  awaiting-import work, no recovery claim, and a verifiable native identity. A request is
+  withdrawn by draining and removing its workers, one by one; there is no faster path that
+  skips the barriers. The removal converges: an interrupted removal — the roster was written
+  and the receipt was not — is completed by repeating the command, with the same barriers read
+  from the identity the receipt recorded, so the record and the roster agree again.
+- The creation call is proved against the installed CLI's own schema before it is made, and the
+  request is the one that schema declares: the model as a `Model.Ref` object with a required `id`
+  and `providerID`, the location as a `Location.PublicRef` object with a required `directory`, and
+  nothing else. The evidence and its limits are in
+  [opencode-native-api-evidence.md](opencode-native-api-evidence.md).
+- Once the command has launched, a nonzero exit or an unusable returned session id is an
+  **ambiguous committed effect**: the request becomes uncertain and is not retried without a
+  verified reconciliation. A failure **before** the command starts is a definite, retryable
+  failure. A retry takes the request's ownership atomically, so two retries never own one request.
+  A session receipt only ever moves forward, in the order `unverified` → `created` →
+  `registered` → `draining` → `removed`: a stale write never moves a receipt backwards, and a
+  valid transition — registered to draining, draining to removed — is never refused. A registered
+  request is terminal: no later write moves it back to an earlier state. A command reports what
+  the durable state holds: an idempotent result counts exactly the sessions it lists, never lists
+  a worker the roster does not hold, and names the sessions of the request that are draining,
+  removed or gone. A request converges: an interrupted attempt is finished by the next run with
+  the same key, which creates no second set of sessions. The admission limit a result reports is
+  the one in effect once the request is done, and the roster size it reports is the size the
+  roster ends at. A failure that left a native session whose identity was never verified poisons
+  the key, and the result says the request is not retryable.
+- The staged activation and rollback plan is
+  [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
+  manager, which reloads the roster and the admission limit on every cycle but does not honour
+  `draining`, and the durable state migration that adds the receipt tables before any request.
 
 The configured `model` is the desired model for the next productive turn. The native
 session row keeps its own historical model: it is read, reported and never written, and a
