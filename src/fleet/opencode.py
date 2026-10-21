@@ -919,6 +919,8 @@ def run_turn(request_path):
     timed_out = cancelled = False
     cleanup = {"confirmed": True, "uncertain": False}
     process = None
+    launch_handle = None
+    result = None
     process_identity_record = None
     message_bytes = request["message"].encode("utf-8")
     started = time.monotonic()
@@ -1001,9 +1003,12 @@ def run_turn(request_path):
             os.chmod(logs / "stderr.log", 0o600)
             os.chmod(logs / "events.jsonl", 0o600)
             env = _runtime_environment(request)
-            process = credential_isolation.launch(request, args, cwd=cwd, stdin=subprocess.PIPE,
+            launch_handle = credential_isolation.launch(request, args, cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=errors, text=False,
                                        env=env, start_new_session=True, bufsize=0)
+            process = launch_handle.process
+            status["containmentDomain"] = launch_handle.containment_domain
+            status["isolationBindingDigest"] = launch_handle.binding.digest
             process_identity_record = process_identity(process.pid)
             if (not process_identity_record or process_identity_record.get("pid") != process.pid
                     or process_identity_record.get("pgid") != process.pid
@@ -1175,8 +1180,6 @@ def run_turn(request_path):
                   "toolFailures": tool_failures, "exitCode": code, "error": status.get("error"),
                   "cleanup": status["cleanup"], "managedProcessIdentity": process_identity_record,
                   "finishedAt": status["finishedAt"]}
-        atomic(root / "result.json", result, indent=None)
-        os.chmod(root / "result.json", 0o600)
     except Exception as error:
         if isinstance(error, credential_isolation.IsolationLaunchUncertain):
             cleanup = {"confirmed": False, "uncertain": True}
@@ -1192,9 +1195,26 @@ def run_turn(request_path):
         status.update(state="blocked", error=str(error), finishedAt=time.time(),
                       cleanup="confirmed" if cleanup["confirmed"] else "uncertain")
     finally:
+        if launch_handle is not None:
+            try:
+                launch_handle.finish()
+            except Exception:
+                # Host process/group exit is only supplementary evidence. A
+                # backend domain may still contain descendants after it exits.
+                status.update(state="blocked", cleanup="uncertain",
+                              error="Enforcing backend containment-domain cleanup is unverified; "
+                                    "reconcile before retry", finishedAt=time.time())
         status.pop("pid", None)
         status.pop("processIdentity", None)
         _write_status(state_path, status)
+        if result is not None:
+            # Never persist a successful/confirmed result before domain proof.
+            result.update(state=status["state"], cleanup=status["cleanup"],
+                          error=status.get("error"), finishedAt=status["finishedAt"],
+                          containmentDomain=status.get("containmentDomain"),
+                          isolationBindingDigest=status.get("isolationBindingDigest"))
+            atomic(root / "result.json", result, indent=None)
+            os.chmod(root / "result.json", 0o600)
     return status
 
 

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -90,10 +91,13 @@ class RecoveryLaunchPathTests(unittest.TestCase):
     """Authorize, dispatch, launch and validate, offline and deterministically."""
 
     def setUp(self):
-        # Synthetic adapter fixture: real backend enforcement is tested separately.
+        # Synthetic adapter fixture: boundary contract is tested separately.
         for boundary, replacement in (
                 ("pre_prompt", lambda request: None),
-                ("launch", lambda request, args, **kwargs: opencode.subprocess.Popen(args, **kwargs))):
+                ("launch", lambda request, args, **kwargs: SimpleNamespace(
+                    process=opencode.subprocess.Popen(args, **kwargs),
+                    containment_domain="synthetic-domain", binding=SimpleNamespace(digest="synthetic"),
+                    finish=lambda: None))):
             gate = patch.object(opencode.credential_isolation, boundary, side_effect=replacement)
             gate.start()
             self.addCleanup(gate.stop)
