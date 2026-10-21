@@ -390,7 +390,7 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 | --- | --- | --- |
 | `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **this suite at the published head `0cca1b35`** | **40 tests: 35 pass, 5 fail** — D9, D10, D11, D12, D13. Identical on two consecutive runs (the concurrent case forces its interleaving) |
 | `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository **without** this file | **475 tests: 30 errors, 4 skipped, 0 failures** — the owner's own state at this head (§6.1) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `0cca1b35`, including this suite | see §6.1 |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `0cca1b35`, including this suite | **529 tests: 5 failures, 30 errors, 4 skipped** — the 5 failures are this suite's retained evidence, the 30 errors are the owner's (§6.1) |
 | `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | the previous base `9d2bd8db` (the comparison) | 32 tests: 25 pass, 6 assertion failures, 1 error — D2–D8 |
 | `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the previous base `9d2bd8db`, without this file | 475 tests: 7 failures |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
