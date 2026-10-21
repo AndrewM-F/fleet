@@ -5,7 +5,7 @@ registered enforcing backend may attest and launch one. Worker JSON, environment
 variables and command filters never establish that trust.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from . import paths
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 POLICY_VERSION = 1
 MAX_EVIDENCE_AGE_SECONDS = 30
 REQUIRED_DENIALS = frozenset(
@@ -79,6 +79,9 @@ class Binding:
     turn_id: str
     launch_instance: str
     model: str
+    recovery_id: str | None
+    owned_worktree: str | None
+    recovery_branch: str | None
 
     @property
     def digest(self):
@@ -102,6 +105,7 @@ class Evidence:
     issued_at: float
     expires_at: float
     process_id: int | None
+    containment_domain: str | None
     proof: bytes
 
 
@@ -165,6 +169,21 @@ def _binding(request):
             _canonical(policy["runtimeRoot"])
         ) or not Path(log_dir).is_relative_to(_canonical(policy["logRoot"])):
             raise IsolationUnavailable("Isolation runtime/log path mismatch")
+        recovery_fields = ("recoveryId", "ownedWorktree", "branch")
+        recovery_id = owned_worktree = recovery_branch = None
+        if any(key in request for key in recovery_fields):
+            if any(
+                not isinstance(request.get(key), str) or not request[key].strip()
+                for key in recovery_fields
+            ):
+                raise IsolationUnavailable("Isolation recovery identity is incomplete")
+            recovery_id = request["recoveryId"]
+            owned_worktree = _canonical(request["ownedWorktree"])
+            recovery_branch = request["branch"]
+            if owned_worktree not in allowed:
+                raise IsolationUnavailable(
+                    "Isolation recovery checkout lacks explicit path permission"
+                )
         identifiers = [
             request[k]
             for k in ("sessionId", "taskId", "turn", "isolationLaunchId", "model")
@@ -188,6 +207,9 @@ def _binding(request):
             allowed,
             denied,
             *identifiers,
+            recovery_id,
+            owned_worktree,
+            recovery_branch,
         )
         return backend, binding
     except IsolationUnavailable:
@@ -198,7 +220,9 @@ def _binding(request):
         ) from error
 
 
-def _verify(backend, binding, evidence, stage, process_id=None):
+def _verify(
+    backend, binding, evidence, stage, process_id=None, containment_domain=None
+):
     now = time.time()
     if (
         not isinstance(evidence, Evidence)
@@ -210,6 +234,14 @@ def _verify(backend, binding, evidence, stage, process_id=None):
         or evidence.binding_digest != binding.digest
         or evidence.stage != stage
         or evidence.process_id != process_id
+        or evidence.containment_domain != containment_domain
+        or (
+            stage in {"process", "cleanup"}
+            and (
+                not isinstance(containment_domain, str)
+                or not containment_domain.strip()
+            )
+        )
         or not isinstance(evidence.proof, bytes)
         or not evidence.proof
         or type(evidence.issued_at) not in (int, float)
@@ -232,35 +264,65 @@ def pre_prompt(request):
     _verify(backend, binding, backend.attest(binding, "pre-prompt"), "pre-prompt")
 
 
-def launch(request, args, **kwargs):
-    """Delegate process creation to the enforcing backend, with no fallback.
+@dataclass(frozen=True)
+class LaunchHandle:
+    """Retain trusted authority for one complete containment-domain lifetime."""
 
-    A fresh launch attestation is required independently of the pre-prompt
-    check. The backend must atomically enforce the bound policy when spawning
-    and return authenticated evidence for the resulting process before Fleet
-    writes any prompt bytes to its stdin.
+    backend: object
+    binding: Binding
+    process: object
+    containment_domain: str
+    _finished: bool = field(default=False, init=False)
+
+    def finish(self):
+        """Stop/reap the whole domain and authenticate its empty terminal state.
+
+        This is mandatory even after a successful process exit. A host PID or
+        PGID cannot enumerate a VM, remote job, cgroup or other backend domain.
+        Configuration changes do not replace the original domain's authority.
+        """
+        if self._finished:
+            return
+        try:
+            evidence = self.backend.abort(
+                self.process, self.binding, self.containment_domain
+            )
+            _verify(
+                self.backend,
+                self.binding,
+                evidence,
+                "cleanup",
+                self.process.pid,
+                self.containment_domain,
+            )
+        except Exception as error:
+            raise IsolationLaunchUncertain(
+                "Enforcing backend containment-domain cleanup is unverified; reconcile before retry"
+            ) from error
+        object.__setattr__(self, "_finished", True)
+
+
+def launch(request, args, **kwargs):
+    """Return a proved domain handle, with no unsandboxed fallback.
+
+    The backend must atomically enforce the binding when spawning and return
+    process/domain evidence before prompt bytes are sent. The caller must keep
+    this handle and finish the domain on every subsequent terminal path.
     """
     backend, binding = _binding(request)
     _verify(backend, binding, backend.attest(binding, "launch"), "launch")
     if args[0] != binding.executable or kwargs.get("cwd") != binding.cwd:
         raise IsolationUnavailable("Launch command differs from the attested binding")
     try:
-        process, evidence = backend.launch(binding, args, **kwargs)
+        process, containment_domain, evidence = backend.launch(binding, args, **kwargs)
     except Exception as error:
         raise IsolationLaunchUncertain(
             "Enforcing backend launch outcome is unknown; reconcile before retry"
         ) from error
+    handle = LaunchHandle(backend, binding, process, containment_domain)
     try:
-        _verify(backend, binding, evidence, "process", process.pid)
+        _verify(backend, binding, evidence, "process", process.pid, containment_domain)
     except Exception:
-        # Backend contract also owns descendant containment and teardown. No
-        # prompt has been sent. Do not continue with a partially proved child.
-        try:
-            cleanup_evidence = backend.abort(process, binding)
-            _verify(backend, binding, cleanup_evidence, "cleanup", process.pid)
-        except Exception as error:
-            raise IsolationLaunchUncertain(
-                "Enforcing backend cleanup is unverified; reconcile before retry"
-            ) from error
+        handle.finish()
         raise
-    return process
+    return handle
