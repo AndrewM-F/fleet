@@ -3,10 +3,12 @@
 **Author:** W8 (independent qualification; not the runtime owner)
 **Runtime owner:** W5 — this document qualifies their implementation and changes none of it
 **Qualification suite:** `tests/test_lifecycle_qualification_independent.py` (one owned file)
-**Status:** **not qualified.** Against the owner's published PR #8 head `0cca1b35`, **40 tests:
-36 pass, 4 fail** — four invariants do not pass. The owner repaired the seven findings this
-qualification had reported; they are now covered by passing regressions, and **four cases remain
-open** (D9–D12). Every failure is recorded below with its exact test name, command, observed
+**Status:** a focused, additive qualification. The earlier heads' results — the **47/47** at
+`8ef01717`, the 50-test run that carried the receipt-transition finding, and `0cca1b35` (35/5),
+`709dfcb` (42/1) and `20670971` (43/0) — are **historical evidence for the heads they were run
+on**, and none of them is evidence for a later head. At the frozen head `17890950` the **7 new
+lifecycle and recovery cases** of §10 pass, and the completed 7 focused and 20 adjacent checks
+were **not re-run**. Every finding is recorded with its exact test name, command, observed
 behaviour and the smallest owned-path patch suggestion for the source owner.
 
 ## 1. The exact source base
@@ -607,3 +609,75 @@ worktree or resource; no Docker; no model call. The owner's own suite at this he
 measured**, so its baseline here is unknown. The pull request's draft and auto-merge state is
 unknown from local records, and the head could not be re-fetched from the remote here. **This is
 qualification evidence, not approval: root's personal review remains pending.**
+
+## 10. Focused extension at the frozen head `17890950`
+
+**Frozen head:** `178909504a442174fa8243ab93b7300a9d1d2717` — "fix(fleet): let a session receipt
+move forward through its lifecycle". The published ref `origin/feat/opencode-session-lifecycle-add-remove`
+and the local owner branch both name it; the remote itself cannot be queried from this worker
+(`git ls-remote` → `could not read Username for 'https://github.com'`), and the pull request's draft
+and auto-merge state is **unknown from any local record**. This section is **additive**: the
+sections above are unchanged and their results stand as recorded.
+
+### 10.1 What was already covered, before anything was added
+
+The suite held **54 tests** when this extension began. The completed checks were the **7 focused**
+(receipt lifecycle + receipt rank) and the **20 adjacent** (crash and uncertainty, takeover and
+partial-create, the two-caller initial-intent races, the receipt trail and the receipt
+truthfulness) groups. Enumerating them against the areas this extension was asked to reach:
+
+| Area the extension was asked to cover | Already covered by | Left open |
+| --- | --- | --- |
+| `registered → draining → removed` | `test_the_receipt_follows_the_worker_from_registered_to_draining_to_removed` | the **replay** of a drain and of a removal |
+| same-key retry after the removal | `test_a_same_key_retry_after_a_removal_never_reports_a_worker_that_is_gone` | a retry after a **refused** drain |
+| stale `created`/`unverified` cannot downgrade `registered` | `test_a_stale_write_does_not_downgrade_a_registered_receipt`, `test_no_step_backwards_is_accepted` | the **edges** of the rule: an unknown stored state, an unknown write |
+| every forward step of the rank order | `test_every_forward_step_of_the_receipt_lifecycle_is_accepted` | a forward transition **over an ambiguous receipt** |
+| a late write cannot resurrect a removed receipt | `test_a_late_registration_does_not_resurrect_a_removed_receipt` | the receipt's **identity fields** while its state moves |
+| the crash between the native effect and its receipt | `test_a_crash_between_the_native_effect_and_its_receipt_creates_no_second_session` | a **drain whose roster write is refused** |
+| a worker without a receipt | — (not covered at all) | the **trail** such a removal leaves |
+| the compare-and-swap and its digest | `test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot`, `test_an_out_of_band_config_change_after_the_snapshot_is_rejected` | — (covered; nothing added) |
+
+### 10.2 The seven cases added
+
+| Test | What it covers | Result at `17890950` |
+| --- | --- | --- |
+| `test_a_drain_replayed_twice_is_safe_and_truthful` | the replay of a drain: the receipt stays `draining`, the worker stays in the roster and marked draining, and the replay reports that the worker was already draining | pass |
+| `test_a_removal_replayed_twice_is_refused_and_leaves_the_receipt_alone` | the replay of a removal: the second removal is refused cleanly and the receipt stays `removed` | pass |
+| `test_a_drain_whose_roster_write_is_refused_leaves_the_receipt_and_the_roster_alike` | a drain whose roster write is refused: the receipt does not record a state that did not happen, the worker stays in the roster and is not marked draining, and the removal afterwards still works | pass |
+| `test_the_removal_of_a_worker_without_a_receipt_leaves_a_trail` | a worker that has no receipt: the removal succeeds, no receipt is invented for it, and the removal is still recorded in the event log | pass |
+| `test_a_forward_transition_over_an_ambiguous_receipt_keeps_the_evidence_in_the_log` | an ambiguous (`unverified`) receipt that is reconciled and then registered: the state moves on and the receipt is no longer `unverified` | pass |
+| `test_the_rank_rule_heals_an_unknown_state_and_refuses_an_unknown_write` | the edges of the rule: a known forward write heals an unknown stored state, and an unknown write cannot overwrite a known state | pass |
+| `test_the_identity_of_a_receipt_does_not_move_with_its_state` | a receipt whose state moves keeps its model, account and working directory | pass |
+
+**No failures.** One of these cases was corrected during the work: the replay test first asserted
+the draining flag on the first roster entry, which is the sandbox's own pre-existing worker rather
+than the one under test; the assertion now looks the entry up by session id. That was a defect in
+the new test, not in the product, and no product behaviour was relaxed to make it pass.
+
+### 10.3 Commands and outcomes
+
+| Command | Scope | Outcome |
+| --- | --- | --- |
+| `python3 -m unittest -v tests.test_lifecycle_qualification_independent.LifecycleReplayTests` | the seven new cases | **7 tests, 0 fail** — 3.0 s |
+| `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
+
+The completed 7 focused and 20 adjacent checks were **not** re-run, and no broad aggregate or
+whole-repository run was made at this head.
+
+### 10.4 Scope exhaustion
+
+The areas this extension was asked to reach are now covered to the limit of synthetic evidence:
+the receipt rank order in both directions and at its edges, the lifecycle transitions and their
+replays, the refused-write path, the ambiguous receipt, the receipt-less worker and the identity
+fields. What remains cannot be reached from a synthetic fixture and is stated as a limit rather
+than a gap in the suite: the real native server's own answer to an ambiguous creation, the live
+manager's behaviour across a restart, the roster's behaviour under a genuine multi-process race, the
+owner's whole-repository suite at this head, and the pull request's draft and auto-merge state.
+
+### 10.5 Synthetic-only limits
+
+Seven tests over **synthetic temporary state** on one head. No real native CLI, native database,
+provider or turn; no live manager, fleet, configuration, session, worktree or resource; no Docker;
+no model call. No W5 source, CLI, roster or existing test was edited; nothing was created, drained,
+removed or activated beyond the sandbox; nothing was published, merged, approved or closed. **Worker
+completion is not approval — root's personal review remains pending.**

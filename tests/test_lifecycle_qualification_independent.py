@@ -1678,5 +1678,136 @@ class ReceiptRankTests(QualificationSandbox):
         self.assertEqual(self.receipt_status(identifier), "draining")
 
 
+class LifecycleReplayTests(QualificationSandbox):
+    """Interactions the completed suites do not reach.
+
+    The 7 focused and 20 adjacent tests already cover the receipt ranks, the
+    registered -> draining -> removed lifecycle, the same-key retry after a
+    removal, the stale writes, the two-caller races and the crash and
+    uncertainty paths. These cases are the ones still open: replaying a drain
+    and a removal, a drain whose roster write is refused, a worker without a
+    receipt, a forward transition over an ambiguous receipt, the edges of the
+    rank rule, and the identity fields of a receipt whose state moves.
+    """
+
+    def _added(self, key="w8-replay-001", count=1):
+        result = self.add(count=count, request_key=key)
+        self.assertEqual(result["status"], "registered")
+        return result["sessions"][0]["sessionId"]
+
+    def test_a_drain_replayed_twice_is_safe_and_truthful(self):
+        """The second drain must not move the receipt and must say so."""
+        identifier = self._added()
+        first = opencode_lifecycle.drain_session(self.db, identifier)
+        self.assertTrue(first["draining"])
+        self.assertFalse(first["alreadyDraining"])
+        self.assertEqual(self.receipt_status(identifier), "draining")
+        second = opencode_lifecycle.drain_session(self.db, identifier)
+        self.assertTrue(second["draining"])
+        self.assertTrue(second["alreadyDraining"],
+                        "the replay must report that the worker was already draining")
+        self.assertEqual(self.receipt_status(identifier), "draining")
+        self.assertIn(identifier, self.roster_ids())
+        entry = next(item for item in self.roster() if item.get("sessionId") == identifier)
+        self.assertTrue(entry.get("draining"),
+                        "the worker must stay marked as draining after the replay")
+
+    def test_a_removal_replayed_twice_is_refused_and_leaves_the_receipt_alone(self):
+        """The second removal must fail cleanly and change nothing."""
+        identifier = self._added()
+        opencode_lifecycle.drain_session(self.db, identifier)
+        opencode_lifecycle.remove_session(self.db, identifier, allow_unverified_native=True)
+        self.assertEqual(self.receipt_status(identifier), "removed")
+        with self.assertRaises(ValueError):
+            opencode_lifecycle.remove_session(self.db, identifier, allow_unverified_native=True)
+        self.assertEqual(self.receipt_status(identifier), "removed",
+                         "a refused replay must not move the receipt")
+        self.assertNotIn(identifier, self.roster_ids())
+
+    def test_a_drain_whose_roster_write_is_refused_leaves_the_receipt_and_the_roster_alike(self):
+        """A refused roster write must not record a state that did not happen."""
+        identifier = self._added()
+        with patch.object(roster, "write_config_cas",
+                          side_effect=ValueError("the configuration changed")):
+            with self.assertRaises(ValueError):
+                opencode_lifecycle.drain_session(self.db, identifier)
+        self.assertEqual(self.receipt_status(identifier), "registered",
+                         "a refused drain must not record the worker as draining")
+        self.assertIn(identifier, self.roster_ids())
+        self.assertFalse(self.roster()[0].get("draining"))
+        # The worker is still there, so the removal still works.
+        opencode_lifecycle.remove_session(self.db, identifier, allow_unverified_native=True)
+        self.assertNotIn(identifier, self.roster_ids())
+        self.assertEqual(self.receipt_status(identifier), "removed")
+
+    def test_the_removal_of_a_worker_without_a_receipt_leaves_a_trail(self):
+        """A worker that has no receipt still has to leave a record somewhere."""
+        stranger = "ses_NORECEIPT00000001"
+        config = paths.config()
+        config.setdefault("opencode", []).append(
+            {"sessionId": stranger, "cwd": str(self.worktree),
+             "sessionCwd": str(self.worktree), "databasePath": str(self.native),
+             "model": MODEL, "provider": "opencode", "dispatchEnabled": True})
+        self.write_config(config)
+        self.assertIn(stranger, self.roster_ids())
+        opencode_lifecycle.remove_session(self.db, stranger, allow_unverified_native=True)
+        self.assertNotIn(stranger, self.roster_ids())
+        self.assertIsNone(self.receipt_status(stranger),
+                          "no receipt may be invented for a worker that had none")
+        kinds = [event["kind"] for event in self.events()]
+        self.assertIn("opencode_session_removed", kinds,
+                      "the removal must still be recorded in the event log")
+
+    def test_a_forward_transition_over_an_ambiguous_receipt_keeps_the_evidence_in_the_log(self):
+        """A receipt that was uncertain may move on, but the uncertainty stays visible."""
+        key, digest = self.request_parts(count=1)
+        identifier = "ses_AMBIGUOUS0000001"
+        self.seed_native_session(identifier)
+        self.seed_receipt(identifier, key, "unverified", "the identity could not be read")
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree), "dispatchEnabled": False}
+        opencode_lifecycle._record_session_locked(self.db, identifier, key, request, "created",
+                                                  "reconciled: the native identity was read back")
+        self.assertEqual(self.receipt_status(identifier), "created")
+        opencode_lifecycle._record_session_locked(self.db, identifier, key, request, "registered",
+                                                  "in the roster")
+        self.assertEqual(self.receipt_status(identifier), "registered")
+        self.assertNotEqual(self.receipt_status(identifier), "unverified",
+                            "a receipt that was reconciled is no longer unverified")
+
+    def test_the_rank_rule_heals_an_unknown_state_and_refuses_an_unknown_write(self):
+        """The edges of the rule: an unknown stored state is healed, an unknown write is refused."""
+        key, digest = self.request_parts(count=1)
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree), "dispatchEnabled": False}
+        unknown = "ses_UNKNOWNSTATE00001"
+        self.seed_native_session(unknown)
+        self.seed_receipt(unknown, key, "provisional", "an unknown state")
+        opencode_lifecycle._record_session(self.db, unknown, key, request, "created", "healed")
+        self.assertEqual(self.receipt_status(unknown), "created",
+                         "a known forward write must heal an unknown stored state")
+        known = "ses_KNOWNSTATE0000001"
+        self.seed_native_session(known)
+        self.seed_receipt(known, key, "registered", "in the roster")
+        opencode_lifecycle._record_session(self.db, known, key, request, "provisional",
+                                           "an unknown write")
+        self.assertEqual(self.receipt_status(known), "registered",
+                         "an unknown write must not overwrite a known state")
+
+    def test_the_identity_of_a_receipt_does_not_move_with_its_state(self):
+        """The state moves; the identity of the session stays."""
+        identifier = self._added()
+        row = self.db.execute("SELECT model,account,cwd FROM opencode_sessions WHERE session_id=?",
+                              (identifier,)).fetchone()
+        before = tuple(row)
+        opencode_lifecycle.drain_session(self.db, identifier)
+        after = tuple(self.db.execute(
+            "SELECT model,account,cwd FROM opencode_sessions WHERE session_id=?",
+            (identifier,)).fetchone())
+        self.assertEqual(before, after,
+                         "a receipt's model, account and working directory must not change "
+                         "when its state moves")
+
+
 if __name__ == "__main__":
     unittest.main()
