@@ -14,9 +14,11 @@ behaviour and the smallest owned-path patch suggestion for the source owner.
 | Field | Value |
 | --- | --- |
 | Repository | `/Users/amf/Developer/.codex/fleet` (remote `0xPlayerOne/fleet`) |
-| **Qualification base** | **`0cca1b35fa76fccde3bc8d11a6dd9bdfe6838462`** — "fix(fleet): close the seven reviewed lifecycle findings" — the published PR #8 head; the remote-tracking ref `origin/feat/opencode-session-lifecycle-add-remove` names exactly this commit |
-| **Qualification branch** | `codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` |
-| **Qualification worktree** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-0cca1b35` — created clean from that commit |
+| **Pinned base (the head this qualification was asked to complete)** | **`0cca1b35fa76fccde3bc8d11a6dd9bdfe6838462`** — "fix(fleet): close the seven reviewed lifecycle findings" |
+| **Current published PR #8 head** | **`709dfcb1733fdd86fe4f1bd866aa636de436979a`** — "fix(fleet): hold the queue evidence, the snapshot and the stale caller"; `origin/feat/opencode-session-lifecycle-add-remove` and the local owner branch both name it. It was published **during** this run, and the suite was re-run against it (§1.1) |
+| **Qualification branch at the pinned base** | `codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` @ `8ea3e6650149d68c1b857e6ee67f5b10dab88367` — 35 pass, 5 fail |
+| **Qualification branch at the current published head** | `codex/20261021-w8-independent-lifecycle-qualification-at-709dfcb` @ `520bbbb` — **40 pass, 0 fail** |
+| **Qualification worktrees** | `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-0cca1b35` and `/Users/amf/Developer/.worktrees/fleet-lifecycle-qualification-w8-at-709dfcb` — each created clean from exactly its base |
 | **Previous base (the comparison)** | `9d2bd8db9432fe51c3848c8e143c50f3272be662` — the head the previous report ran on; every invariant is compared against it (§3) |
 | **Previous branch (preserved, untouched)** | `codex/20261021-w8-independent-lifecycle-qualification` @ `6e3454ffd632bb1177821d5b4a08d93d82c5de0b` — the four earlier commits, the two artifacts and every earlier receipt are left exactly as they were |
 | Carry-forward | the four W8 commits were carried onto the new base with `git cherry-pick` (`927f855`, `f7eca20`, `b6d6de3`, `6e3454ff` → `b10a617`, `88693b7`, `bc0de8a`, `1b34baa`). They touch **only** the two owned paths, so nothing of W5's source is rewritten or duplicated |
@@ -28,6 +30,24 @@ The base moved because the owner published the repair of the seven reviewed find
 qualification therefore starts a **separate clean worktree and branch from exactly that commit** and
 carries its own artifacts forward, so the previous branch, its commits and its receipts stay
 intact and independently checkable.
+
+### 1.1 The published head moved during the run, and the suite was re-run there
+
+While the qualification was running, the owner published `709dfcb`. Its subject — "hold the queue
+evidence, the snapshot and the stale caller" — touches the code behind the findings that were still
+open at `0cca1b35`, so the standing rule (re-run the same suite against the published checked head)
+applies. The same suite, unchanged, was carried onto `709dfcb` with `git cherry-pick` into its own
+clean worktree and branch and re-run there:
+
+| Head | Branch | Suite |
+| --- | --- | --- |
+| `0cca1b35` (pinned) | `…-at-0cca1b35` @ `8ea3e66` | 40 tests: **35 pass, 5 fail** (D9–D13) |
+| `709dfcb` (current published) | `…-at-709dfcb` @ `520bbbb` | 40 tests: **40 pass, 0 fail** |
+
+The repair is visible in the diff: `model_selection._apply` now reads the digest **before** the
+configuration and hands that digest to `roster.write_config_cas` (D11, D12), and `roster.py` and
+`opencode_lifecycle.py` changed for the queue evidence, the snapshot and the stale caller (D9, D10,
+D13).
 
 ## 2. What the suite covers, and what it deliberately does not
 
@@ -123,7 +143,11 @@ owner to accept, reject or re-shape.
 | D10 — an existing queue file without a tasks list is treated as an empty queue | — | **FAIL** | not fixed: `queue.get("tasks", [])` defaults to an empty list |
 | D11 — a configuration change after the model writer's snapshot is overwritten | — | **FAIL** | not fixed: the compare-and-swap digest is read again at write time |
 | D12 — the compare-and-swap does not use the digest captured with the snapshot | — | **FAIL** | the same cause as D11, observed directly |
-| D13 — a late same-key request creates a second native session and overwrites the registered intent | — | **FAIL** | not fixed: the guard reads the intent's status only when it is `creating` |
+| D13 — a late same-key request creates a second native session and overwrites the registered intent | — | **FAIL** | not fixed at `0cca1b35`: the guard reads the intent's status only when it is `creating` |
+
+**At the owner's current published head `709dfcb` every one of these passes** (§1.1): the suite is
+40 tests, 40 pass, 0 fail. The table above is the record of what each finding was, so the repair
+stays covered by the regression that found it.
 
 **Nine of the twelve findings are repaired and covered by passing regressions; five cases remain
 open.** D11 and D12 are one cause with two observations: the model writer reads the configuration,
@@ -393,6 +417,9 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 | `python3 -m unittest discover -s tests -t .` | the whole repository at `0cca1b35`, including this suite | **529 tests: 5 failures, 30 errors, 4 skipped** — the 5 failures are this suite's retained evidence, the 30 errors are the owner's (§6.1) |
 | `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | the previous base `9d2bd8db` (the comparison) | 32 tests: 25 pass, 6 assertion failures, 1 error — D2–D8 |
 | `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the previous base `9d2bd8db`, without this file | 475 tests: 7 failures |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the same suite at the current published head `709dfcb`** | **40 tests: 40 pass, 0 fail** |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `709dfcb`, including this suite | see §6.3 |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the repository at `709dfcb` **without** this file | see §6.3 |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
 | `git diff --stat 0cca1b35...codex/20261021-w8-independent-lifecycle-qualification-at-0cca1b35` | the owned delta against the published head | two new paths only |
 
@@ -418,6 +445,21 @@ FileNotFoundError: .../config/fleet.local.json
 provider pair without creating a config file"), but it is unreachable: `slots(cfg)` is called
 before the guard, and it is `slots()` that reads the file. **This qualification does not touch the
 owner's tests or the owner's source; the failures are preserved and reported here for root.**
+
+### 6.3 The owner's own suite at `709dfcb`
+
+Without this qualification the repository's own suite is **475 tests with 30 errors, 4 skipped and
+0 failures** at `709dfcb` — the same 30 errors as at `0cca1b35`, one cause, unchanged by the
+owner's new commit: `manager.import_queue` still reads the roster with `paths.all_slots()`, whose
+legacy no-config-file guard is unreachable, so every fixture without a configuration file fails
+before the import can run. With this qualification the repository is **543 tests with 30 errors, 4
+skipped and 0 failures**: every one of this suite's 40 tests passes, and all 30 errors belong to
+the owner's own suite.
+
+**The qualification is green and the head is not.** This suite's 40 invariants all hold at the
+published head; the repository's own 30 errors are the owner's and are outside this qualification's
+two paths. They are preserved as failures and are reported for root: they block a merge of the
+head independently of this qualification.
 
 ### 6.2 Per-test receipt at the published head `0cca1b35`
 
@@ -471,31 +513,27 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite does not pass on the published head.** Five invariants do not pass at `0cca1b35` —
-   D9, D10, D11, D12 and D13 (§3). Until the source owner repairs them — or records why the
-   invariant is wrong — this branch cannot be qualified.
-2. **The published head is not green in the owner's own suite either.** Without this qualification,
-   the repository's own suite is **475 tests with 30 errors** at `0cca1b35` (§6.1): the new
-   `manager.import_queue` reads the configuration through `paths.all_slots()`, whose legacy
-   no-config-file guard is unreachable, so every fixture without a configuration file fails before
-   the import can run. Those errors are **preserved as failures** and are the owner's to fix; this
-   qualification changed nothing of theirs.
-3. **Nine of the twelve findings are repaired** and are now covered by passing regressions, so the
-   repairs stay protected. D1–D8's repairs are all covered by tests that remain in the suite.
-4. **D11 and D12 are one cause**, and D13 is a second window in the same area: the runtime decides
-   what a request still needs *before* it takes the writer lock, so a late same-key request can
-   create a second native session and move a registered intent back to `creating`.
-5. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
+1. **The suite passes at the published head `709dfcb`** — 40 tests, 40 pass, 0 fail (§1.1, §6). The
+   lifecycle invariants this qualification covers are met, and each of the thirteen findings that
+   were open at some point is still covered by the regression that found it.
+2. **The published head is not green in the owner's own suite.** Without this qualification the
+   repository is 475 tests with **30 errors** (§6.3): the new `manager.import_queue` reads the
+   configuration through `paths.all_slots()`, whose legacy no-config-file guard is unreachable, so
+   every fixture without a configuration file fails before the import can run. That is the owner's
+   to fix; this qualification changed nothing of theirs, and the failures are preserved as failures.
+   **It blocks a merge of the head independently of this qualification.**
+3. **The qualification was pinned to `0cca1b35`, which the owner has since moved past.** The
+   results at both heads are recorded (§1.1); the pinned branch shows the five findings that were
+   open there and the current branch shows the repair.
+4. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
    disposable native CLI and a disposable fleet, which are outside this outcome's scope and outside
-   its authority. In particular the D13 result is observed against the **fake** native server: the
-   second native session is real in the synthetic inventory, and nothing here says what a real
-   server would do with it.
-6. **The out-of-band change in D11 and D12 is written by the test itself**, bypassing the writer
-   lock, because that is what "out of band" means. A change that respects the lock cannot reach
-   that window, so the two cases describe the same exposure from two directions.
-7. **The published head was not re-fetched.** This worker has no GitHub authorization, so
-   `git ls-remote` fails; the head this qualification ran against is the commit `0cca1b35` itself,
+   its authority.
+5. **The out-of-band change in D11 and D12 was written by the test itself**, bypassing the writer
+   lock, because that is what out of band means; a change that respects the lock cannot reach that
+   window.
+6. **The published head could not be re-fetched.** This worker has no GitHub authorization, so
+   `git ls-remote` fails; the head this qualification ran against is the commit `709dfcb` itself,
    and the local remote-tracking ref `origin/feat/opencode-session-lifecycle-add-remove` names it.
-8. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
+7. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
    documentation file was modified, W5's branch and worktree were not touched, and no live manager,
    session, configuration, registered worktree or resource was changed.
