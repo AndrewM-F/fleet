@@ -1411,7 +1411,8 @@ class InitialIntentRaceTests(QualificationSandbox):
         self.assertEqual(result_status(results["first"]), "uncertain",
                          "the first attempt must be uncertain")
         self.assertEqual(len(self.native_creates()), 1,
-                         "an uncertain attempt must not be followed by a second native session")
+                         "an uncertain attempt must not be followed by a second "
+                         "native session")
         self.assertEqual(self.intent_status(self.KEY), "uncertain",
                          "the durable uncertain intent must not be overwritten")
         late_result = results["late"]
