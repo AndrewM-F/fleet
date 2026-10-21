@@ -21,6 +21,7 @@ anything from the host. No production fix is implemented or copied: where the
 published source does not satisfy an invariant, the test fails and the failure
 is the acceptance evidence that is routed back to the source owner.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -263,6 +264,12 @@ class QualificationSandbox(unittest.TestCase):
     def provisioning(self):
         return self.db.execute("SELECT request_key,status,detail,payload_digest "
                                "FROM opencode_provisioning").fetchall()
+
+    def intent_status(self, key):
+        """The durable status of a request's intent."""
+        row = self.db.execute("SELECT status FROM opencode_provisioning WHERE request_key=?",
+                              (key,)).fetchone()
+        return row[0] if row else None
 
     def session_receipts(self):
         return self.db.execute("SELECT session_id,request_key,status,detail "
@@ -607,6 +614,71 @@ class QueueAndLedgerIntegrityTests(QualificationSandbox):
         self.assertIn(self.existing, self.roster_ids())
         self.assertTrue(self.roster()[0].get("draining"))
 
+    def _removal_with_queue(self, content):
+        """Write a queue file with exactly this content and try to remove."""
+        paths.QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        paths.QUEUE.write_text(content)
+        try:
+            opencode_lifecycle.remove_session(self.db, self.existing,
+                                              allow_unverified_native=True)
+        except ValueError as error:
+            return str(error)
+        return None
+
+    def test_an_existing_empty_queue_file_refuses_the_removal(self):
+        """An existing but empty queue is not an empty queue.
+
+        The file is there, so the work in it is unknown: a queue file that
+        carries nothing readable must refuse the removal rather than report
+        that there is nothing waiting.
+        """
+        for content in ("", "   \n\t  \n"):
+            paths.QUEUE.parent.mkdir(parents=True, exist_ok=True)
+            paths.QUEUE.write_text(content)
+            with self.assertRaises(ValueError) as error:
+                opencode_lifecycle.remove_session(self.db, self.existing,
+                                                  allow_unverified_native=True)
+            self.assertIn("queue", str(error.exception).lower())
+            self.assertIn(self.existing, self.roster_ids(),
+                          "a worker must not be removed while its queue cannot be read")
+
+    def test_an_existing_queue_file_without_a_tasks_list_refuses_the_removal(self):
+        """A queue file that names no tasks list cannot be read either."""
+        error = self._removal_with_queue(json.dumps({"author": "root"}))
+        self.assertIsNotNone(error, "a queue file without a tasks list must refuse")
+        self.assertIn("queue", error.lower())
+        self.assertIn(self.existing, self.roster_ids(),
+                      "a worker must not be removed while its queue cannot be read")
+
+    def test_a_truncated_queue_file_refuses_the_removal(self):
+        """A truncated queue file is a malformed queue file."""
+        error = self._removal_with_queue('{"author": "root", "tasks": [{"id": "task-trunc"')
+        self.assertIsNotNone(error, "a truncated queue file must refuse")
+        self.assertIn("queue", error.lower())
+        self.assertIn(self.existing, self.roster_ids())
+
+    def test_a_missing_queue_file_is_distinguished_from_an_unreadable_one(self):
+        """A queue file that is not there is a different case from one that cannot be read.
+
+        There is no queue, so there is nothing waiting to be imported; the
+        removal must not report the unreadable-queue refusal, and the queue
+        file's absence must not be silently reported as an unreadable queue.
+        """
+        paths.QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        paths.QUEUE.unlink(missing_ok=True)
+        outcome = {}
+        try:
+            outcome["result"] = opencode_lifecycle.remove_session(
+                self.db, self.existing, allow_unverified_native=True)
+        except ValueError as error:
+            outcome["error"] = str(error)
+        if "error" in outcome:
+            self.assertNotIn("queue", outcome["error"].lower(),
+                             "a missing queue file is not an unreadable queue file")
+        else:
+            self.assertTrue(outcome["result"]["removed"])
+            self.assertNotIn(self.existing, self.roster_ids())
+
 
 class RemovalBarrierTests(QualificationSandbox):
     """The removal barriers protect the work and the worktree."""
@@ -775,6 +847,14 @@ class BarrierRaceTests(QualificationSandbox):
                          ["task-late"], "the queue entry must not be lost")
 
     def test_a_model_selection_write_never_loses_a_roster_entry(self):
+        """A model selection must never lose a roster entry.
+
+        The selection and the addition are two writers of the same file. The
+        roster is the identity source, so no worker may vanish between them and
+        no receipt may claim a registration the roster does not have. Which of
+        the two writes lands first is not the invariant; the invariant is that
+        the roster stays consistent and complete.
+        """
         selection_read = threading.Event()
         selection_done = threading.Event()
         real_plan = model_selection.plan
@@ -782,7 +862,7 @@ class BarrierRaceTests(QualificationSandbox):
         def slow_plan(cfg, model, session_id=None, db=None):
             planned = real_plan(cfg, model, session_id, db)
             selection_read.set()
-            selection_done.wait(20)
+            selection_done.wait(5)
             return planned
 
         def selection():
@@ -805,16 +885,164 @@ class BarrierRaceTests(QualificationSandbox):
         worker = threading.Thread(target=selection)
         worker.start()
         self.assertTrue(selection_read.wait(20), "the selection must read the roster first")
-        result = addition()
+        try:
+            result = addition()
+        except ValueError as error:
+            # The addition refused rather than overwriting the selection's
+            # change; that is a refusal, not a lost worker.
+            result = {"error": str(error)}
         selection_done.set()
         worker.join(30)
         self.assertEqual(len(self.native_creates()), 1)
-        self.assertEqual(result.get("registered"), 1,
-                         "the addition must have registered its worker before the write")
+        # The invariant: nothing is lost and nothing is claimed twice.
         self.assertIn(self.existing, self.roster_ids(),
                       "the model selection must not lose the roster entry it read")
-        self.assertGreaterEqual(len(self.roster()), 2,
-                                "the model selection must not lose a worker added meanwhile")
+        self.assertEqual(len(self.roster_ids()), len(set(self.roster_ids())),
+                         "no worker may be registered twice")
+        registered = [row[0] for row in self.session_receipts() if row[2] == "registered"]
+        for identifier in registered:
+            self.assertIn(identifier, self.roster_ids(),
+                          "a receipt must agree with the roster")
+        if isinstance(result, dict) and "error" in result:
+            # The addition refused rather than overwriting the selection's
+            # change; that is a refusal, not a lost worker.
+            self.assertIn("configuration changed", result["error"])
+
+    def test_an_out_of_band_config_change_after_the_snapshot_is_rejected(self):
+        """A configuration change that arrives after the snapshot must be rejected.
+
+        The model writer reads the configuration and then writes it back. If
+        another writer changes the configuration in between, the model writer's
+        write must be refused: its copy is stale and the roster is the identity
+        source.
+        """
+        real_plan = model_selection.plan
+
+        def plan_then_change(cfg, model, session_id=None, db=None):
+            planned = real_plan(cfg, model, session_id, db)
+            changed = paths.config()
+            changed["maxConcurrent"] = int(changed.get("maxConcurrent", 0)) + 3
+            paths.write_config(changed)
+            return planned
+
+        with patch.object(model_selection, "plan", side_effect=plan_then_change):
+            with self.assertRaises(ValueError) as error:
+                model_selection.apply(self.db, OTHER_APPROVED, self.existing, db=self.db)
+        self.assertIn("configuration changed", str(error.exception))
+        self.assertEqual(paths.config()["maxConcurrent"], 7,
+                         "the out-of-band change must survive the refused write")
+
+    def test_the_compare_and_swap_uses_the_digest_captured_with_the_snapshot(self):
+        """The compare-and-swap must compare against the snapshot it started from.
+
+        The digest a writer compares against has to be the digest of the
+        configuration it read. A digest read again at write time always matches,
+        and the compare-and-swap can then never detect a change.
+        """
+        captured = {}
+        real_cas = roster.write_config_cas
+        real_plan = model_selection.plan
+
+        def plan_then_change(cfg, model, session_id=None, db=None):
+            planned = real_plan(cfg, model, session_id, db)
+            captured["snapshot"] = hashlib.sha256(self.config_bytes()).hexdigest()
+            changed = paths.config()
+            changed["maxConcurrent"] = int(changed.get("maxConcurrent", 0)) + 3
+            paths.write_config(changed)
+            return planned
+
+        def spy_cas(cfg, expected_digest):
+            captured["expected"] = expected_digest
+            captured["current"] = roster.config_digest()
+            return real_cas(cfg, expected_digest)
+
+        with patch.object(model_selection, "plan", side_effect=plan_then_change), \
+             patch.object(roster, "write_config_cas", side_effect=spy_cas):
+            with self.assertRaises(ValueError):
+                model_selection.apply(self.db, OTHER_APPROVED, self.existing, db=self.db)
+        self.assertIn("expected", captured, "the write must go through the compare-and-swap")
+        self.assertEqual(captured["expected"], captured["snapshot"],
+                         "the compare-and-swap must use the digest captured with the "
+                         "configuration it read, not a digest read again at write time")
+        self.assertNotEqual(captured["expected"], captured["current"],
+                            "the change that arrived after the snapshot must be visible")
+
+    def test_a_concurrent_same_key_request_creates_one_session_and_keeps_the_final_intent(self):
+        """Two same-key requests may create one native session and register it once.
+
+        The interleaving is forced, not hoped for. The late request computes
+        what it still needs before the first request has registered anything,
+        and it only reaches the writer lock after the first request has
+        finished. That is a legal order of events, and it is the one the
+        runtime has to be safe in, so the outcome is the same on every run.
+        """
+        real_probe = opencode_lifecycle.verify_native_api_support
+        late_needed = threading.Event()
+        first_done = threading.Event()
+
+        def probe_spy(executable, timeout=opencode_lifecycle.API_PROBE_TIMEOUT_SECONDS):
+            name = threading.current_thread().name
+            if name == "late-request":
+                late_needed.set()
+                first_done.wait(30)
+            elif name == "first-request":
+                late_needed.wait(30)
+            return real_probe(executable, timeout)
+
+        def request():
+            db = store.database(paths.DB)
+            try:
+                return opencode_lifecycle.add_sessions(
+                    db, count=1, model=MODEL, cwd=str(self.worktree), root=str(self.root),
+                    request_key="w8-final-intent-002")
+            finally:
+                db.close()
+
+        results = {}
+
+        def run(name):
+            try:
+                results[name] = request()
+            except Exception as error:  # noqa: BLE001 - the failure is the result
+                results[name] = {"error": str(error)}
+            finally:
+                if name == "first":
+                    first_done.set()
+
+        with patch.object(opencode_lifecycle, "verify_native_api_support",
+                          side_effect=probe_spy):
+            first = threading.Thread(target=run, args=("first",), name="first-request")
+            second = threading.Thread(target=run, args=("second",), name="late-request")
+            first.start()
+            second.start()
+            first.join(60)
+            second.join(60)
+        self.assertEqual(len(self.native_creates()), 1,
+                         "one key must create at most one native session")
+        registered = [row for row in self.session_receipts() if row[2] == "registered"]
+        self.assertEqual(len(registered), 1, "one key must register at most one worker")
+        self.assertEqual(self.intent_status("w8-final-intent-002"), "registered",
+                         "a final intent must never overwrite a registered request")
+        self.assertEqual(len(self.roster()), 2)
+        self.assertEqual(len(self.roster_ids()), len(set(self.roster_ids())))
+
+    def test_a_final_intent_never_overwrites_a_registered_request(self):
+        """A registered request stays registered.
+
+        The intent of a request is durable. Once it says the request is
+        registered, a later attempt for the same key must not move it back to an
+        earlier state.
+        """
+        first = self.add(count=1, request_key="w8-final-intent-003")
+        self.assertEqual(first["status"], "registered")
+        self.assertEqual(self.intent_status("w8-final-intent-003"), "registered")
+        second = self.add(count=1, request_key="w8-final-intent-003")
+        self.assertTrue(second.get("idempotent"))
+        self.assertEqual(self.intent_status("w8-final-intent-003"), "registered",
+                         "a later attempt must not move a registered intent back")
+        self.assertEqual(len(self.native_creates()), 1)
+        self.assertEqual(len([row for row in self.session_receipts()
+                              if row[2] == "registered"]), 1)
 
 
 class ReceiptTruthfulnessTests(QualificationSandbox):
