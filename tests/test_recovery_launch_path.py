@@ -90,6 +90,13 @@ class RecoveryLaunchPathTests(unittest.TestCase):
     """Authorize, dispatch, launch and validate, offline and deterministically."""
 
     def setUp(self):
+        # Synthetic adapter fixture: real backend enforcement is tested separately.
+        for boundary, replacement in (
+                ("pre_prompt", lambda request: None),
+                ("launch", lambda request, args, **kwargs: opencode.subprocess.Popen(args, **kwargs))):
+            gate = patch.object(opencode.credential_isolation, boundary, side_effect=replacement)
+            gate.start()
+            self.addCleanup(gate.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.native_cwd = self.root / "native-worker"
@@ -138,6 +145,13 @@ class RecoveryLaunchPathTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Never depend on an ignored local fleet config in the source checkout.
+        config_path = self.root / "synthetic-fleet.json"
+        config_path.write_text(json.dumps({"pi": [], "claude": [], "opencode": [self.slot]}))
+        for name, value in (("CONFIG", config_path), ("DATA", self.data)):
+            fixture_path = patch.object(paths, name, value)
+            fixture_path.start()
+            self.addCleanup(fixture_path.stop)
         slot_patch = patch.object(paths, "opencode_slots", return_value=[self.slot])
         slot_patch.start()
         self.addCleanup(slot_patch.stop)

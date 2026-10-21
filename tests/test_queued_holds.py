@@ -255,6 +255,13 @@ class HeldRecoverySuccessorTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Keep the fresh-checkout suite independent of local source configuration.
+        config_path = self.root / "synthetic-fleet.json"
+        config_path.write_text(json.dumps({"pi": [], "claude": [], "opencode": [self.slot]}))
+        for name, value in (("CONFIG", config_path), ("DATA", self.data)):
+            fixture_path = patch.object(paths, name, value)
+            fixture_path.start()
+            self.addCleanup(fixture_path.stop)
         slots = patch.object(paths, "opencode_slots", return_value=[self.slot])
         slots.start()
         self.addCleanup(slots.stop)

@@ -15,7 +15,7 @@ import time
 import uuid
 from urllib.parse import quote
 
-from . import paths
+from . import credential_isolation, paths
 from .util import atomic
 
 # Retain the legacy pin for existing rosters; selection is always explicit per slot.
@@ -578,7 +578,8 @@ def send(slot, message, task_id=None, recovery=None, model=None):
                    "nativeIdentityModel": native_identity,
                    "message": message, "executable": slot["executable"],
                    "logDir": str(logs), "timeoutSeconds": int(slot.get("turnTimeoutSeconds", 0)),
-                   "lockFd": lock.fileno()}
+                   "lockFd": lock.fileno(), "isolationLaunchId": str(uuid.uuid4()),
+                   "turnRoot": str(path.resolve())}
         if selection:
             request["modelSelection"] = {"model": expected,
                                          "nativeIdentityModel": native_identity,
@@ -588,6 +589,7 @@ def send(slot, message, task_id=None, recovery=None, model=None):
             request["recoveryId"] = recovery["id"]
             request["ownedWorktree"] = recovery["owned_worktree"]
             request["branch"] = recovery["branch"]
+        credential_isolation.pre_prompt(request)
         atomic(path / "request.json", request, indent=None)
         os.chmod(path / "request.json", 0o600)
         launch = {"turn": turn, "taskId": task_id, "sessionId": sid,
@@ -999,7 +1001,7 @@ def run_turn(request_path):
             os.chmod(logs / "stderr.log", 0o600)
             os.chmod(logs / "events.jsonl", 0o600)
             env = _runtime_environment(request)
-            process = subprocess.Popen(args, cwd=cwd, stdin=subprocess.PIPE,
+            process = credential_isolation.launch(request, args, cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=errors, text=False,
                                        env=env, start_new_session=True, bufsize=0)
             process_identity_record = process_identity(process.pid)
@@ -1176,6 +1178,8 @@ def run_turn(request_path):
         atomic(root / "result.json", result, indent=None)
         os.chmod(root / "result.json", 0o600)
     except Exception as error:
+        if isinstance(error, credential_isolation.IsolationLaunchUncertain):
+            cleanup = {"confirmed": False, "uncertain": True}
         if process and process.returncode is None:
             if process_identity_record:
                 cleanup = _terminate_owned_group(process, process_identity_record)
