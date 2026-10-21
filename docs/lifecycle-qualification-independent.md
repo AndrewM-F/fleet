@@ -144,6 +144,7 @@ owner to accept, reject or re-shape.
 | D11 — a configuration change after the model writer's snapshot is overwritten | — | **FAIL** | not fixed: the compare-and-swap digest is read again at write time |
 | D12 — the compare-and-swap does not use the digest captured with the snapshot | — | **FAIL** | the same cause as D11, observed directly |
 | D13 — a late same-key request creates a second native session and overwrites the registered intent | — | **FAIL** | not fixed at `0cca1b35`: the guard reads the intent's status only when it is `creating` |
+| **D14 — a late same-key request that resumes after an uncertain attempt creates a second native session and overwrites the uncertain intent** | — | — (first seen at `709dfcb`) | **FAIL at `709dfcb`**: the lock-time checks cover `registered` and `creating`, but not `uncertain` |
 
 **At the owner's current published head `709dfcb` every one of these passes** (§1.1): the suite is
 40 tests, 40 pass, 0 fail. The table above is the record of what each finding was, so the repair
@@ -358,6 +359,27 @@ detect a change that arrived in between.
   request whose key is already registered — so the number of sessions to create is decided under the
   lock rather than before it.
 
+### D14 — a late same-key request that resumes after an uncertain attempt creates a second native session
+
+* **Test:** `test_a_stale_caller_that_resumes_after_an_uncertain_attempt_fails_closed`
+  (class `InitialIntentRaceTests`)
+* **Observed:** `AssertionError: 2 != 1 : an uncertain attempt must not be followed by a second
+  native session`. The late caller snapshots what it still needs before the first caller has
+  written anything, the first caller's native identity then cannot be read (its attempt is
+  **uncertain**), and the late caller resumes: it **creates a second native session** and its
+  intent write replaces the first caller's `uncertain` state.
+* **Why it matters:** an uncertain outcome must stay uncertain — "absence is no proof" is the
+  product's own rule. The guard that enforces it (line 767) reads `existing`, the intent row as the
+  caller saw it **at the start of its own request**, not the durable row. A late caller whose
+  snapshot predates the other caller's write sees no intent at all and skips the guard. The
+  lock-time checks (lines 827–847) read the durable row `current` and cover a different digest, a
+  `registered` row and a `creating` row with a live creator — but **not** an `uncertain` row, so
+  nothing stops the late caller: it records `creating` over the uncertain state and creates.
+* **Smallest owned-path suggestion** (`src/fleet/opencode_lifecycle.py`): evaluate the uncertain
+  state from the row read **inside** the writer lock (`current`), not from the caller's early
+  snapshot (`existing`), and refuse a request whose key's durable intent says `uncertain` unless
+  the operator reconciles it explicitly.
+
 ## 4. Candidate cases accepted and refused
 
 | Candidate | Accepted | Refused |
@@ -446,6 +468,15 @@ provider pair without creating a config file"), but it is unreachable: `slots(cf
 before the guard, and it is `slots()` that reads the file. **This qualification does not touch the
 owner's tests or the owner's source; the failures are preserved and reported here for root.**
 
+### 6.2 The focused runs of this task, and the heavy-run admission
+
+This task ran **only bounded focused synthetic tests**: the qualification suite itself (43 tests,
+31 seconds, every fixture in a temporary directory) and the focused race class. **The heavy
+whole-repository run was not repeated** — the one heavy-run admission for this fleet was spent on
+the run already recorded above (543 tests at `709dfcb`, 475 for the remaining modules, 30 owner
+errors). The numbers in §6.1 and §6.3 are therefore from that run, with the suite then at 40
+tests; the suite has since grown by the three race cases, of which two pass and one fails (D14).
+
 ### 6.3 The owner's own suite at `709dfcb`
 
 Without this qualification the repository's own suite is **475 tests with 30 errors, 4 skipped and
@@ -461,7 +492,7 @@ published head; the repository's own 30 errors are the owner's and are outside t
 two paths. They are preserved as failures and are reported for root: they block a merge of the
 head independently of this qualification.
 
-### 6.2 Per-test receipt at the published head `0cca1b35`
+### 6.4 Per-test receipt at the published head `0cca1b35`
 
 | # | Test | Class | Result |
 | --- | --- | --- | --- |
@@ -513,9 +544,12 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite passes at the published head `709dfcb`** — 40 tests, 40 pass, 0 fail (§1.1, §6). The
-   lifecycle invariants this qualification covers are met, and each of the thirteen findings that
-   were open at some point is still covered by the regression that found it.
+1. **One invariant does not hold at the published head `709dfcb`.** The suite is 43 tests: 42 pass
+   and **1 fail** — D14, the late same-key caller that resumes after an uncertain attempt
+   (§3). The other two race cases, and every earlier finding, hold. The fail-closed property for an
+   uncertain intent is decided from the caller's early snapshot instead of the durable row read
+   under the writer lock, so a late caller can create a second native session and overwrite the
+   uncertain state.
 2. **The published head is not green in the owner's own suite.** Without this qualification the
    repository is 475 tests with **30 errors** (§6.3): the new `manager.import_queue` reads the
    configuration through `paths.all_slots()`, whose legacy no-config-file guard is unreachable, so

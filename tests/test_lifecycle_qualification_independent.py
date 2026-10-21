@@ -1239,5 +1239,195 @@ class ReviewFindingReproductionTests(QualificationSandbox):
         self.assertEqual(self.events(), [], "a dry run must not emit an event")
 
 
+class InitialIntentRaceTests(QualificationSandbox):
+    """The two-caller initial-intent race, reproduced deterministically.
+
+    Two callers carry the same request key. The late one snapshots what it
+    still needs and then pauses; the first one creates the native sessions,
+    records them and reaches its intent state. When the late one resumes it
+    must not overwrite that durable state, and it must not create an extra
+    native session or a subset of one.
+
+    Every barrier here is an event, so the order is chosen rather than hoped
+    for, and the native creations are the sandbox's fake server.
+    """
+
+    KEY = "w8-intent-race"
+
+    def _caller(self, name, count=2, key=None, results=None):
+        def run():
+            db = store.database(paths.DB)
+            try:
+                results[name] = opencode_lifecycle.add_sessions(
+                    db, count=count, model=MODEL, cwd=str(self.worktree), root=str(self.root),
+                    request_key=key or self.KEY)
+            except Exception as error:  # noqa: BLE001 - the failure is the result
+                results[name] = {"error": str(error)}
+            finally:
+                db.close()
+        return run
+
+    def _assert_one_request_created_exactly_its_sessions(self, count):
+        """The exact native-create count and the distinct native sessions."""
+        self.assertEqual(len(self.native_creates()), count,
+                         "one key must create exactly the sessions it asked for")
+        created = [row for row in self.native_sessions() if row != self.existing]
+        self.assertEqual(len(created), count, "no extra native session may exist")
+        self.assertEqual(len(set(created)), count, "no native session may be created twice")
+
+    def _registered_ids(self):
+        return [row[0] for row in self.session_receipts() if row[2] == "registered"]
+
+    def test_a_stale_caller_that_resumes_after_the_key_was_registered_gets_the_idempotent_result(self):
+        """The late caller resumes after the key was registered.
+
+        The registered row is the truth: the late caller must report it, must
+        not create anything and must not overwrite it.
+        """
+        late_at_snapshot = threading.Event()
+        first_done = threading.Event()
+        real_probe = opencode_lifecycle.verify_native_api_support
+
+        def probe(executable, timeout=opencode_lifecycle.API_PROBE_TIMEOUT_SECONDS):
+            if threading.current_thread().name == "late-caller":
+                late_at_snapshot.set()
+                first_done.wait(30)
+            return real_probe(executable, timeout)
+
+        results = {}
+        with patch.object(opencode_lifecycle, "verify_native_api_support", side_effect=probe):
+            late = threading.Thread(target=self._caller("late", results=results),
+                                    name="late-caller")
+            late.start()
+            self.assertTrue(late_at_snapshot.wait(20),
+                            "the late caller must snapshot before the first caller runs")
+            first = threading.Thread(target=self._caller("first", results=results),
+                                     name="first-caller")
+            first.start()
+            first.join(60)
+            first_done.set()
+            late.join(60)
+        self._assert_one_request_created_exactly_its_sessions(2)
+        registered = self._registered_ids()
+        self.assertEqual(len(registered), 2)
+        self.assertEqual(len(set(registered)), 2)
+        self.assertEqual(len(self.roster()), 3, "the roster must hold the two new workers once")
+        self.assertEqual(len(self.roster_ids()), len(set(self.roster_ids())))
+        self.assertEqual(self.intent_status(self.KEY), "registered",
+                         "the durable intent must not be overwritten")
+        late_result = results["late"]
+        self.assertNotIn("error", late_result, late_result)
+        self.assertTrue(late_result.get("idempotent"),
+                        "the late caller must report the registered result")
+        self.assertEqual(late_result.get("created"), 0)
+        self.assertEqual(late_result.get("registered"), 2)
+        self.assertEqual({item["sessionId"] for item in late_result["sessions"]},
+                         set(registered))
+
+    def test_a_stale_caller_that_resumes_while_the_creator_is_alive_creates_nothing_extra(self):
+        """The late caller resumes while the first caller is still in flight.
+
+        The first caller has created its sessions and recorded their ids, and
+        its creator is alive. The late caller holds a stale snapshot of what it
+        still needs; it must not act on it.
+        """
+        first_recorded = threading.Event()
+        late_done = threading.Event()
+        real_record = opencode_lifecycle._record_provisioning
+
+        def record_spy(db, request_key, request, status, detail="", count=None,
+                       payload_digest="", creator_pid=0, keep_registered=False):
+            written = real_record(db, request_key, request, status, detail, count,
+                                  payload_digest, creator_pid, keep_registered)
+            if (threading.current_thread().name == "first-caller"
+                    and isinstance(detail, str) and detail.startswith("{")):
+                # The ids are recorded before the roster write: the first
+                # caller is in flight, with a live creator and its identities
+                # already durable.
+                first_recorded.set()
+                late_done.wait(30)
+            return written
+
+        results = {}
+        with patch.object(opencode_lifecycle, "_record_provisioning", side_effect=record_spy):
+            first = threading.Thread(target=self._caller("first", results=results),
+                                     name="first-caller")
+            first.start()
+            self.assertTrue(first_recorded.wait(20),
+                            "the first caller must record its identities")
+            late = threading.Thread(target=self._caller("late", results=results),
+                                    name="late-caller")
+            late.start()
+            late.join(60)
+            late_done.set()
+            first.join(60)
+        self._assert_one_request_created_exactly_its_sessions(2)
+        registered = self._registered_ids()
+        self.assertEqual(len(registered), 2)
+        self.assertEqual(len(set(registered)), 2)
+        self.assertEqual(len(self.roster_ids()), len(set(self.roster_ids())))
+        self.assertEqual(self.intent_status(self.KEY), "registered",
+                         "the durable intent must not be overwritten")
+
+    def test_a_stale_caller_that_resumes_after_an_uncertain_attempt_fails_closed(self):
+        """The late caller resumes after an uncertain attempt.
+
+        The first caller's native identity could not be read, so its outcome
+        stays uncertain. The late caller must fail closed: it may not create a
+        session and it may not rewrite the uncertain state.
+        """
+        late_at_snapshot = threading.Event()
+        first_done = threading.Event()
+        real_probe = opencode_lifecycle.verify_native_api_support
+        real_create = opencode_lifecycle.create_native_session
+
+        def probe(executable, timeout=opencode_lifecycle.API_PROBE_TIMEOUT_SECONDS):
+            if threading.current_thread().name == "late-caller":
+                late_at_snapshot.set()
+                first_done.wait(30)
+            return real_probe(executable, timeout)
+
+        def create_then_hide(*args, **kwargs):
+            session = real_create(*args, **kwargs)
+            with sqlite3.connect(self.native) as db:
+                db.execute("DELETE FROM session_v2 WHERE id=?", (session["id"],))
+            return session
+
+        results = {}
+        with patch.object(opencode_lifecycle, "verify_native_api_support", side_effect=probe), \
+             patch.object(opencode_lifecycle, "create_native_session",
+                          side_effect=create_then_hide):
+            late = threading.Thread(target=self._caller("late", results=results),
+                                    name="late-caller")
+            late.start()
+            self.assertTrue(late_at_snapshot.wait(20),
+                            "the late caller must snapshot before the first caller runs")
+            first = threading.Thread(target=self._caller("first", results=results),
+                                     name="first-caller")
+            first.start()
+            first.join(60)
+            first_done.set()
+            late.join(60)
+        self.assertEqual(result_status(results["first"]), "uncertain",
+                         "the first attempt must be uncertain")
+        self.assertEqual(len(self.native_creates()), 1,
+                         "an uncertain attempt must not be followed by a second native session")
+        self.assertEqual(self.intent_status(self.KEY), "uncertain",
+                         "the durable uncertain intent must not be overwritten")
+        late_result = results["late"]
+        if "error" in late_result:
+            self.assertIn("uncertain", late_result["error"].lower(), late_result["error"])
+        else:
+            self.assertTrue(late_result.get("uncertain"),
+                            "the late caller must fail closed on an uncertain attempt")
+
+
+def result_status(result):
+    """The status a result carries, or the text of the error it raised."""
+    if "error" in result:
+        return "error"
+    return result.get("status")
+
+
 if __name__ == "__main__":
     unittest.main()
