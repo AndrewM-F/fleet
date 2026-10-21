@@ -410,6 +410,15 @@ def cmd_remove_opencode(args):
         sys.exit(1)
 
 
+def cmd_rollback_opencode(args):
+    """Withdraw one provisioned request from the roster, keeping native sessions."""
+    try:
+        out(opencode_lifecycle.rollback_request(database(), args.request_key, note=args.note))
+    except (ValueError, OSError) as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="fleet")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -598,6 +607,11 @@ def main(argv=None):
     p.add_argument("--allow-unverified-native", action="store_true",
                    help="operator override for a native identity that cannot be read back")
     p.set_defaults(fn=cmd_remove_opencode)
+    p = sub.add_parser("rollback-opencode",
+                       help="withdraw one provisioned request from the roster, keeping its sessions")
+    p.add_argument("--request-key", required=True)
+    p.add_argument("--note", default="", help="operator note recorded with the receipt")
+    p.set_defaults(fn=cmd_rollback_opencode)
     sub.add_parser("supervise", help="restart dead components every 30s (launchd runs this)").set_defaults(
         fn=lambda a: ops.supervise())
     p = sub.add_parser("supervisor", help="install/uninstall the launchd supervisor")

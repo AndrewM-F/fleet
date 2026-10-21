@@ -40,6 +40,7 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet add-opencode --count N --model PROVIDER/MODEL --cwd PATH --root PATH [--request-key KEY] [--enable-dispatch] [--max-concurrent N] [--dry-run\|--status]` | create and register OpenCode sessions on demand, idempotently per request key |
 | `bin/fleet drain-opencode --session SID --note "..."` | stop dispatching to one worker and report the work it still owns (nothing is dropped) |
 | `bin/fleet remove-opencode --session SID --note "..."` | remove one worker from the roster, keeping its native session and history |
+| `bin/fleet rollback-opencode --request-key KEY --note "..."` | withdraw one provisioned request from the roster, keeping its native sessions |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |
 | `bin/fleet run` / `wait` / `ack --event-id N` | foreground manager / any-event wait (was `fleet.py`) |
 
@@ -68,3 +69,8 @@ An errored OpenCode task remains terminal. After verifying cleanup and preservin
 worktree, `recover-opencode` records a one-use successor authorization. The manager dispatches a
 separately root-authorized task; it never replays the failed task or changes model/dispatch settings.
 See [OpenCode recovery](docs/troubleshooting.md#opencode-error-turn).
+
+## On-demand OpenCode sessions
+`bin/fleet add-opencode` creates sessions through the supported OpenCode CLI, never through a
+database write. The staged activation and rollback plan, including the pinned older manager and
+the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).

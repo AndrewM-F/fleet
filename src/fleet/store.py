@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS opencode_provisioning (
   model TEXT NOT NULL, account TEXT NOT NULL, cwd TEXT NOT NULL, root TEXT NOT NULL,
   requested_count INTEGER NOT NULL, dispatch_enabled INTEGER NOT NULL,
   status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
-  detail TEXT NOT NULL DEFAULT '');
+  detail TEXT NOT NULL DEFAULT '',
+  payload_digest TEXT NOT NULL DEFAULT '');
 """
 _OPENCODE_SESSIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS opencode_sessions (
@@ -68,6 +69,23 @@ CREATE TABLE IF NOT EXISTS opencode_sessions (
   status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
   detail TEXT NOT NULL DEFAULT '');
 """
+
+
+def _upgrade_opencode_provisioning(db):
+    """Add the payload digest to a provisioning table created by an earlier build.
+
+    The idempotency key is bound to the whole request, so the digest of the
+    request has to be kept with it. A table created before that column existed
+    keeps its rows and gains the column; an existing row without a digest is
+    treated as unbound, so a key that is reused with different options is
+    refused rather than silently accepted.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(opencode_provisioning)")}
+    if not columns or "payload_digest" in columns:
+        return
+    db.execute("ALTER TABLE opencode_provisioning ADD COLUMN payload_digest "
+               "TEXT NOT NULL DEFAULT ''")
+    db.commit()
 
 
 def _upgrade_recovery_adoptions(db):
@@ -164,6 +182,7 @@ def database(path=None):
     db.executescript(_RECOVERY_ADOPTIONS_TABLE)
     db.executescript(_OPENCODE_PROVISIONING_TABLE)
     db.executescript(_OPENCODE_SESSIONS_TABLE)
+    _upgrade_opencode_provisioning(db)
     _upgrade_recovery_adoptions(db)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}

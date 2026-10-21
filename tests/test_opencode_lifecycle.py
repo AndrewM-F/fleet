@@ -17,7 +17,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import dispatch, heavy, opencode, opencode_lifecycle, ops, paths, store  # noqa: E402
+from fleet import (dispatch, heavy, model_selection, opencode,  # noqa: E402
+                 opencode_lifecycle, ops, paths, store)
 
 MODEL = "opencode-go/minimax-m3.1-flash-free"
 OTHER_APPROVED = "opencode/minimax-m3.1-flash-free"
@@ -59,6 +60,8 @@ if mode == "garbage":
     print("not json at all")
     raise SystemExit(0)
 session_id = control["sessionId"]
+if control.get("unique"):
+    session_id = f"{{session_id}}-{{calls}}"
 directory = (data or {{}}).get("location", {{}}).get("directory")
 if data:
     with sqlite3.connect(DATABASE) as database:
@@ -288,7 +291,7 @@ class ScopeRefusalTests(Sandbox):
         self.assertEqual(self.requests(), [])
 
     def test_a_malformed_count_is_refused(self):
-        for count in (0, -1, 17, "2"):
+        for count in (0, -1, opencode_lifecycle.MAX_ADD_COUNT + 1, "2"):
             with self.assertRaises(ValueError):
                 self.add(count=count)
         self.assertEqual(self.requests(), [])
@@ -529,6 +532,348 @@ class InterruptionTests(Sandbox):
         opencode_lifecycle.remove_session(self.db, self.existing, note="retiring")
         self.assertEqual(marker.read_text(), "untouched")
         self.assertEqual(sorted(path.name for path in self.wt.iterdir()), before)
+
+
+class UncertainOutcomeTests(Sandbox):
+    """An uncertain outcome stays uncertain until the native identity is reconciled."""
+
+    def test_a_hung_creation_is_recorded_as_uncertain_and_not_as_a_failure(self):
+        self.write_control({"mode": "hang", "sessionId": "ses_NEW0000000000000001"})
+        with patch.object(opencode_lifecycle, "CREATE_TIMEOUT_SECONDS", 1):
+            result = self.add(count=1, request_key="w5-uncertain-001")
+        self.assertTrue(result["uncertain"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["status"], "uncertain")
+        self.assertFalse(result["rosterChanged"])
+        row = self.db.execute("SELECT status,detail FROM opencode_provisioning "
+                              "WHERE request_key=?", ("w5-uncertain-001",)).fetchone()
+        self.assertEqual(row[0], "uncertain")
+        self.assertEqual(len(self.roster()), 1)
+
+    def test_the_intent_is_durable_before_the_first_native_call(self):
+        seen = []
+        original = opencode_lifecycle._record_provisioning
+
+        def record(db, key, request, status, detail="", count=None, payload_digest=""):
+            seen.append(status)
+            return original(db, key, request, status, detail, count, payload_digest)
+
+        with patch.object(opencode_lifecycle, "_record_provisioning", side_effect=record):
+            self.add(count=1, request_key="w5-uncertain-002")
+        self.assertEqual(seen[0], "creating")
+        self.assertIn("registered", seen)
+
+    def test_a_crash_after_the_native_create_is_reconciled_before_a_retry(self):
+        # The native session is created, then the process dies before the receipt.
+        with patch.object(opencode_lifecycle, "_record_session", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.add(count=1, request_key="w5-uncertain-003")
+        self.assertEqual(len(self.roster()), 1)
+        with sqlite3.connect(self.native) as db:
+            created = db.execute("SELECT id FROM session_v2 WHERE id<>?",
+                                 (self.existing,)).fetchall()
+        self.assertEqual(len(created), 1)  # the native session exists
+        receipts = opencode_lifecycle._session_receipts(self.db, "w5-uncertain-003")
+        self.assertEqual(receipts, [])  # and it was never receipted
+        calls_before = len(self.requests())
+        resumed = self.add(count=1, request_key="w5-uncertain-003")
+        # The retry adopts the session that already exists: no second native session.
+        self.assertEqual(resumed["created"], 0)
+        self.assertEqual(resumed["reconciled"], [created[0][0]])
+        self.assertEqual(len(self.requests()), calls_before)
+        self.assertEqual([entry["sessionId"] for entry in self.roster()],
+                         [self.existing, created[0][0]])
+
+    def test_an_unverified_receipt_is_never_ignored(self):
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("ses_UNVERIFIED0000000001", "w5-uncertain-004", "ses_UNVERIFIED0000000001",
+             MODEL, str(self.native), str(self.wt), str(self.root), "unverified", 1, 1, "x"))
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("w5-uncertain-004", MODEL, str(self.native), str(self.wt), str(self.root), 1, 0,
+             "creating", 1, 1, "", ""))
+        self.db.commit()
+        with self.assertRaises(ValueError) as error:
+            self.add(count=1, request_key="w5-uncertain-004")
+        self.assertIn("not ignored", str(error.exception))
+        self.assertEqual(self.requests(), [])
+
+    def test_an_unverified_receipt_is_promoted_when_the_identity_can_be_read_back(self):
+        identifier = "ses_UNVERIFIED0000000002"
+        with sqlite3.connect(self.native) as db:
+            db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                       (identifier, str(self.wt), "project-test", MODEL))
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (identifier, "w5-uncertain-005", identifier, MODEL, str(self.native), str(self.wt),
+             str(self.root), "unverified", 1, 1, "x"))
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("w5-uncertain-005", MODEL, str(self.native), str(self.wt), str(self.root), 1, 0,
+             "creating", 1, 1, "", ""))
+        self.db.commit()
+        result = self.add(count=1, request_key="w5-uncertain-005")
+        self.assertEqual(result["created"], 0)
+        self.assertEqual([entry["sessionId"] for entry in self.roster()], [self.existing, identifier])
+        receipt = self.db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                                  (identifier,)).fetchone()
+        self.assertEqual(receipt[0], "registered")
+
+
+class SerializationTests(Sandbox):
+    """Same-key provisioning and roster writes are serialized and compared."""
+
+    def test_two_concurrent_requests_with_the_same_key_create_one_session(self):
+        import threading
+        results = []
+
+        def run():
+            db = store.database(paths.DB)
+            try:
+                results.append(opencode_lifecycle.add_sessions(
+                    db, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                    request_key="w5-race-001"))
+            except Exception as error:  # noqa: BLE001 - the failure is the result
+                results.append({"error": str(error)})
+            finally:
+                db.close()
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(len(self.roster()), 2)
+        self.assertEqual(sorted(result.get("created", -1) for result in results), [0, 1])
+
+    def test_a_configuration_changed_during_the_request_is_never_overwritten(self):
+        def rewrite(*args, **kwargs):
+            # A concurrent writer changes the roster while the request runs.
+            cfg = paths.config()
+            cfg["maxConcurrent"] = 7
+            paths.write_config(cfg)
+            return {"id": "ses_RACE0000000000000001", "data": {}}
+
+        with patch.object(opencode_lifecycle, "create_native_session",
+                          side_effect=rewrite), \
+             patch.object(opencode_lifecycle, "_verify_created", return_value={}):
+            with self.assertRaises(ValueError) as error:
+                self.add(count=1, request_key="w5-race-002")
+        self.assertIn("configuration changed", str(error.exception))
+        self.assertEqual(paths.config()["maxConcurrent"], 7)
+        self.assertEqual(len(self.roster()), 1)
+
+    def test_a_removal_and_a_dispatch_claim_cannot_both_win(self):
+        import threading
+        started = threading.Event()
+        release = threading.Event()
+
+        def claim():
+            # A dispatch claim holds the model lock, then a task appears for the
+            # worker it claimed.
+            db = store.database(paths.DB)
+            try:
+                with model_selection.model_lock():
+                    started.set()
+                    release.wait(10)
+                    db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
+                               ("t-claimed", self.existing, str(self.wt),
+                                json.dumps({"message": "m"}), "sent", 1))
+                    db.commit()
+            finally:
+                db.close()
+
+        thread = threading.Thread(target=claim)
+        thread.start()
+        started.wait(10)
+        outcome = {}
+
+        def remove():
+            db = store.database(paths.DB)
+            try:
+                outcome["result"] = opencode_lifecycle.remove_session(db, self.existing)
+            except ValueError as error:
+                outcome["error"] = str(error)
+            finally:
+                db.close()
+
+        remover = threading.Thread(target=remove)
+        remover.start()
+        release.set()
+        thread.join(20)
+        remover.join(20)
+        self.assertIn("error", outcome)
+        self.assertIn("outstanding work", outcome["error"])
+        self.assertEqual(len(self.roster()), 1)
+
+
+class RequestKeyBindingTests(Sandbox):
+    """A request key is bound to the complete request."""
+
+    def test_the_same_key_with_a_different_count_is_refused(self):
+        self.add(count=1, request_key="w5-key-001")
+        with self.assertRaises(ValueError) as error:
+            self.add(count=2, request_key="w5-key-001")
+        self.assertIn("different request", str(error.exception))
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_the_same_key_with_a_different_dispatch_flag_is_refused(self):
+        self.add(count=1, request_key="w5-key-002")
+        with self.assertRaises(ValueError):
+            self.add(count=1, request_key="w5-key-002", enable_dispatch=True)
+
+    def test_the_same_key_with_a_different_admission_limit_is_refused(self):
+        self.add(count=1, request_key="w5-key-003")
+        with self.assertRaises(ValueError):
+            self.add(count=1, request_key="w5-key-003", max_concurrent=6)
+
+    def test_the_same_key_with_a_different_model_is_refused(self):
+        self.add(count=1, request_key="w5-key-004")
+        with self.assertRaises(ValueError):
+            self.add(count=1, request_key="w5-key-004", model=OTHER_APPROVED)
+
+    def test_the_same_key_with_a_different_account_is_refused(self):
+        self.add(count=1, request_key="w5-key-005")
+        other = Path(self.tmp.name) / "other.db"
+        with self.assertRaises(ValueError):
+            self.add(count=1, request_key="w5-key-005", database_path=str(other))
+
+    def test_the_same_key_with_a_different_working_directory_is_refused(self):
+        self.add(count=1, request_key="w5-key-006")
+        other = Path(self.tmp.name) / "wt" / "second"
+        other.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+        with self.assertRaises(ValueError):
+            self.add(count=1, request_key="w5-key-006", cwd=str(other))
+
+    def test_the_same_request_with_the_same_options_is_idempotent(self):
+        self.add(count=1, request_key="w5-key-007")
+        again = self.add(count=1, request_key="w5-key-007")
+        self.assertTrue(again["idempotent"])
+        self.assertEqual(len(self.requests()), 1)
+
+
+class OverrideTests(Sandbox):
+    """The operator override never covers a worker that is known to be active."""
+
+    def test_a_worker_that_is_running_is_never_removed_even_with_the_override(self):
+        with patch.object(opencode_lifecycle, "_native_state",
+                          return_value={"state": "running", "cwd": str(self.wt)}):
+            with self.assertRaises(ValueError) as error:
+                opencode_lifecycle.remove_session(self.db, self.existing,
+                                                 allow_unverified_native=True)
+        self.assertIn("known to be active", str(error.exception))
+        self.assertEqual(len(self.roster()), 1)
+
+    def test_an_unverifiable_worker_may_be_removed_with_the_override(self):
+        with patch.object(opencode_lifecycle, "_native_state",
+                          return_value={"state": "unavailable", "error": "x"}):
+            result = opencode_lifecycle.remove_session(self.db, self.existing,
+                                                        allow_unverified_native=True)
+        self.assertTrue(result["removed"])
+
+
+class BoundedRequestTests(Sandbox):
+    """One bounded request covers a whole fleet scale-up."""
+
+    def test_one_request_adds_seventeen_sessions(self):
+        self.write_control({"mode": "ok", "sessionId": "ses_SCALE000000000000000",
+                            "unique": True})
+        result = self.add(count=17, request_key="w5-scale-17")
+        self.assertEqual(result["created"], 17)
+        self.assertEqual(len(self.roster()), 18)
+        self.assertEqual(len(self.requests()), 17)
+
+    def test_the_bound_is_still_a_bound(self):
+        with self.assertRaises(ValueError):
+            self.add(count=opencode_lifecycle.MAX_ADD_COUNT + 1)
+        self.assertEqual(opencode_lifecycle.MAX_ADD_COUNT, 32)
+
+
+class RollbackTests(Sandbox):
+    """A request can be withdrawn without deleting a native session."""
+
+    def test_a_rollback_withdraws_the_roster_entries_and_keeps_the_sessions(self):
+        self.write_control({"mode": "ok", "sessionId": "ses_ROLLBACK000000000001",
+                            "unique": True})
+        self.add(count=2, request_key="w5-rollback-001")
+        self.assertEqual(len(self.roster()), 3)
+        result = opencode_lifecycle.rollback_request(self.db, "w5-rollback-001", note="reverting")
+        self.assertEqual(result["removedFromRoster"],
+                         ["ses_ROLLBACK000000000001-0", "ses_ROLLBACK000000000001-1"])
+        self.assertEqual(len(self.roster()), 1)
+        with sqlite3.connect(self.native) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM session_v2").fetchone()[0], 3)
+
+    def test_a_rolled_back_key_never_adds_again(self):
+        self.write_control({"mode": "ok", "sessionId": "ses_ROLLBACK000000000002",
+                            "unique": True})
+        self.add(count=1, request_key="w5-rollback-002")
+        opencode_lifecycle.rollback_request(self.db, "w5-rollback-002")
+        with self.assertRaises(ValueError) as error:
+            self.add(count=1, request_key="w5-rollback-002")
+        self.assertIn("rolled-back", str(error.exception))
+        self.assertEqual(len(self.roster()), 1)
+
+
+class PlanTests(Sandbox):
+    """The staged activation and rollback plan rests on these invariants."""
+
+    def test_a_store_created_before_the_receipt_tables_gains_them(self):
+        legacy = Path(self.tmp.name) / "legacy.sqlite"
+        connection = sqlite3.connect(legacy)
+        connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, sid TEXT NOT NULL, "
+                           "cwd TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, "
+                           "updated REAL NOT NULL)")
+        connection.execute("INSERT INTO tasks VALUES ('t-legacy','s','/w','{}','queued',1)")
+        connection.commit()
+        connection.close()
+        db = store.database(legacy)
+        self.addCleanup(db.close)
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("opencode_provisioning", tables)
+        self.assertIn("opencode_sessions", tables)
+        self.assertEqual(db.execute("SELECT state FROM tasks WHERE id='t-legacy'").fetchone()[0],
+                         "queued")
+
+    def test_a_provisioning_row_created_before_the_digest_column_gains_it(self):
+        legacy = Path(self.tmp.name) / "legacy-provisioning.sqlite"
+        connection = sqlite3.connect(legacy)
+        connection.execute("CREATE TABLE opencode_provisioning (request_key TEXT PRIMARY KEY, "
+                           "model TEXT NOT NULL, account TEXT NOT NULL, cwd TEXT NOT NULL, "
+                           "root TEXT NOT NULL, requested_count INTEGER NOT NULL, "
+                           "dispatch_enabled INTEGER NOT NULL, status TEXT NOT NULL, "
+                           "created REAL NOT NULL, updated REAL NOT NULL, "
+                           "detail TEXT NOT NULL DEFAULT '')")
+        connection.commit()
+        connection.close()
+        db = store.database(legacy)
+        self.addCleanup(db.close)
+        columns = {row[1] for row in db.execute("PRAGMA table_info(opencode_provisioning)")}
+        self.assertIn("payload_digest", columns)
+
+    def test_the_drain_reports_that_an_older_manager_does_not_honour_it(self):
+        result = opencode_lifecycle.drain_session(self.db, self.existing, note="draining")
+        self.assertTrue(result["draining"])
+        self.assertIn("predates", result["advisory"])
+        self.assertIn("honouredByThisBuild", result)
+        # This build's dispatcher honours the flag; an older pinned manager does not.
+        self.assertTrue(result["honouredByThisBuild"])
+
+    def test_the_removal_refuses_while_work_is_outstanding_even_when_draining(self):
+        self.task("t-queued", self.existing, "queued")
+        opencode_lifecycle.drain_session(self.db, self.existing, note="draining")
+        with self.assertRaises(ValueError):
+            opencode_lifecycle.remove_session(self.db, self.existing)
+        self.assertEqual(len(self.roster()), 1)
 
 
 if __name__ == "__main__":

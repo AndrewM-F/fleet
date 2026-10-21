@@ -81,7 +81,26 @@ never invents a session id, so the id in a receipt is always the id the native s
   queue entry, worktree or credential is touched.
 - Both the provisioning request and every session carry a durable receipt in
   `opencode_provisioning` and `opencode_sessions` inside `fleet.sqlite`, so ownership and
-  idempotency survive a manager restart.
+  idempotency survive a manager restart. The receipt keeps the digest of the complete request, so
+  a key reused with a different count, account, working directory, model, dispatch flag or
+  admission limit is refused instead of silently doing something else.
+- The request key is bound to the request, the roster write is compared with the configuration the
+  request started from, and provisioning and roster writes are serialized across processes. A
+  concurrent writer is never overwritten and two requests for the same key cannot both create.
+- One request may add up to thirty-two sessions, so a whole scale-up (for example eight to
+  twenty-five sessions) is one bounded request rather than several manual calls.
+- An uncertain outcome stays uncertain. A creation whose answer never arrived is recorded as
+  uncertain, not as an ordinary retryable failure; the intent is recorded before the first native
+  call, and the next run reconciles the native identity before it creates anything. A session
+  whose receipt says its identity was never verified is never ignored: it is reconciled first, and
+  an unresolved one refuses the request.
+- `bin/fleet rollback-opencode --request-key KEY` withdraws one provisioned request from the
+  roster. The native sessions stay in the account with their history and the key never adds
+  again.
+- The staged activation and rollback plan is
+  [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
+  manager, which does not honour `draining`, and the durable state migration that adds the
+  receipt tables before any request.
 
 The configured `model` is the desired model for the next productive turn. The native
 session row keeps its own historical model: it is read, reported and never written, and a

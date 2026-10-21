@@ -109,15 +109,34 @@ command prints JSON on stdout and exits non-zero on failure.
   `--max-concurrent` is the only way to change the admission limit, and only inside the validated
   limits; the limit is never raised implicitly, and the heavy-job admission is a separate,
   unchanged bound. The command never starts, stops or replaces a manager.
+  The request key is bound to the **complete** request: reusing it with a different count,
+  account, working directory, model, dispatch flag or admission limit is refused, never silently
+  reshaped. One bounded request covers a whole scale-up (a request may add up to thirty-two
+  sessions, so eight to twenty-five is one request of seventeen additions). Provisioning and
+  roster writes are serialized across processes and compared with the configuration the request
+  started from, so a concurrent writer is never overwritten. A creation whose answer never
+  arrived stays **uncertain**: it is not an ordinary retryable failure, the intent is recorded
+  before the first native call, and the next run reconciles the native identity before it creates
+  anything. A session whose receipt says it was never verified is never ignored: it is reconciled
+  first, and an unresolved one refuses the request.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the
-  operator resolves it.
+  operator resolves it. A manager that predates the draining flag keeps dispatching to the
+  worker, so the drain is advisory against it: pause the fleet or upgrade the manager.
 - `bin/fleet remove-opencode --session SID --note "..."` — remove one worker from the roster. It
   refuses while a task or turn is queued, in flight or uncertain, while a recovery holds the
-  session, and while the native identity cannot be verified (`--allow-unverified-native` is an
-  explicit, recorded operator override). The native session and its history are kept, and no hold,
-  task, queue entry, worktree or credential is touched.
+  session, and while the native identity cannot be verified. A worker whose state explicitly says
+  it is running is never removed, and `--allow-unverified-native` does not override that: it only
+  covers a native identity that cannot be read at all. The native session and its history are
+  kept, and no hold, task, queue entry, worktree or credential is touched.
+- `bin/fleet rollback-opencode --request-key KEY --note "..."` — withdraw one provisioned request
+  from the roster. The native sessions stay in the account with their history, the receipts keep
+  the audit trail, and the request key never adds again, so a retry cannot resurrect the sessions
+  silently.
+- The staged activation and rollback plan for a live fleet, including the pinned older manager and
+  the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
+  It is not executed by this command.
 - `bin/fleet opencode-model --inspect` / `--model PROVIDER/MODEL --worker SID|--all [--dry-run]` —
   report or set the approved OpenCode provider/model for managed workers. The model must
   be one of the explicitly approved free models; the legacy default is unchanged. The
