@@ -539,3 +539,71 @@ the matrix, does not measure the owner's own suite, and does not exercise the na
 provider, a live manager, a live fleet, a real session or a real worktree. The whole suite at this
 head is now **50 tests: 48 pass, 2 fail** — the 47 tests of the completed exact-head result all
 still pass, and the two failures are the finding above.
+
+## 9. Focused qualification at `17890950` — the receipt-lifecycle repair
+
+This section is **additive and focused**. The completed results stay where they are: the **47/47**
+exact-`8ef01717` result (§6) and the 50-test run at `8ef01717` that carried the receipt-transition
+finding (§8) are historical evidence for the heads they were run on. **No broad matrix was
+re-run or restated here**, and nothing in §§1–8 was edited.
+
+**Head:** `178909504a442174fa8243ab93b7300a9d1d2717` — "fix(fleet): let a session receipt move
+forward through its lifecycle". The published ref `origin/feat/opencode-session-lifecycle-add-remove`
+and the local owner branch both name it; the remote itself cannot be queried from this worker
+(`git ls-remote` → `could not read Username for 'https://github.com'`), and the pull request's
+draft and auto-merge state is **unknown from any local record**.
+
+**Branch / worktree:** `codex/20261021-w8-independent-lifecycle-qualification-at-17890950`, created
+clean from that commit.
+
+### 9.1 The published delta
+
+`src/fleet/opencode_lifecycle.py` (+34/−16) and a new `tests/test_receipt_lifecycle.py` (100
+lines), plus `AGENTS.md` and `docs/configuration.md`. The repair orders the receipt states and
+admits a forward transition while refusing a stale one:
+
+```
+_RECEIPT_RANK = {"unverified": -1, "created": 0, "registered": 1, "draining": 2, "removed": 3}
+```
+
+`_record_session` uses that order in the conflict clause (`WHERE <rank of the new status> >= <rank
+of the stored status>`), so `registered → draining` and `draining → removed` are recorded while
+`registered → created` is refused. `_record_session_locked` no longer decides by itself: it reads
+the stored status before the write and reports the status that is durable afterwards.
+
+### 9.2 The finding of task 13, re-run here
+
+| Test | Asserts | At `8ef01717` | At `17890950` |
+| --- | --- | --- | --- |
+| `test_the_receipt_follows_the_worker_from_registered_to_draining_to_removed` | the add → `registered` → drain → remove lifecycle records `draining` and then `removed` | **FAIL** (`'registered' != 'draining'`) | **pass** |
+| `test_a_same_key_retry_after_a_removal_never_reports_a_worker_that_is_gone` | a same-key retry after the removal reports no worker the roster does not hold | **FAIL** | **pass** |
+| `test_a_stale_write_does_not_downgrade_a_registered_receipt` | a stale `created` or `unverified` write does not un-register a session | pass | **pass** |
+
+### 9.3 The rule exercised in both directions
+
+| Test | Asserts | Result |
+| --- | --- | --- |
+| `test_every_forward_step_of_the_receipt_lifecycle_is_accepted` | each step of `unverified → created → registered → draining → removed` is recorded | pass |
+| `test_no_step_backwards_is_accepted` | no step backwards is recorded: a stale write leaves the receipt where it is | pass |
+| `test_a_late_registration_does_not_resurrect_a_removed_receipt` | a writer that arrives after the removal does not bring the receipt back | pass |
+| `test_the_locked_write_reports_the_status_that_was_recorded` | the locked write reports the durable status, not the one it asked for | pass |
+
+### 9.4 The focused failure and recovery interactions
+
+| Command | Scope | Result |
+| --- | --- | --- |
+| `python3 -m unittest -v tests.test_lifecycle_qualification_independent.ReceiptLifecycleTests tests.test_lifecycle_qualification_independent.ReceiptRankTests` | the receipt lifecycle and the rank rule | **7 tests, 0 fail** — 3.0 s |
+| `python3 -m unittest -v tests.test_lifecycle_qualification_independent.CrashAndUncertaintyTests tests.test_lifecycle_qualification_independent.ReviewFindingReproductionTests tests.test_lifecycle_qualification_independent.InitialIntentRaceTests tests.test_lifecycle_qualification_independent.ReceiptLifecycleTests tests.test_lifecycle_qualification_independent.ReceiptRankTests tests.test_lifecycle_qualification_independent.ReceiptTruthfulnessTests` | the groups the delta touches: the crash and uncertainty paths, the takeover and partial-create paths, the two-caller races, the receipt trail and the receipt truthfulness | **20 tests, 0 fail** — 11.4 s |
+| `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
+
+No broad aggregate run and no whole-repository run was made for this head, and the matrix of §2 was
+not re-run: this is a focused qualification of one repair.
+
+### 9.5 Limits of this focused qualification
+
+Seven receipt tests and twenty focused tests over **synthetic temporary state** on one head. No
+real native CLI, native database, provider or turn; no live manager, fleet, configuration, session,
+worktree or resource; no Docker; no model call. The owner's own suite at this head is **not
+measured**, so its baseline here is unknown. The pull request's draft and auto-merge state is
+unknown from local records, and the head could not be re-fetched from the remote here. **This is
+qualification evidence, not approval: root's personal review remains pending.**

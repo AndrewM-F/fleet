@@ -1608,5 +1608,75 @@ class ReceiptLifecycleTests(QualificationSandbox):
                          "a stale unverified write must not un-register a session")
 
 
+class ReceiptRankTests(QualificationSandbox):
+    """The published receipt rule: a receipt moves forward, never backwards.
+
+    The repair orders the receipt states and admits a forward transition while
+    refusing a stale one. These tests exercise that rule in both directions, in
+    synthetic temporary state, and cover the case that matters most in
+    practice: a late writer must not resurrect a receipt that is already
+    removed.
+    """
+
+    ORDER = ("unverified", "created", "registered", "draining", "removed")
+
+    def _receipt(self, index, status):
+        key, digest = self.request_parts(count=1)
+        identifier = "ses_RANK%08d" % index
+        self.seed_native_session(identifier)
+        self.seed_receipt(identifier, key, status, "seeded")
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree), "dispatchEnabled": False}
+        return identifier, key, request
+
+    def test_every_forward_step_of_the_receipt_lifecycle_is_accepted(self):
+        """Each step forward is a valid transition and must be recorded."""
+        for index, status in enumerate(self.ORDER[:-1]):
+            identifier, key, request = self._receipt(index, status)
+            following = self.ORDER[index + 1]
+            opencode_lifecycle._record_session(self.db, identifier, key, request, following,
+                                               "moved to " + following)
+            self.assertEqual(self.receipt_status(identifier), following,
+                             "the step from %s to %s must be recorded"
+                             % (status, following))
+
+    def test_no_step_backwards_is_accepted(self):
+        """A stale write never moves a receipt backwards."""
+        for index, status in enumerate(self.ORDER[1:], start=1):
+            identifier, key, request = self._receipt(index, status)
+            earlier = self.ORDER[index - 1]
+            opencode_lifecycle._record_session(self.db, identifier, key, request, earlier,
+                                               "a stale write")
+            self.assertEqual(self.receipt_status(identifier), status,
+                             "a stale write from %s to %s must not be recorded"
+                             % (status, earlier))
+
+    def test_a_late_registration_does_not_resurrect_a_removed_receipt(self):
+        """A writer that arrives after the removal must not bring it back."""
+        identifier, key, request = self._receipt(9, "removed")
+        opencode_lifecycle._record_session(self.db, identifier, key, request, "registered",
+                                           "a late registration")
+        self.assertEqual(self.receipt_status(identifier), "removed",
+                         "a removed receipt must not be resurrected")
+        opencode_lifecycle._record_session_locked(self.db, identifier, key, request, "registered",
+                                                  "a late registration")
+        self.assertEqual(self.receipt_status(identifier), "removed",
+                         "a removed receipt must not be resurrected")
+
+    def test_the_locked_write_reports_the_status_that_was_recorded(self):
+        """The locked write reports the durable status, not the one it asked for."""
+        identifier, key, request = self._receipt(10, "registered")
+        recorded = opencode_lifecycle._record_session_locked(self.db, identifier, key, request,
+                                                             "draining", "draining")
+        self.assertEqual(recorded, "draining")
+        self.assertEqual(self.receipt_status(identifier), "draining")
+        # A stale write under the lock leaves the receipt where it is.
+        recorded = opencode_lifecycle._record_session_locked(self.db, identifier, key, request,
+                                                             "created", "a stale write")
+        self.assertEqual(recorded, "draining",
+                         "the locked write must report the status that is durable")
+        self.assertEqual(self.receipt_status(identifier), "draining")
+
+
 if __name__ == "__main__":
     unittest.main()
