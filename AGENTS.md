@@ -118,7 +118,8 @@ command prints JSON on stdout and exits non-zero on failure.
   serializes the roster, the queue enqueue, the queue import, the model selection and the dispatch
   claim, and every roster write is a compare-and-swap against the configuration the writer started
   from, so a writer that takes the lock is never overwritten; a writer that ignores it is not
-  protected. The enqueue and the import read the roster inside that lock, so a roster a concurrent
+  protected. The digest of that configuration is read before the configuration itself, so a change
+  that lands between the two is detected at the write and kept, never overwritten. The enqueue and the import read the roster inside that lock, so a roster a concurrent
   removal has already changed is never used to accept a task for a worker that is gone. A creation whose answer never arrived stays **uncertain**: it is not an
   ordinary retryable failure, the intent is recorded before the first native call, and the
   request stops. The native inventory is never scanned and nothing is adopted: absence and
@@ -147,7 +148,16 @@ command prints JSON on stdout and exits non-zero on failure.
   failure. A retry takes the request's ownership atomically, and a session receipt only ever
   moves forward, in the order `unverified` → `created` → `registered` → `draining` → `removed`:
   a stale write never moves a receipt backwards, and a valid transition — registered to draining,
-  draining to removed — is never refused.
+  draining to removed — is never refused. A registered request is terminal as well: no later write
+  moves it back to an earlier state. A command reports what the durable state holds: an idempotent
+  result counts exactly the sessions it lists, it never lists a worker the roster does not
+  hold, and it names the sessions of the request that are draining, removed or gone. A request
+  converges: an attempt that was interrupted — between two of its own receipt writes, or between
+  the roster write and the request row — is finished by the next run with the same key, which
+  creates no second set of sessions. The admission limit a result reports is the one in effect
+  once the request is done, and the roster size it reports is the size the roster ends at. A
+  failure that left a native session whose identity was never verified poisons the key, and the
+  result says the request is not retryable instead of advertising a retry the next run refuses.
 - `bin/fleet drain-opencode --session SID --note "..."` — stop dispatching to one worker and report
   the work it still owns. Nothing is cancelled, released, re-routed or dropped: a queued task that
   is bound to the worker is reported as outstanding, and the worker takes no new work until the
@@ -164,7 +174,10 @@ command prints JSON on stdout and exits non-zero on failure.
   removed, and `--allow-unverified-native` does not override that: it only covers a native identity
   that cannot be read at all. The native session and its history are kept, and no hold, task, queue
   entry, worktree or credential is touched. There is no second removal path: a receipt-owned worker
-  leaves the roster only through this command, with these barriers.
+  leaves the roster only through this command, with these barriers. The removal also converges: if
+  it was interrupted between the roster write and the receipt write, the record and the roster
+  disagree, and repeating the command finishes the receipt with the same barriers, read from the
+  identity the receipt recorded, so the record and the roster agree again.
 - The staged activation and rollback plan for a live fleet, including the pinned older manager and
   the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
   It is not executed by this command. The pinned manager reloads the roster and the admission limit on

@@ -477,9 +477,11 @@ def _record_provisioning(db, request_key, request, status, detail="", count=None
                          payload_digest="", creator_pid=0, keep_registered=False):
     """Record the state of a provisioning request.
 
-    ``keep_registered`` refuses to move a request that is already registered
-    back to an earlier state: a final intent must never overwrite the fact
-    that the request was registered.
+    A registered request is terminal: no later write moves it back to an
+    earlier state, so a final intent must never overwrite the fact that the
+    request was registered. The rule is in the statement itself, so it holds
+    whoever writes. ``keep_registered`` additionally leaves the recorded
+    payload digest and the recorded owner untouched.
     """
     now = time.time()
     if keep_registered:
@@ -501,7 +503,8 @@ def _record_provisioning(db, request_key, request, status, detail="", count=None
         "ON CONFLICT(request_key) DO UPDATE SET status=excluded.status,"
         "updated=excluded.updated,detail=excluded.detail,"
         "payload_digest=excluded.payload_digest,"
-        "creator_pid=excluded.creator_pid",
+        "creator_pid=excluded.creator_pid "
+        "WHERE opencode_provisioning.status<>'registered'",
         (request_key, request["model"], request["account"], request["cwd"], request["root"],
          request["count"] if count is None else count, int(request["dispatchEnabled"]),
          status, now, now, detail, payload_digest, int(creator_pid)))
@@ -571,29 +574,48 @@ def _record_session_locked(db, session_id, request_key, request, status, detail=
         return after[0] if after is not None else status
 
 
-def _registered_result(db, key, request, count, entries, dispatch_enabled, note=""):
+def _registered_result(db, key, request, count, dispatch_enabled, note=""):
     """The result of a request that is already registered.
 
     The request's own receipts are its sessions. A request whose receipts are
-    missing claims nothing, and it never claims the whole roster.
+    missing claims nothing, and it never claims the whole roster. A receipt
+    that says a session is registered while the roster does not hold it is a
+    session that is gone: it is not reported as a live worker, it is named
+    separately, and the count always agrees with the sessions that are listed.
+
+    The caller holds the writer lock, so the roster is read as it is now.
     """
-    registered = [receipt for receipt in _session_receipts(db, key)
-                  if receipt["status"] == "registered"]
+    cfg = paths.config()
+    current = [entry for entry in cfg.get("opencode", []) if isinstance(entry, dict)]
+    roster_ids = {entry.get("sessionId") for entry in current}
+    receipts = _session_receipts(db, key)
+    live = [receipt for receipt in receipts if receipt["status"] == "registered"]
+    registered = [receipt for receipt in live
+                  if receipt["session_id"] in roster_ids]
+    gone = [receipt["session_id"] for receipt in live
+            if receipt["session_id"] not in roster_ids]
+    draining = [receipt["session_id"] for receipt in receipts
+                if receipt["status"] == "draining"]
+    removed = [receipt["session_id"] for receipt in receipts
+               if receipt["status"] == "removed"]
     return {"action": "add-opencode", "idempotent": True, "requestKey": key,
             "created": 0, "registered": len(registered), "requested": count,
             "sessions": [{"sessionId": receipt["session_id"],
                           "dispatchEnabled": bool(dispatch_enabled)}
                          for receipt in registered],
+            "notInRoster": gone,
+            "draining": draining,
+            "removed": removed,
             "model": request["model"], "account": request["account"],
             "cwd": request["cwd"], "root": request["root"],
-            "logicalSessions": len(entries),
-            "admissionLimit": int(paths.config().get("maxConcurrent", 0)),
+            "logicalSessions": len(current),
+            "admissionLimit": int(cfg.get("maxConcurrent", 0)),
             "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
             "status": "registered", "uncertain": False, "retryable": False,
             "note": note}
 
 
-def _locked_intent(db, key, request, count, entries, digest, reconciled, current_total, note):
+def _locked_intent(db, key, request, count, digest, reconciled, note):
     """Decide, under the writer lock, what this request may do.
 
     The row, its payload digest and every session receipt are read again under
@@ -617,7 +639,7 @@ def _locked_intent(db, key, request, count, entries, digest, reconciled, current
             if current[7] == "registered":
                 # Another caller completed this request. The result is idempotent
                 # and the completed row is never overwritten.
-                return {"result": _registered_result(db, key, request, count, entries,
+                return {"result": _registered_result(db, key, request, count,
                                                      current[6], current[10])}
             if current[7] == "creating" and _creator_alive(current[12]):
                 # Another caller is creating this request right now. Its receipts
@@ -662,16 +684,13 @@ def _locked_intent(db, key, request, count, entries, digest, reconciled, current
         if needed == 0 and not pending:
             _record_provisioning(db, key, request, "registered", "nothing to add",
                                  payload_digest=digest, creator_pid=os.getpid())
-            return {"result": {"action": "add-opencode", "idempotent": True,
-                                "requestKey": key, "created": 0,
-                                "registered": len(registered), "requested": count,
-                                "sessions": [], "model": request["model"],
-                                "account": request["account"], "cwd": request["cwd"],
-                                "root": request["root"], "logicalSessions": current_total,
-                                "admissionLimit": int(paths.config().get("maxConcurrent", 0)),
-                                "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
-                                "status": "registered", "uncertain": False, "retryable": False,
-                                "rosterChanged": False, "note": "nothing to add"}}
+            # The result names the sessions the request registered, so its
+            # count and its list always agree.
+            result = _registered_result(
+                db, key, request, count,
+                current[6] if current is not None else bool(request["dispatchEnabled"]),
+                "nothing to add")
+            return {"result": {**result, "rosterChanged": False}}
         if needed:
             # The intent is durable before the first native call, so a crash
             # between the create and its receipt is recoverable.
@@ -786,8 +805,10 @@ def add_sessions(db, count=None, target_total=None, model=None, cwd=None, root=N
 
 def _add_sessions(db, count, target_total, model, cwd, root, database_path, request_key,
                    enable_dispatch, max_concurrent, dry_run, note, reconciled_sessions):
-    cfg = paths.config()
+    # The digest is read before the configuration, so a change that lands
+    # between the two is detected at the write instead of being overwritten.
     config_digest = roster.config_digest()
+    cfg = paths.config()
     entries = [entry for entry in cfg.get("opencode", []) if isinstance(entry, dict)]
     current_total = len(entries)
     if target_total is not None:
@@ -800,7 +821,8 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
         if count == 0:
             # The target is already reached: nothing is created and the request
             # is a no-op that says so.
-            return {"action": "add-opencode", "idempotent": True, "requestKey": None,
+            return {"action": "add-opencode", "idempotent": True,
+                    "requestKey": request_key,
                     "requested": 0, "requestedTotal": target_total,
                     "rosterTotalBefore": current_total, "toCreate": 0, "created": 0,
                     "registered": 0, "sessions": [], "model": model,
@@ -867,6 +889,17 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     receipts = _session_receipts(db, key)
     pending = [receipt for receipt in receipts if receipt["status"] == "created"]
     registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
+    # The native sessions this request already holds: the ones an earlier
+    # attempt created, the ones whose identity was never verified and the ones
+    # the operator named. A dry run writes nothing, so the plan counts them as
+    # they will be reconciled, not as they are recorded now.
+    held = {receipt["session_id"] for receipt in receipts
+            if receipt["status"] in {"created", "unverified"}} | set(reconciled)
+    # The roster size the request ends at: a session the roster already holds
+    # is not added twice, and a session that is reconciled is added once.
+    roster_ids = _roster_session_ids(cfg)
+    adding = len([identifier for identifier in held if identifier not in roster_ids])
+    to_create = max(0, count - len(held) - len(registered))
     # The plan reports what the request would do. The counts that decide it are
     # taken under the writer lock, against the row and the receipts as they are
     # there, so a caller that planned from a stale snapshot cannot create an
@@ -875,14 +908,14 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
             "requested": count,
             "requestedTotal": target_total,
             "rosterTotalBefore": current_total,
-            "toCreate": max(0, count - len(pending) - len(registered)),
+            "toCreate": to_create,
             "created": 0, "registered": len(registered),
-            "alreadyRegistered": len(registered), "pendingNative": len(pending),
+            "alreadyRegistered": len(registered), "pendingNative": len(held),
             "reconciled": [identifier for identifier in reconciled],
             "model": request["model"], "account": request["account"],
             "cwd": request["cwd"], "root": request["root"],
             "dispatchEnabled": request["dispatchEnabled"],
-            "logicalSessions": current_total + max(0, count - len(pending) - len(registered)),
+            "logicalSessions": current_total + adding + to_create,
             "admissionLimit": int(cfg.get("maxConcurrent", 0)),
             "heavyJobSlots": heavy.SLOT_COUNT,
             "maxConcurrent": {"before": int(cfg.get("maxConcurrent", 0)),
@@ -893,11 +926,19 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                                     plan["logicalSessions"])
     if limit is not None:
         plan["maxConcurrent"]["after"] = limit
+        # The result reports the admission limit that is in effect once the
+        # request is done, not the one that was in effect before it.
+        plan["admissionLimit"] = limit
     if dry_run:
         # A dry run writes nothing at all: no receipt, no provisioning row, no
         # roster entry, no native state.
         return plan
-    executable = paths.executable("opencode", cfg)
+    try:
+        executable = paths.executable("opencode", cfg)
+    except RuntimeError as error:
+        # The CLI is not installed. The request fails before anything is
+        # created, and it fails as a command error rather than as a traceback.
+        raise ValueError("The OpenCode CLI could not be found: " + str(error)) from error
     # The creation call is proved against the installed CLI's own schema before
     # it is made: the request is only sent when the schema declares it.
     api_support = verify_native_api_support(executable)
@@ -905,16 +946,18 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     scratch.mkdir(parents=True, exist_ok=True)
     # The decision is taken under the writer lock, against the row, its payload
     # digest and every session receipt as they are there.
-    decision = _locked_intent(db, key, request, count, entries, digest, reconciled,
-                              current_total, note)
+    decision = _locked_intent(db, key, request, count, digest, reconciled, note)
     if "result" in decision:
         return decision["result"]
     needed = decision["needed"]
     pending = decision["pending"]
     registered = decision["registered"]
+    roster_ids = _roster_session_ids(paths.config())
+    adding = len([receipt["session_id"] for receipt in pending
+                  if receipt["session_id"] not in roster_ids])
     plan = {**plan, "toCreate": needed, "registered": len(registered),
             "alreadyRegistered": len(registered), "pendingNative": len(pending),
-            "logicalSessions": current_total + needed}
+            "logicalSessions": current_total + adding + needed}
     created = []
     try:
         for _ in range(needed):
@@ -964,11 +1007,19 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                              creator_pid=os.getpid())
         emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
              error=str(error), created=created)
+        # A failure that left a native session whose identity was never
+        # verified poisons the key: the next run refuses it until it is
+        # reconciled, so the request is not retryable.
+        unverified = [receipt["session_id"] for receipt in _session_receipts(db, key)
+                      if receipt["status"] == "unverified"]
         return {**plan, "created": len(created), "registered": 0,
                 "createdNotRegistered": created, "sessions": [],
                 "logicalSessions": current_total,
-                "status": "failed", "uncertain": False, "retryable": True,
-                "failed": str(error), "rosterChanged": False}
+                "status": "failed", "uncertain": False, "retryable": not unverified,
+                "failed": str(error), "rosterChanged": False,
+                "note": ("the request left a native session whose identity could never be "
+                         "verified (" + ", ".join(unverified) + "); the same key is refused "
+                         "until it is reconciled explicitly") if unverified else ""}
     # The sessions created by an earlier attempt of this request are verified
     # again, here, immediately before they are registered: their identity, their
     # working directory and their model are read back from the native inventory
@@ -996,20 +1047,23 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                     "rosterChanged": False}
     # The exact set that is about to be registered is proved before the roster is
     # written: the requested number of distinct ids, each with the expected
-    # model, none of them owned twice.
+    # model, none of them owned twice. The sessions an interrupted attempt
+    # already registered are part of the request, so the set is proved as a
+    # whole: a retry after an interruption converges instead of refusing.
     to_register = [receipt["session_id"] for receipt in pending] + created
-    if len(to_register) != count:
-        raise ProvisioningError("The request would register " + str(len(to_register))
+    whole = [receipt["session_id"] for receipt in registered] + to_register
+    if len(whole) != count:
+        raise ProvisioningError("The request would register " + str(len(whole))
                                  + " sessions but asked for " + str(count) + "; nothing was "
                                  "written")
-    if len(set(to_register)) != len(to_register):
+    if len(set(whole)) != len(whole):
         raise ProvisioningError("The request would register the same native session twice; "
                                  "nothing was written")
     # The ids are recorded against the request before the roster is written, so a
     # crash between the two is recoverable: the retry registers exactly these
     # sessions instead of creating a second set.
     _record_provisioning(db, key, request, "creating",
-                         json.dumps({"sessions": to_register}), payload_digest=digest,
+                         json.dumps({"sessions": whole}), payload_digest=digest,
                          creator_pid=os.getpid(), keep_registered=True)
     with roster.roster_lock():
         current = _provisioning_row(db, key)
@@ -1018,7 +1072,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                 # Another caller completed the request while this one was
                 # creating: the completed row and the roster are never
                 # overwritten by a stale caller.
-                return _registered_result(db, key, request, count, entries, current[6],
+                return _registered_result(db, key, request, count, current[6],
                                           current[10])
             if (current[12] not in (0, os.getpid())
                     and _creator_alive(current[12])):
@@ -1043,12 +1097,12 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
                              payload_digest=digest, creator_pid=os.getpid())
         emit(db, "opencode_sessions_added", requestKey=key, sessions=to_register,
              model=request["model"], account=request["account"], note=note)
-        proof = _prove_registration(db, updated, key, request, to_register)
+        proof = _prove_registration(db, updated, key, request, whole)
     return {**plan, "created": len(created),
-            "registered": len(to_register),
+            "registered": len(whole),
             "sessions": [{"sessionId": identifier,
                           "dispatchEnabled": request["dispatchEnabled"]}
-                         for identifier in to_register],
+                         for identifier in whole],
             "status": "registered", "uncertain": False, "retryable": False,
             "rosterChanged": True, "proof": proof,
             "apiSupport": api_support}
@@ -1075,9 +1129,14 @@ def _prove_registration(db, cfg, key, request, to_register):
 
 # --- drain and removal -----------------------------------------------------
 
+def _roster_matches(cfg, session_id):
+    """The configured OpenCode workers that name this session."""
+    return [entry for entry in cfg.get("opencode", [])
+            if isinstance(entry, dict) and entry.get("sessionId") == session_id]
+
+
 def _roster_entry(cfg, session_id):
-    matches = [entry for entry in cfg.get("opencode", [])
-               if isinstance(entry, dict) and entry.get("sessionId") == session_id]
+    matches = _roster_matches(cfg, session_id)
     if len(matches) != 1:
         raise ValueError("The session is not one configured OpenCode worker")
     return matches[0]
@@ -1121,8 +1180,8 @@ def drain_session(db, session_id, note=""):
     """
     with roster.queue_lock():
         with roster.roster_lock():
-            cfg = paths.config()
             config_digest = roster.config_digest()
+            cfg = paths.config()
             entry = _roster_entry(cfg, session_id)
             outstanding = _outstanding_tasks(db, session_id)
             try:
@@ -1201,10 +1260,15 @@ def remove_session(db, session_id, note="", allow_unverified_native=False):
                 return _remove_session(db, session_id, note, allow_unverified_native)
 
 
-def _remove_session(db, session_id, note, allow_unverified_native):
-    cfg = paths.config()
-    config_digest = roster.config_digest()
-    entry = _roster_entry(cfg, session_id)
+def _removal_barriers(db, cfg, session_id, entry, allow_unverified_native):
+    """Every barrier a removal must pass, on either of its two paths.
+
+    A removal refuses while the worker still owns outstanding work, while a
+    task for it is still waiting to be imported, while a recovery holds the
+    session, and while the native turn state says the worker is active. The
+    operator override only covers a native identity that cannot be read at all;
+    it never covers a worker that is known to be running.
+    """
     outstanding = _outstanding_tasks(db, session_id)
     try:
         awaiting = roster.queued_tasks_for(session_id, db)
@@ -1247,6 +1311,68 @@ def _remove_session(db, session_id, note, allow_unverified_native):
             if not allow_unverified_native:
                 raise ValueError("The native identity of this session could not be "
                                  "verified: " + str(error)) from error
+
+
+def _complete_removed_receipt(db, session_id, note, allow_unverified_native):
+    """Finish a removal that was interrupted between the roster and the receipt.
+
+    The removal writes the roster and then the receipt. A crash in between
+    leaves a receipt that says the worker is registered while the roster does
+    not hold it, and the removal cannot simply be repeated: the worker is
+    already gone. The removal is completed here instead, with the same
+    barriers — the outstanding work, the queue evidence, the recovery that
+    holds the session and the native turn state — read from the identity the
+    receipt itself recorded, so no barrier is skipped and no work is lost.
+    """
+    row = db.execute("SELECT request_key,model,account,cwd,root,status FROM opencode_sessions "
+                     "WHERE session_id=?", (session_id,)).fetchone()
+    if row is None or row[5] not in {"registered", "draining", "removed"}:
+        raise ValueError("The session is not one configured OpenCode worker")
+    request_key, model, account, cwd, _recorded_root, status = row
+    cfg = paths.config()
+    if status == "removed":
+        # The record and the roster already agree: the worker is gone.
+        return {"action": "remove-opencode", "sessionId": session_id, "removed": True,
+                "alreadyRemoved": True, "rosterChanged": False,
+                "nativeSessionKept": True,
+                "note": "the worker was already out of the roster; the native session and "
+                        "its history are untouched",
+                "logicalSessions": len(cfg.get("opencode", [])),
+                "admissionLimit": int(cfg.get("maxConcurrent", 0)),
+                "heavyJobSlots": heavy.SLOT_COUNT}
+    entry = {"sessionId": session_id, "cwd": cwd, "sessionCwd": cwd,
+             "databasePath": account, "model": model, "provider": "opencode",
+             "dispatchEnabled": False}
+    _removal_barriers(db, cfg, session_id, entry, allow_unverified_native)
+    _record_session(db, session_id, request_key,
+                    {"model": model, "account": account, "cwd": cwd,
+                     "root": str(_resolve(paths.ROOT)), "dispatchEnabled": False},
+                    "removed", "removed from the roster")
+    emit(db, "opencode_session_removed", sessionId=session_id, note=note,
+         nativeSessionKept=True)
+    return {"action": "remove-opencode", "sessionId": session_id, "removed": True,
+            "alreadyRemoved": False, "rosterChanged": False,
+            "nativeSessionKept": True,
+            "note": "the roster write was interrupted; the receipt was completed and the "
+                    "native session and its history are untouched",
+            "logicalSessions": len(cfg.get("opencode", [])),
+            "admissionLimit": int(cfg.get("maxConcurrent", 0)),
+            "heavyJobSlots": heavy.SLOT_COUNT}
+
+
+def _remove_session(db, session_id, note, allow_unverified_native):
+    config_digest = roster.config_digest()
+    cfg = paths.config()
+    matches = _roster_matches(cfg, session_id)
+    if len(matches) > 1:
+        raise ValueError("The session is not one configured OpenCode worker")
+    if not matches:
+        # The roster does not hold the worker. If its receipt says that it did,
+        # the removal was interrupted between the roster write and the
+        # receipt, and it is completed here instead of being refused.
+        return _complete_removed_receipt(db, session_id, note, allow_unverified_native)
+    entry = matches[0]
+    _removal_barriers(db, cfg, session_id, entry, allow_unverified_native)
     updated = paths.config()
     updated["opencode"] = [item for item in updated.get("opencode", [])
                             if item.get("sessionId") != session_id]
@@ -1262,6 +1388,7 @@ def _remove_session(db, session_id, note, allow_unverified_native):
     emit(db, "opencode_session_removed", sessionId=session_id, note=note,
          nativeSessionKept=True)
     return {"action": "remove-opencode", "sessionId": session_id, "removed": True,
+            "rosterChanged": True,
             "nativeSessionKept": True, "note": "the native session and its history are untouched",
             "logicalSessions": len(updated.get("opencode", [])),
             "admissionLimit": int(updated.get("maxConcurrent", 0)),

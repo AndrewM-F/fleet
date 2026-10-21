@@ -391,7 +391,7 @@ def cmd_add_opencode(args):
             request_key=args.request_key, enable_dispatch=args.enable_dispatch,
             max_concurrent=args.max_concurrent, dry_run=args.dry_run, note=args.note or "",
             reconciled_sessions=args.reconciled_session))
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, opencode_lifecycle.ProvisioningError) as error:
         print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
         sys.exit(1)
 

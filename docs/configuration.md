@@ -92,7 +92,8 @@ never invents a session id, so the id in a receipt is always the id the native s
   lock, so a roster a concurrent removal has already changed is never used to accept a task for a
   worker that is gone. Every roster write is a compare-and-swap against the configuration the
   writer started from: a writer that takes the lock is never overwritten, and a writer that ignores
-  it is not protected.
+  it is not protected. The digest of that configuration is read before the configuration itself, so
+  a change that lands between the two is detected at the write and kept, never overwritten.
   The decision for a request key is taken under the writer lock, against the row, its payload
   digest and every session receipt as they are there, and the number of sessions to create is
   counted there as well. A stale caller that planned from an earlier snapshot returns idempotently
@@ -124,7 +125,9 @@ never invents a session id, so the id in a receipt is always the id the native s
   `bin/fleet remove-opencode`, with its barriers: no queued, in-flight, uncertain or
   awaiting-import work, no recovery claim, and a verifiable native identity. A request is
   withdrawn by draining and removing its workers, one by one; there is no faster path that
-  skips the barriers.
+  skips the barriers. The removal converges: an interrupted removal — the roster was written
+  and the receipt was not — is completed by repeating the command, with the same barriers read
+  from the identity the receipt recorded, so the record and the roster agree again.
 - The creation call is proved against the installed CLI's own schema before it is made, and the
   request is the one that schema declares: the model as a `Model.Ref` object with a required `id`
   and `providerID`, the location as a `Location.PublicRef` object with a required `directory`, and
@@ -136,7 +139,15 @@ never invents a session id, so the id in a receipt is always the id the native s
   failure. A retry takes the request's ownership atomically, so two retries never own one request.
   A session receipt only ever moves forward, in the order `unverified` → `created` →
   `registered` → `draining` → `removed`: a stale write never moves a receipt backwards, and a
-  valid transition — registered to draining, draining to removed — is never refused.
+  valid transition — registered to draining, draining to removed — is never refused. A registered
+  request is terminal: no later write moves it back to an earlier state. A command reports what
+  the durable state holds: an idempotent result counts exactly the sessions it lists, never lists
+  a worker the roster does not hold, and names the sessions of the request that are draining,
+  removed or gone. A request converges: an interrupted attempt is finished by the next run with
+  the same key, which creates no second set of sessions. The admission limit a result reports is
+  the one in effect once the request is done, and the roster size it reports is the size the
+  roster ends at. A failure that left a native session whose identity was never verified poisons
+  the key, and the result says the request is not retryable.
 - The staged activation and rollback plan is
   [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md). It covers the pinned older
   manager, which reloads the roster and the admission limit on every cycle but does not honour

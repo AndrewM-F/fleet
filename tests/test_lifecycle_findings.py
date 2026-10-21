@@ -587,12 +587,11 @@ class StaleSnapshotBarrierTests(FindingSandbox):
         real_record = opencode_lifecycle._record_provisioning
         outcome = {"b": None, "a": None}
 
-        def intent(db, key, request, count, entries, digest, reconciled, current_total, note):
+        def intent(db, key, request, count, digest, reconciled, note):
             if threading.current_thread() is b_thread:
                 b_snapshot.set()
                 release_b.wait(60)
-            return real_intent(db, key, request, count, entries, digest, reconciled,
-                               current_total, note)
+            return real_intent(db, key, request, count, digest, reconciled, note)
 
         def record(db, key, request, status, detail="", count=None, payload_digest="",
                    creator_pid=0, keep_registered=False):
