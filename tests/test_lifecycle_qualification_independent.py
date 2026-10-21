@@ -40,6 +40,11 @@ from fleet import (manager, model_selection, opencode,  # noqa: E402
 MODEL = "opencode-go/minimax-m3.1-flash-free"
 OTHER_APPROVED = "opencode/minimax-m3.1-flash-free"
 
+# A process id that cannot exist on this host, so the runtime's liveness check
+# reports it as gone. It models an attempt whose process died, without touching
+# the check itself.
+DEAD_PID = 4194303
+
 # The schema the runtime proves a session creation against: the model is a
 # Model.Ref object with a required id and providerID, the location is a
 # Location.PublicRef object with a required directory, the body allows no other
@@ -289,6 +294,49 @@ class QualificationSandbox(unittest.TestCase):
         return {"head": head, "branch": branch, "status": status,
                 "tracked": (self.worktree / "tracked.txt").read_text(),
                 "untracked": (self.worktree / "untracked.txt").read_text()}
+
+    # -- fixtures for a pre-existing request intent -------------------------
+    def request_parts(self, count=1, target_total=None, enable_dispatch=False,
+                      max_concurrent=None):
+        """The key and the payload digest the module itself derives.
+
+        The module's own functions are used, so the fixture cannot drift from
+        the rule it exercises.
+        """
+        request = {"root": str(self.root), "account": str(self.native), "model": MODEL,
+                   "cwd": str(self.worktree)}
+        digest = opencode_lifecycle._payload_digest(request, count, target_total,
+                                                     enable_dispatch, max_concurrent)
+        key = opencode_lifecycle.derive_request_key(request, count, target_total,
+                                                     enable_dispatch, max_concurrent)
+        return key, digest
+
+    def seed_intent(self, key, status, digest, creator_pid=0, detail="", count=1):
+        """Write the durable intent of a request, as an earlier attempt left it."""
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest,"
+            "creator_pid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (key, MODEL, str(self.native), str(self.worktree), str(self.root), count, 0,
+             status, 1.0, 1.0, detail, digest, creator_pid))
+        self.db.commit()
+
+    def seed_receipt(self, session_id, key, status, detail=""):
+        """Write a session receipt of a request, as an earlier attempt left it."""
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, key, session_id, MODEL, str(self.native), str(self.worktree),
+             str(self.root), status, 1.0, 1.0, detail))
+        self.db.commit()
+
+    def seed_native_session(self, session_id):
+        """Write a native identity row, so a seeded receipt can be verified."""
+        with sqlite3.connect(self.native) as db:
+            db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                       (session_id, str(self.worktree), "project-independent",
+                        json.dumps({"id": "minimax-m3.1-flash-free",
+                                    "providerID": "opencode-go"})))
 
 
 class NativeEffectTests(QualificationSandbox):
@@ -826,6 +874,141 @@ class ReceiptTruthfulnessTests(QualificationSandbox):
         ok, reason = recovery.verify_stopped_native_execution(slot, "task-successor-2")
         self.assertFalse(ok, "a live process must never be reported as stopped")
         self.assertTrue(reason)
+
+
+class ReviewFindingReproductionTests(QualificationSandbox):
+    """Named reproductions for the review findings that are still applicable.
+
+    Each test states one invariant in the product's own terms and reproduces it
+    with a deterministic synthetic fixture. No test weakens an existing guard
+    and no oracle is changed to turn a failure into a pass.
+    """
+
+    def _concurrently(self, first, second):
+        barrier = threading.Barrier(2, timeout=20)
+        results = {}
+
+        def wrap(name, function):
+            def runner():
+                try:
+                    barrier.wait()
+                    results[name] = function()
+                except Exception as error:  # noqa: BLE001 - the failure is the result
+                    results[name] = {"error": str(error)}
+            return runner
+
+        threads = [threading.Thread(target=wrap("a", first)),
+                   threading.Thread(target=wrap("b", second))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        return results
+
+    def test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover(self):
+        """The same key must never add twice, whatever the intent row says.
+
+        The guard that keeps two same-key requests apart reads the creator
+        identity recorded in the request's durable intent. A request that takes
+        a key over from an attempt whose process is gone must leave that intent
+        naming the live creator; if it does not, the guard is off for that key
+        and both requests create native sessions.
+        """
+        key, digest = self.request_parts(count=2)
+        # A native session an earlier attempt created and receipted.
+        earlier = "ses_EARLIER00000000001"
+        self.seed_native_session(earlier)
+        self.seed_receipt(earlier, key, "created", "native session created")
+        # The intent the attempt that died left behind: it names a creator that
+        # is gone, so the guard that reads it cannot see a live attempt.
+        self.seed_intent(key, "creating", digest, creator_pid=DEAD_PID,
+                         detail="intent recorded before the native creation", count=2)
+
+        def request():
+            db = store.database(paths.DB)
+            try:
+                return opencode_lifecycle.add_sessions(
+                    db, count=2, model=MODEL, cwd=str(self.worktree), root=str(self.root),
+                    request_key=key)
+            finally:
+                db.close()
+
+        self._concurrently(request, request)
+        self.assertLessEqual(len(self.native_creates()), 1,
+                             "one key must never create more than one native session")
+        registered = [row for row in self.session_receipts() if row[2] == "registered"]
+        identifiers = [row[0] for row in registered]
+        self.assertEqual(len(identifiers), len(set(identifiers)),
+                         "one key must never register the same session twice")
+
+    def test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again(self):
+        """A crash in the middle of a creation must leave the request uncertain.
+
+        The product's own contract is that an uncertain outcome stays uncertain
+        and the next run adopts nothing on its own. A crash after one session
+        was created and receipted, but while a second one was in flight, leaves
+        that second session unknown: the retry must stop and ask for an explicit
+        reconciliation instead of creating another one.
+        """
+        real_create = opencode_lifecycle.create_native_session
+        calls = {"count": 0}
+
+        def create_then_crash(*args, **kwargs):
+            session = real_create(*args, **kwargs)
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise KeyboardInterrupt("the fleet process died during the second creation")
+            return session
+
+        with patch.object(opencode_lifecycle, "create_native_session",
+                          side_effect=create_then_crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.add(count=2, request_key="w8-partial-001")
+        crashed = len(self.native_creates())
+        self.assertEqual(crashed, 2, "the crashed attempt created two native sessions")
+        self.assertEqual(len([row for row in self.session_receipts()]), 1,
+                         "only the first session was receipted")
+
+        # The crashed attempt's process is gone. An in-process crash cannot make
+        # its own pid disappear, so the liveness check is modelled directly.
+        outcome = {}
+        with patch.object(opencode_lifecycle, "_creator_alive", return_value=False):
+            try:
+                outcome["result"] = self.add(count=2, request_key="w8-partial-001")
+            except ValueError as error:
+                outcome["error"] = str(error)
+        self.assertEqual(len(self.native_creates()), crashed,
+                         "a retry must not create a native session while the crashed "
+                         "attempt's outcome is unknown")
+        self.assertIn("error", outcome,
+                      "the retry must refuse while the crashed attempt's outcome is unknown")
+
+    def test_a_dry_run_does_not_mutate_a_receipt(self):
+        """A dry run writes nothing: not a receipt, not a roster, not a native call.
+
+        A request whose receipt is still unresolved is reconciled before the
+        plan is reported. That reconciliation writes to the receipt table, so a
+        dry run over such a request changes state it promised to leave alone.
+        """
+        key, digest = self.request_parts(count=1)
+        unresolved = "ses_UNVERIFIED00000001"
+        self.seed_native_session(unresolved)
+        self.seed_receipt(unresolved, key, "unverified", "the identity could not be read")
+        self.seed_intent(key, "creating", digest, creator_pid=DEAD_PID,
+                         detail="intent recorded before the native creation", count=1)
+        before = self.session_receipts()
+        outcome = {}
+        try:
+            outcome["plan"] = self.add(count=1, request_key=key, dry_run=True)
+        except Exception as error:  # noqa: BLE001 - a refusal is also an outcome
+            outcome["error"] = str(error)
+        after = self.session_receipts()
+        self.assertEqual(before, after,
+                         "a dry run must not change a receipt: "
+                         f"{before} became {after}")
+        self.assertEqual(self.native_creates(), [],
+                         "a dry run must not reach the native server")
+        self.assertEqual(self.events(), [], "a dry run must not emit an event")
 
 
 if __name__ == "__main__":
