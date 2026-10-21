@@ -44,11 +44,9 @@ from pathlib import Path
 import re
 import shutil
 import signal
-import sqlite3
 import subprocess
 import tempfile
 import time
-from urllib.parse import quote
 
 from . import heavy, model_selection, opencode, ops, paths, roster
 from .store import emit
@@ -566,8 +564,6 @@ def _record_session_locked(db, session_id, request_key, request, status, detail=
     registration that happened in between is seen and the monotonic rule holds.
     """
     with roster.roster_lock():
-        before = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
-                            (session_id,)).fetchone()
         _record_session(db, session_id, request_key, request, status, detail)
         after = db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
                            (session_id,)).fetchone()
@@ -649,7 +645,7 @@ def _locked_intent(db, key, request, count, digest, reconciled, note):
         # The sessions this request can account for, read under the lock.
         recorded = _recorded_sessions(current)
         accounted = {receipt["session_id"] for receipt in receipts
-                     if receipt["status"] == "created"} | set(recorded) | set(reconciled)
+                     if receipt["status"] != "unverified"} | set(recorded) | set(reconciled)
         if current is not None and current[7] in {"uncertain", "creating"} \
                 and len(accounted) < count:
             # The attempt's effects are not all accounted for: the request stays
@@ -678,7 +674,7 @@ def _locked_intent(db, key, request, count, digest, reconciled, note):
         receipts = _session_receipts(db, key)
         pending = [receipt for receipt in receipts if receipt["status"] == "created"]
         registered = [receipt for receipt in receipts if receipt["status"] == "registered"]
-        needed = count - len(pending) - len(registered)
+        needed = count - len(receipts)
         if needed < 0:
             needed = 0
         if needed == 0 and not pending:
@@ -815,25 +811,10 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
         if type(target_total) is not int or target_total < 1:
             raise ValueError("The total roster size must be a positive whole number")
         count = target_total - current_total
-        if count < 0:
-            raise ValueError(f"The roster already holds {current_total} OpenCode workers, "
-                             f"which is more than the requested total {target_total}")
-        if count == 0:
-            # The target is already reached: nothing is created and the request
-            # is a no-op that says so.
-            return {"action": "add-opencode", "idempotent": True,
-                    "requestKey": request_key,
-                    "requested": 0, "requestedTotal": target_total,
-                    "rosterTotalBefore": current_total, "toCreate": 0, "created": 0,
-                    "registered": 0, "sessions": [], "model": model,
-                    "account": str(_account_of(entries, database_path)), "cwd": str(cwd),
-                    "root": str(_resolve(root)), "logicalSessions": current_total,
-                    "admissionLimit": int(cfg.get("maxConcurrent", 0)),
-                    "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": False,
-                    "status": "already-reached", "uncertain": False, "retryable": False,
-                    "rosterChanged": False,
-                    "note": "the roster already holds the requested total"}
-    request = validate_request(cfg, count, model, cwd, root, database_path)
+    # Validate identity and derive the intent key even when the roster already
+    # reached the target. A previous attempt may still own unfinished receipts.
+    request = validate_request(cfg, 1 if target_total is not None else count,
+                               model, cwd, root, database_path)
     request["dispatchEnabled"] = bool(enable_dispatch)
     reconciled = validate_reconciled_sessions(reconciled_sessions)
     digest = _payload_digest(request, count, target_total, enable_dispatch, max_concurrent)
@@ -843,14 +824,37 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     if existing is not None:
         recorded = existing[11] or ""
         if not recorded:
-            # A request recorded before the payload binding cannot be verified,
-            # so it fails closed instead of being accepted as a retry.
             raise ValueError("The recorded request predates the payload binding and cannot be "
                              "verified; it is refused instead of being reused. Use a new key.")
         if recorded != digest:
             raise ValueError("The request key was already used for a different request "
                              "(count, total, account, working directory, model, dispatch flag "
                              "or admission limit). Use a new key for a different request.")
+        # The durable intent owns its original count. Roster growth, removal or
+        # a crash after its roster write cannot change that count on replay.
+        count = existing[5]
+        request["count"] = count
+    elif target_total is not None and count <= 0:
+        if count < 0:
+            raise ValueError(f"The roster already holds {current_total} OpenCode workers, "
+                             f"which is more than the requested total {target_total}")
+        if reconciled:
+            raise ValueError("No unfinished request owns these reconciled sessions")
+        validate_max_concurrent(int(cfg.get("maxConcurrent", 0)), max_concurrent,
+                                current_total)
+        return {"action": "add-opencode", "idempotent": True, "requestKey": key,
+                "requested": 0, "requestedTotal": target_total,
+                "rosterTotalBefore": current_total, "toCreate": 0, "created": 0,
+                "registered": 0, "sessions": [], "model": request["model"],
+                "account": request["account"], "cwd": request["cwd"],
+                "root": request["root"], "logicalSessions": current_total,
+                "admissionLimit": int(cfg.get("maxConcurrent", 0)),
+                "heavyJobSlots": heavy.SLOT_COUNT, "dryRun": bool(dry_run),
+                "status": "already-reached", "uncertain": False, "retryable": False,
+                "rosterChanged": False,
+                "note": "the roster already holds the requested total"}
+    request = {**validate_request(cfg, count, model, cwd, root, database_path),
+               "dispatchEnabled": bool(enable_dispatch)}
     # The request's own reconciliations run before the plan: a receipt that was
     # never verified is reconciled first, and the sessions the operator named are
     # verified against the native inventory. Both are this request's own
@@ -899,7 +903,7 @@ def _add_sessions(db, count, target_total, model, cwd, root, database_path, requ
     # is not added twice, and a session that is reconciled is added once.
     roster_ids = _roster_session_ids(cfg)
     adding = len([identifier for identifier in held if identifier not in roster_ids])
-    to_create = max(0, count - len(held) - len(registered))
+    to_create = max(0, count - len({r["session_id"] for r in receipts} | held))
     # The plan reports what the request would do. The counts that decide it are
     # taken under the writer lock, against the row and the receipts as they are
     # there, so a caller that planned from a stale snapshot cannot create an

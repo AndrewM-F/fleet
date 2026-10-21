@@ -123,3 +123,22 @@ proof, and the receipts keep the record of what was created.
 It creates no account, changes no credential, permission, provider or model, clears no hold,
 cancels no task, deletes no native session, starts no second manager, and never deploys or
 releases anything.
+
+### Follow-up repair qualification
+
+Target-total replays resolve the complete intent key before testing the current
+roster size. They retain the durable original requested count and finish an
+interrupted receipt set instead of declaring success from the roster alone.
+The generic `remove` command routes OpenCode identities, including receipt-owned
+identities absent from the roster, through the lifecycle removal barriers.
+Failed and uncertain add results retain their JSON recovery evidence and exit
+nonzero. An uncertain exit is never permission to retry creation blindly.
+
+CLI dry-run planning upgrades only an in-memory snapshot. A missing data/root
+path remains missing, and legacy durable tables are not migrated. Planning
+refuses a store with WAL present, including an empty WAL file, rather than
+creating/modifying SQLite sidecars or ignoring committed WAL data. It performs
+configuration/receipt planning; it does not start the installed CLI to qualify
+its native schema. Native API compatibility remains checked before actual
+creation. No live native lifecycle or manager activation is qualified by the
+synthetic regression suite.

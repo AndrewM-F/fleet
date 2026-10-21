@@ -177,8 +177,19 @@ def add_claude(session_id, cwd, model, effort, new=False, dispatch=False):
 
 
 def remove(session_id):
+    # OpenCode removal has one authoritative path, including interrupted
+    # receipt-owned removals where the roster entry is already absent.
+    from . import opencode_lifecycle
+
     cfg = paths.config()
     db = database()
+    if (any(slot.get("sessionId") == session_id for slot in cfg.get("opencode", []))
+            or db.execute("SELECT 1 FROM opencode_sessions WHERE session_id=?",
+                          (session_id,)).fetchone()):
+        try:
+            return opencode_lifecycle.remove_session(db, session_id)
+        finally:
+            db.close()
     if db.execute("SELECT 1 FROM tasks WHERE sid=? AND state IN ('queued','dispatching','sent','running')",
                   (session_id,)).fetchone():
         raise ValueError("Worker has queued or in-flight tasks")
