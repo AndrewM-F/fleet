@@ -107,6 +107,21 @@ If the roster was changed by something else in the meantime, the write is refuse
 compared with the copy the request started from, and a changed configuration is never
 overwritten.
 
+## What the review findings changed in this plan
+
+- **The native model is verified, not only the id and the directory.** A session whose recorded
+  model is not the requested one is refused, and a session created by an earlier attempt is verified
+  again — id, directory **and** model — immediately before it is registered.
+- **A duplicated native id is rejected.** An id that is already in the roster, already owned by
+  another request, or already created earlier in this request is refused instead of being
+  registered a second time.
+- **The creation path is proved against the installed CLI, not only against synthetic tests.**
+  [opencode-native-api-evidence.md](opencode-native-api-evidence.md) quotes the OpenAPI 3.1.0 schema
+  that the installed OpenCode v2.0.29 serves from its own `GET /openapi.json`: `POST /api/session`
+  (`session.create`), an all-optional body of `{id, parentID, title, agent, model, location,
+  metadata, permissions}`, no prompt-shaped field and no security scheme, so the call is
+  provider-free. The spec and the probe are kept with the operator handoff.
+
 ## What this plan never does
 
 It creates no account, changes no credential, permission, provider or model, clears no hold,

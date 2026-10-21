@@ -60,13 +60,15 @@ if mode == "garbage":
     print("not json at all")
     raise SystemExit(0)
 session_id = control["sessionId"]
-if control.get("unique"):
+if not control.get("duplicate"):
+    # A real server returns a distinct id for every created session.
     session_id = f"{{session_id}}-{{calls}}"
 directory = (data or {{}}).get("location", {{}}).get("directory")
 if data:
+    recorded = control.get("recordModel") or data.get("model")
     with sqlite3.connect(DATABASE) as database:
         database.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
-                         (session_id, directory, "project-test", data.get("model")))
+                         (session_id, directory, "project-test", recorded))
 print(json.dumps({{"data": {{"id": session_id, "directory": directory,
                           "model": (data or {{}}).get("model")}}}}))
 '''
@@ -236,20 +238,22 @@ class IdempotencyTests(Sandbox):
         self.assertEqual(len(self.roster()), 1)
         receipts = opencode_lifecycle._session_receipts(self.db, "w5-scale-002")
         self.assertEqual([receipt["status"] for receipt in receipts], ["created"])
-        self.assertEqual(failed["createdNotRegistered"], ["ses_NEW0000000000000001"])
+        created = failed["createdNotRegistered"]
+        self.assertEqual(len(created), 1)
         with sqlite3.connect(self.native) as db:
             self.assertEqual(
                 db.execute("SELECT count(*) FROM session_v2 WHERE id=?",
-                           ("ses_NEW0000000000000001",)).fetchone()[0], 1)
-        # The retry registers the session that already exists and creates nothing.
+                           (created[0],)).fetchone()[0], 1)
+        # The retry registers the session that already exists and creates only the
+        # missing one: two sessions, one new native session.
         self.write_control({"mode": "ok", "sessionId": "ses_NEW0000000000000002"})
         resumed = self.add(count=2, request_key="w5-scale-002")
-        # The session created before the failure is registered, and only the
-        # missing one is created: two sessions, one new native session.
         self.assertEqual(resumed["registered"], 2)
         self.assertEqual(resumed["created"], 1)
-        self.assertEqual([entry["sessionId"] for entry in self.roster()],
-                         [self.existing, "ses_NEW0000000000000001", "ses_NEW0000000000000002"])
+        roster = [entry["sessionId"] for entry in self.roster()]
+        self.assertEqual(len(roster), 3)
+        self.assertIn(created[0], roster)
+        self.assertEqual(len(set(roster)), 3)
 
 
 class PartialFailureTests(Sandbox):
@@ -260,7 +264,9 @@ class PartialFailureTests(Sandbox):
         self.assertFalse(result["rosterChanged"])
         self.assertEqual(len(self.roster()), 1)
         self.assertTrue(result["failed"])
-        self.assertEqual(result["createdNotRegistered"], ["ses_NEW0000000000000001"])
+        self.assertEqual(len(result["createdNotRegistered"]), 1)
+        self.assertTrue(result["createdNotRegistered"][0].startswith(
+            "ses_NEW0000000000000001"))
         kinds = [row[0] for row in self.db.execute("SELECT kind FROM events")]
         self.assertIn("needs_attention", kinds)
 
@@ -785,12 +791,39 @@ class BoundedRequestTests(Sandbox):
     """One bounded request covers a whole fleet scale-up."""
 
     def test_one_request_adds_seventeen_sessions(self):
-        self.write_control({"mode": "ok", "sessionId": "ses_SCALE000000000000000",
-                            "unique": True})
+        self.write_control({"mode": "ok", "sessionId": "ses_SCALE000000000000000"})
         result = self.add(count=17, request_key="w5-scale-17")
         self.assertEqual(result["created"], 17)
         self.assertEqual(len(self.roster()), 18)
         self.assertEqual(len(self.requests()), 17)
+        # Seventeen distinct native sessions, seventeen distinct receipts and
+        # seventeen distinct roster entries: no id is reused.
+        added = [entry["sessionId"] for entry in self.roster() if entry["sessionId"] != self.existing]
+        self.assertEqual(len(added), 17)
+        self.assertEqual(len(set(added)), 17)
+        receipts = [r for r in opencode_lifecycle._session_receipts(self.db, "w5-scale-17")
+                    if r["status"] == "registered"]
+        self.assertEqual(len(receipts), 17)
+        self.assertEqual(len({r["session_id"] for r in receipts}), 17)
+        with sqlite3.connect(self.native) as db:
+            rows = db.execute("SELECT id FROM session_v2").fetchall()
+        self.assertEqual(len({row[0] for row in rows}), 18)
+
+    def test_a_duplicated_native_id_is_rejected(self):
+        # A server that returns the same id for every creation would register
+        # one session twice; the second id is rejected instead.
+        self.write_control({"mode": "ok", "sessionId": "ses_DUPLICATE00000000001",
+                            "duplicate": True})
+        result = self.add(count=2, request_key="w5-scale-dup")
+        self.assertFalse(result["rosterChanged"])
+        self.assertEqual(len(self.roster()), 1)
+        self.assertIn("this request already created", result["failed"])
+        # The first session was created and is recorded; the duplicate id was
+        # rejected, so the roster was not changed and the retry registers the
+        # one real session instead of creating a second one.
+        receipts = opencode_lifecycle._session_receipts(self.db, "w5-scale-dup")
+        self.assertEqual([receipt["status"] for receipt in receipts], ["created"])
+        self.assertEqual(len(receipts), 1)
 
     def test_the_bound_is_still_a_bound(self):
         with self.assertRaises(ValueError):
@@ -874,6 +907,91 @@ class PlanTests(Sandbox):
         with self.assertRaises(ValueError):
             opencode_lifecycle.remove_session(self.db, self.existing)
         self.assertEqual(len(self.roster()), 1)
+
+
+class NativeIdentityTests(Sandbox):
+    """The native model, not only the id and the directory, identifies a session."""
+
+    def test_a_session_with_another_native_model_is_refused(self):
+        self.write_control({"mode": "ok", "sessionId": "ses_OTHERMODEL000000001",
+                            "recordModel": "opencode/deepseek-v4.1-flash-free"})
+        result = self.add(count=1, request_key="w5-model-001")
+        self.assertFalse(result["rosterChanged"])
+        self.assertEqual(len(self.roster()), 1)
+        self.assertIn("could not be read back", result["failed"])
+
+    def test_the_created_session_carries_the_requested_model(self):
+        self.add(count=1, request_key="w5-model-002")
+        identifier = self.roster()[-1]["sessionId"]
+        with sqlite3.connect(self.native) as db:
+            row = db.execute("SELECT model FROM session_v2 WHERE id=?", (identifier,)).fetchone()
+        self.assertEqual(row[0], MODEL)
+
+    def test_a_pending_session_that_no_longer_verifies_is_not_registered(self):
+        identifier = "ses_PENDING000000000001"
+        with sqlite3.connect(self.native) as db:
+            db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                       (identifier, str(self.wt), "project-test", MODEL))
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (identifier, "w5-model-003", identifier, MODEL, str(self.native), str(self.wt),
+             str(self.root), "created", 1, 1, "created before the crash"))
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("w5-model-003", MODEL, str(self.native), str(self.wt), str(self.root), 1, 0,
+             "creating", 1, 1, "", ""))
+        self.db.commit()
+        # The native session is gone by the time the request is retried.
+        with sqlite3.connect(self.native) as db:
+            db.execute("DELETE FROM session_v2 WHERE id=?", (identifier,))
+        result = self.add(count=1, request_key="w5-model-003")
+        self.assertFalse(result["rosterChanged"])
+        self.assertEqual(len(self.roster()), 1)
+        self.assertIn("no longer verifies", result["failed"])
+        receipt = self.db.execute("SELECT status FROM opencode_sessions WHERE session_id=?",
+                                  (identifier,)).fetchone()
+        self.assertEqual(receipt[0], "created")
+
+    def test_a_pending_session_with_another_native_model_is_not_registered(self):
+        identifier = "ses_PENDING000000000002"
+        with sqlite3.connect(self.native) as db:
+            db.execute("INSERT OR REPLACE INTO session_v2 VALUES (?,?,?,?)",
+                       (identifier, str(self.wt), "project-test",
+                        "opencode/deepseek-v4.1-flash-free"))
+        self.db.execute(
+            "INSERT INTO opencode_sessions (session_id,request_key,native_id,model,account,cwd,"
+            "root,status,created,updated,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (identifier, "w5-model-004", identifier, MODEL, str(self.native), str(self.wt),
+             str(self.root), "created", 1, 1, "created before the crash"))
+        self.db.execute(
+            "INSERT INTO opencode_provisioning (request_key,model,account,cwd,root,"
+            "requested_count,dispatch_enabled,status,created,updated,detail,payload_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("w5-model-004", MODEL, str(self.native), str(self.wt), str(self.root), 1, 0,
+             "creating", 1, 1, "", ""))
+        self.db.commit()
+        result = self.add(count=1, request_key="w5-model-004")
+        self.assertFalse(result["rosterChanged"])
+        self.assertEqual(len(self.roster()), 1)
+        self.assertIn("no longer verifies", result["failed"])
+
+    def test_the_native_request_stays_inside_the_documented_schema(self):
+        # The installed OpenCode CLI serves its own OpenAPI 3.1.0 spec
+        # (opencode v2.0.29, spec sha256 49c38e1c0a6c0e8c91ab5fbeaddd068effc543bdecf96484caf4eb956218a1c7).
+        # POST /api/session declares exactly these body properties, none of
+        # them required, and no prompt-shaped field: the call is provider-free.
+        documented = {"id", "parentID", "title", "agent", "model", "location", "metadata",
+                      "permissions"}
+        self.add(count=1, request_key="w5-model-005")
+        payload = self.requests()[0]["data"]
+        self.assertTrue(set(payload).issubset(documented))
+        self.assertEqual(set(payload), {"location", "model"})
+        self.assertEqual(sorted(payload["location"]), ["directory"])
+        self.assertEqual(payload["model"], MODEL)
+        self.assertNotIn("prompt", json.dumps(payload).lower())
 
 
 if __name__ == "__main__":

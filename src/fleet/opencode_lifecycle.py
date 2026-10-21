@@ -313,9 +313,17 @@ def create_native_session(executable, account, cwd, model, scratch, timeout=None
     return _parse_session(stdout)
 
 
-def _verify_created(session_id, cwd, account):
-    """Read the created session's own identity row back, read-only."""
-    return opencode.verify_native_session(session_id, cwd, account)
+def _verify_created(session_id, cwd, account, model=None):
+    """Read the created session's own identity row back, read-only.
+
+    The identity is the session id, the working directory **and** the model the
+    native session itself records. A session that does not carry the requested
+    model is not the session this request asked for, whatever its id says.
+    """
+    native = opencode.verify_native_session(session_id, cwd, account)
+    if model is not None:
+        opencode.verify_native_model(model, native)
+    return native
 
 
 def _native_candidates(account, cwd, model):
@@ -414,6 +422,29 @@ def _roster_session_ids(cfg):
             if isinstance(entry, dict)}
 
 
+def _receipted_session_ids(db):
+    return {receipt["session_id"] for receipt in _session_receipts(db)}
+
+
+def _reject_duplicate_identity(db, cfg, identifier, request_key, created):
+    """Refuse a native session id that is already owned.
+
+    A returned id that is already in the roster, already receipted by another
+    request, or already created earlier in this request is a duplicate. It is
+    rejected instead of being registered a second time, and the roster is not
+    changed.
+    """
+    if identifier in _roster_session_ids(cfg):
+        raise ProvisioningError("The native server returned a session id that is already in "
+                                "the roster: " + identifier)
+    if identifier in created:
+        raise ProvisioningError("The native server returned a session id that this request "
+                                "already created: " + identifier)
+    if identifier in _receipted_session_ids(db):
+        raise ProvisioningError("The native server returned a session id that another "
+                                "request already owns: " + identifier)
+
+
 # --- reporting --------------------------------------------------------------
 
 def status(db, root=None):
@@ -507,7 +538,8 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
     if unresolved:
         for receipt in unresolved:
             try:
-                _verify_created(receipt["session_id"], request["cwd"], request["account"])
+                _verify_created(receipt["session_id"], request["cwd"], request["account"],
+                                request["model"])
             except (ValueError, OSError) as error:
                 raise ValueError("A native session of this request was created but its "
                                  "identity could never be verified (" + receipt["session_id"]
@@ -572,8 +604,11 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
             session = create_native_session(executable, request["account"], request["cwd"],
                                             request["model"], scratch)
             identifier = session["id"]
+            # A returned id that is already owned is rejected instead of being
+            # registered a second time.
+            _reject_duplicate_identity(db, paths.config(), identifier, key, created)
             try:
-                _verify_created(identifier, request["cwd"], request["account"])
+                _verify_created(identifier, request["cwd"], request["account"], request["model"])
             except (ValueError, OSError) as error:
                 # The session exists but its identity is not proven: it is recorded
                 # as unverified and never counted as created.
@@ -602,6 +637,28 @@ def _add_sessions(db, count, model, cwd, root, database_path, request_key, enabl
                 "logicalSessions": len(entries),
                 "status": "failed", "uncertain": False, "retryable": True,
                 "failed": str(error), "rosterChanged": False}
+    # The sessions created by an earlier attempt of this request are verified
+    # again, here, immediately before they are registered: their identity, their
+    # working directory and their model are read back from the native inventory
+    # once more, so a session that changed or vanished is never registered.
+    for receipt in pending:
+        try:
+            _verify_created(receipt["session_id"], request["cwd"], request["account"],
+                            request["model"])
+        except (ValueError, OSError) as error:
+            _record_provisioning(db, key, request, "failed",
+                                 "a previously created native session no longer verifies: "
+                                 + str(error), payload_digest=digest)
+            emit(db, "needs_attention", category="opencode-provisioning", requestKey=key,
+                 error="a previously created native session no longer verifies: " + str(error),
+                 sessionId=receipt["session_id"])
+            return {**plan, "created": len(created), "registered": 0,
+                    "createdNotRegistered": created + [receipt["session_id"]],
+                    "sessions": [], "logicalSessions": len(entries),
+                    "status": "failed", "uncertain": False, "retryable": False,
+                    "failed": "a previously created native session no longer verifies: "
+                              + str(error),
+                    "rosterChanged": False}
     updated = paths.config()
     for identifier in [receipt["session_id"] for receipt in pending] + created:
         if any(entry.get("sessionId") == identifier for entry in updated.get("opencode", [])):

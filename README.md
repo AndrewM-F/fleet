@@ -74,3 +74,5 @@ See [OpenCode recovery](docs/troubleshooting.md#opencode-error-turn).
 `bin/fleet add-opencode` creates sessions through the supported OpenCode CLI, never through a
 database write. The staged activation and rollback plan, including the pinned older manager and
 the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
+The native creation call is proved against the installed CLI's own OpenAPI schema in
+[docs/opencode-native-api-evidence.md](docs/opencode-native-api-evidence.md).
