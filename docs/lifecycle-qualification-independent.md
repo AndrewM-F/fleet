@@ -3,11 +3,11 @@
 **Author:** W8 (independent qualification; not the runtime owner)
 **Runtime owner:** W5 — this document qualifies their implementation and changes none of it
 **Qualification suite:** `tests/test_lifecycle_qualification_independent.py` (one owned file)
-**Status:** **not qualified.** Against the owner's final reviewed head `9d2bd8db`, four invariants
-still do not pass (three assertion failures and one error); a fifth, found at the admission base,
-was repaired by the owner and is kept as a passing regression. Each failure is recorded below with
-its exact test name, command, observed behaviour and the smallest owned-path patch suggestion for
-the source owner.
+**Status:** **not qualified.** Against the owner's published head `9d2bd8db`, seven invariants do
+not pass (six assertion failures and one error); an eighth, found at the admission base, was
+repaired by the owner and is kept as a passing regression. Each failure is recorded below with its
+exact test name, command, observed behaviour and the smallest owned-path patch suggestion for the
+source owner.
 
 ## 1. The exact source base
 
@@ -23,9 +23,27 @@ the source owner.
 | Base provenance | W5's task was `working` when the suite was first built, so the qualification did not wait: it was built, checked and run against `f4f26de`, and the defects were routed back before the owner's task finished |
 
 The admission base and the owner final head are both reported because the evidence has two parts:
-what the published base did (§3, D1–D5) and what the owner's final reviewed head still does (§3,
-final-head status). **Qualification is not declared: the same suite does not pass on the final
+what the published base did (§3, D1–D5) and what the owner's published head still does (§3,
+final-head status). **Qualification is not declared: the same suite does not pass on the published
 head** (§3, §6).
+
+**The published head under review, re-verified read-only.** The owner's continuation
+`20261021-w5-fleet-lifecycle-seven-final-review-findings-repair-09` was **working** when this
+qualification re-checked it (live manager view, session `ses_a028b8fd0eed4f2c985ed1e0fa`, turn
+`31e6197a-afca-4401-91a5-6caf7e5c10d8`, updated 2026-10-21T09:52:09Z; task sent 09:44:33Z,
+consumed 09:44:57Z). Its worktree carries **uncommitted** changes to
+`src/fleet/control.py`, `src/fleet/manager.py`, `src/fleet/model_selection.py`,
+`src/fleet/opencode_lifecycle.py`, `src/fleet/roster.py`, `tests/test_opencode_lifecycle.py` and a
+new `tests/test_lifecycle_findings.py`. **None of that tree was read, and none of it was
+integrated**: only the path names were observed, through `git status --porcelain`, to establish
+that there is uncommitted work and that the published head is still the head under review. The
+published head remains `9d2bd8db` — the local remote-tracking ref
+`origin/feat/opencode-session-lifecycle-add-remove` says so, and it is the head this qualification
+verified as published at the previous checkpoint. The remote could **not** be re-fetched for a
+fresh confirmation: `git ls-remote https://github.com/0xPlayerOne/fleet.git` fails with
+`could not read Username for 'https://github.com': Device not configured`, because this worker has
+no GitHub authorization. That limitation is stated rather than worked around; the immutable head
+this qualification ran against is the commit `9d2bd8db` itself.
 
 ## 2. What the suite covers, and what it deliberately does not
 
@@ -78,6 +96,9 @@ dedicated test (§3, D1).
 | A drain and a removal of one worker cannot both take effect | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | barrier | pass |
 | **A stale import never binds a task to a removed worker** | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | barrier | **FAIL (D4)** |
 | **A model-selection write never loses a roster entry** | `test_a_model_selection_write_never_loses_a_roster_entry` | barrier | **FAIL (D5)** |
+| **The same key never creates a second native session after a takeover** | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | barrier | **FAIL (D6)** |
+| **A partial-create crash leaves the request uncertain instead of creating again** | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | fault injection | **FAIL (D7)** |
+| **A dry run does not mutate a receipt** | `test_a_dry_run_does_not_mutate_a_receipt` | fault injection | **FAIL (D8)** |
 | The status report counts the roster and the receipts truthfully | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | — | pass |
 | **A recovery receipt refuses a turn whose cleanup is not confirmed** | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | fault injection | pass |
 | **A recovery receipt refuses a turn whose process is still live** | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | fault injection | pass |
@@ -88,15 +109,17 @@ ledger with controlled failures. The suite asserts, in every case, that **no dup
 call** was made, that **no queue entry was lost**, that **no unsafe registration or removal**
 happened, and that the reported status matches what actually occurred.
 
-## 3. The five published defects (retained as failing acceptance evidence)
+## 3. The published defects and the open review findings (retained as failing acceptance evidence)
 
 Each item is a failing test in the committed suite. **No production fix is implemented or copied
 here**; the suggestion is the smallest change in the source owner's own paths, offered for the
 owner to accept, reject or re-shape.
 
-**Status against the owner final head `9d2bd8db`:** D1 is **repaired** by the owner's commit
+**Status against the owner published head `9d2bd8db`:** D1 is **repaired** by the owner's commit
 "match the resolved session-create contract, and prove the reload" — its test now passes. **D2, D3,
-D4 and D5 still fail**, unchanged, and they are retained here as the open regressions.
+D4 and D5 still fail**, unchanged, and they are retained here as the open regressions. **D6, D7 and
+D8 are the named review findings reproduced in this run**; all three still fail at the published
+head, so all three remain applicable.
 
 ### D1 — the session-create body does not conform to the schema the runtime proved
 
@@ -180,6 +203,56 @@ D4 and D5 still fail**, unchanged, and they are retained here as the open regres
   `roster.write_config_cas`, so a configuration that changed underneath is refused rather than
   overwritten — the same protection the roster writer already has.
 
+### D6 — the same key creates a second native session after a takeover
+
+* **Test:** `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover`
+  (class `ReviewFindingReproductionTests`)
+* **Command:** `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"`
+* **Observed:** `2 not less than or equal to 1` — two barrier-aligned requests that carry **the same
+  request key** each performed a native creation. The intent row of that key named a creator that
+  is gone (the fixture writes a pid that cannot exist), and one native session of that key was
+  already receipted.
+* **Why it matters:** the CLI's own contract is that the same key never adds twice. The guard that
+  keeps two same-key requests apart reads the creator identity in the request's durable intent, and
+  `_record_provisioning` does **not** refresh that identity when a request takes the key over
+  (`ON CONFLICT(request_key) DO UPDATE SET status, updated, detail, payload_digest` leaves
+  `creator_pid` alone). After a takeover the intent still names the dead creator, the guard reports
+  no live attempt, and both requests create native sessions for one key.
+* **Smallest owned-path suggestion** (`src/fleet/opencode_lifecycle.py`): refresh `creator_pid` in
+  the `ON CONFLICT` clause, so the intent always names the attempt that currently holds the key.
+
+### D7 — a crash in the middle of a creation is not left uncertain
+
+* **Test:** `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again`
+  (class `ReviewFindingReproductionTests`)
+* **Observed:** the crashed attempt created **two** native sessions but receipted only the first
+  (the crash lands between the native effect and its receipt). The retry then created a **third**
+  native session instead of refusing: the assertion `a retry must not create a native session while
+  the crashed attempt's outcome is unknown` fails, and no refusal is raised.
+* **Why it matters:** the product's own contract is that an uncertain outcome stays uncertain and
+  the next run adopts nothing on its own. The guard that enforces it only refuses when the request
+  has **no** receipted session, so one receipted session masks the unknown state of the others: the
+  retry proceeds, and the session the crashed attempt created without a receipt is orphaned and
+  never reported.
+* **Smallest owned-path suggestion** (`src/fleet/opencode_lifecycle.py`): treat a `"creating"`
+  intent with a **dead** creator as uncertain regardless of how many sessions were receipted, so
+  the request stops and asks for an explicit reconciliation.
+
+### D8 — a dry run mutates a receipt
+
+* **Test:** `test_a_dry_run_does_not_mutate_a_receipt` (class `ReviewFindingReproductionTests`)
+* **Observed:** a dry run over a request whose receipt is still `unverified` changed that receipt:
+  the reconciliation that runs before the plan is reported rewrites the receipt to `created` with
+  the detail "reconciled: the native identity was read back". The assertion
+  `a dry run must not change a receipt` fails, comparing the receipt rows before and after.
+* **Why it matters:** the dry run's own contract is "A dry run writes nothing at all: no receipt,
+  no roster, no native state" — and the reconciliation that precedes the plan's return commits a
+  receipt change, so a read-only request is not read-only. It also happens before the request is
+  refused, so a dry run can leave state behind even when it does not return a plan.
+* **Smallest owned-path suggestion** (`src/fleet/opencode_lifecycle.py`): resolve the unresolved
+  receipts *after* the dry-run early return, so a dry run reports the plan and the receipt state it
+  found, and changes nothing.
+
 ## 4. Candidate cases accepted and refused
 
 | Candidate | Accepted | Refused |
@@ -215,6 +288,15 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 * **Timing and crash windows are injected, not real.** The crash between the native effect and the
   receipt is simulated by raising out of the native call in-process; the real crash window also
   includes the process dying between the roster write and the receipt, which is not reproduced.
+* **A dead creator is modelled, not reaped.** The "the attempt's process is gone" precondition is
+  expressed by a process id that cannot exist on this host, and in one case by telling the runtime's
+  own liveness check that the creator is gone — an in-process crash cannot make its own process
+  disappear. The runtime's liveness check itself is not re-implemented and not weakened.
+* **The pre-existing intent is seeded, not produced by a full crash chain.** The same-key takeover
+  (D6) and the unresolved receipt (D8) are reproduced by writing the durable intent and the
+  receipt the way an earlier attempt leaves them, using the module's own key and digest functions
+  so the fixture cannot drift from the rule it exercises. The full chain that produces such a row
+  is the owner's to exercise.
 * **Single-process concurrency.** The race cases use threads inside one process; the file locks are
   advisory and would behave the same across processes, but that is not exercised.
 * **The recovery receipts are checked as evidence, not as a recovery.** `verify_stopped_native_execution`
@@ -226,12 +308,73 @@ These are **not** qualified by this suite and are stated as limits, not as passe
 | Command | Scope | Result |
 | --- | --- | --- |
 | `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | this suite, at the **admission base** `f4f26de` | **29 tests: 24 pass, 4 assertion failures, 1 error** — 5 not passing (D1–D5) |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `f4f26de`, including this suite | **492 tests: 11 failures, 1 error** — 5 of them are D1–D5, **7 are pre-existing** (below) |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `f4f26de`, including this suite | **492 tests: 11 failures, 1 error** — 5 of them D1–D5, **7 pre-existing** |
 | `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository at `f4f26de` **without** this file (it is the only `test_l*` module) | **463 tests: 7 failures** — the pre-existing baseline |
-| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the same suite at the owner final head `9d2bd8db`** | **29 tests: 25 pass, 3 assertion failures, 1 error** — 4 not passing (D2–D5); D1 now passes |
-| `python3 -m unittest discover -s tests -t .` | the whole repository at `9d2bd8db`, including this suite | **504 tests: 10 failures, 1 error** — 4 of them are D2–D5, 7 pre-existing (unchanged) |
+| `python3 -m unittest discover -s tests -t . -p "test_lifecycle_qualification_independent.py"` | **the suite at the published head `9d2bd8db`** | **32 tests: 25 pass, 6 assertion failures, 1 error** — 7 not passing (D2–D8); D1 passes |
+| `python3 -m unittest discover -s tests -t .` | the whole repository at `9d2bd8db`, including this suite | **507 tests: 13 failures, 1 error** — 7 of them D2–D8, 7 pre-existing |
+| `python3 -m unittest discover -s tests -t . -p "test_[!l]*.py"` | the same repository at `9d2bd8db` **without** this file | **475 tests: 7 failures** — the pre-existing baseline |
 | `python3 -m py_compile tests/test_lifecycle_qualification_independent.py` | the owned test file | pass |
 | `git diff --stat 9d2bd8db...codex/20261021-w8-independent-lifecycle-qualification` | the owned delta against the owner branch | two new paths only |
+
+**Per-test receipt at the published head `9d2bd8db`** (32 tests; the seven that do not pass are
+named, every other test passed):
+
+| # | Test | Class | Result |
+| --- | --- | --- | --- |
+| 1 | `test_the_native_call_carries_only_the_model_and_the_directory` | `NativeEffectTests` | pass |
+| 2 | `test_the_created_session_is_read_back_from_the_synthetic_identity_row` | `NativeEffectTests` | pass |
+| 3 | `test_the_native_request_body_conforms_to_the_schema_the_runtime_proved` | `NativeEffectTests` | pass (D1, repaired) |
+| 4 | `test_a_duplicate_native_identity_is_refused_and_the_roster_stays_exact` | `NativeEffectTests` | pass |
+| 5 | `test_the_registration_proof_counts_distinct_sessions_exactly` | `NativeEffectTests` | pass |
+| 6 | `test_a_dry_run_makes_no_native_call_and_writes_no_receipt` | `DryRunTests` | pass |
+| 7 | `test_a_dry_run_of_a_target_total_writes_nothing` | `DryRunTests` | pass |
+| 8 | `test_the_same_key_with_a_different_payload_is_refused_before_any_native_call` | `RequestKeyBindingTests` | pass |
+| 9 | `test_the_same_key_with_the_same_payload_is_idempotent` | `RequestKeyBindingTests` | pass |
+| 10 | `test_a_crash_between_the_native_effect_and_its_receipt_creates_no_second_session` | `CrashAndUncertaintyTests` | pass |
+| 11 | `test_a_crashed_creator_leaves_the_request_uncertain_and_not_retryable` | `CrashAndUncertaintyTests` | pass |
+| 12 | `test_an_explicitly_named_session_is_registered_without_a_second_creation` | `CrashAndUncertaintyTests` | pass |
+| 13 | `test_a_native_effect_that_cannot_be_read_back_stays_uncertain` | `CrashAndUncertaintyTests` | pass |
+| 14 | `test_a_malformed_queue_file_does_not_let_a_removal_pass_unseen` | `QueueAndLedgerIntegrityTests` | **FAIL (D2)** |
+| 15 | `test_an_unreadable_task_ledger_refuses_the_removal_and_keeps_the_roster` | `QueueAndLedgerIntegrityTests` | pass |
+| 16 | `test_a_terminal_task_in_the_queue_history_does_not_block_the_removal` | `QueueAndLedgerIntegrityTests` | **ERROR (D3)** |
+| 17 | `test_a_queue_entry_that_names_the_worker_is_never_lost_by_a_drain` | `QueueAndLedgerIntegrityTests` | pass |
+| 18 | `test_a_running_worker_is_never_removed` | `RemovalBarrierTests` | pass |
+| 19 | `test_a_removal_keeps_the_native_session_and_every_hold` | `RemovalBarrierTests` | pass |
+| 20 | `test_a_removal_leaves_a_dirty_unpublished_worktree_byte_identical` | `RemovalBarrierTests` | pass |
+| 21 | `test_an_active_worker_with_unpublished_work_is_never_removed` | `RemovalBarrierTests` | pass |
+| 22 | `test_two_barrier_aligned_requests_with_one_key_make_exactly_one_native_call` | `BarrierRaceTests` | pass |
+| 23 | `test_two_barrier_aligned_requests_with_one_key_and_different_payloads_conflict` | `BarrierRaceTests` | pass |
+| 24 | `test_a_drain_and_a_removal_of_one_worker_cannot_both_take_effect` | `BarrierRaceTests` | pass |
+| 25 | `test_an_import_with_a_stale_roster_snapshot_never_binds_a_task_to_a_removed_worker` | `BarrierRaceTests` | **FAIL (D4)** |
+| 26 | `test_a_model_selection_write_never_loses_a_roster_entry` | `BarrierRaceTests` | **FAIL (D5)** |
+| 27 | `test_the_status_report_counts_the_roster_and_the_receipts_truthfully` | `ReceiptTruthfulnessTests` | pass |
+| 28 | `test_a_recovery_receipt_refuses_a_turn_whose_cleanup_is_not_confirmed` | `ReceiptTruthfulnessTests` | pass |
+| 29 | `test_a_recovery_receipt_refuses_a_turn_whose_process_is_still_live` | `ReceiptTruthfulnessTests` | pass |
+| 30 | `test_a_same_key_request_never_creates_a_second_native_session_after_a_takeover` | `ReviewFindingReproductionTests` | **FAIL (D6)** |
+| 31 | `test_a_partial_create_crash_leaves_the_request_uncertain_instead_of_creating_again` | `ReviewFindingReproductionTests` | **FAIL (D7)** |
+| 32 | `test_a_dry_run_does_not_mutate_a_receipt` | `ReviewFindingReproductionTests` | **FAIL (D8)** |
+
+**Baseline versus new failures.** The repository's own suite at `9d2bd8db`, without this file, is
+**475 tests with 7 failures**; with this file it is **507 tests with 13 failures and 1 error**. The
+7 owner failures are unchanged and are all in `tests/test_queue_runway.py`
+(`QueueRunwayTests`): `test_active_is_not_reserve`,
+`test_cycle_returns_early_when_runway_is_low`,
+`test_default_remains_nonblocking_snapshot_with_timeout_zero`,
+`test_pending_import_is_distinct_and_deduplicated`, `test_queued_successors_cover_both_workers`,
+`test_unapproved_or_unknown_targets_do_not_cover_workers` and
+`test_uncertain_and_finished_never_count`. Their symptom is a *session id* appearing in a
+report's task list where a task id was expected
+(`['b', 'ses_EXISTING000000000001'] != ['b']`). That is the same queue-history area as D3, and it
+is reported here as context for the owner, not as a finding of this qualification.
+
+**This suite adds no failure to the repository's own tests.** Every failure it contributes is one of
+its own seven, each of which is a retained defect reproduction.
+
+The repository has no separate lint or format tool (no CI workflow, no packaging configuration);
+the documented check is the unittest discovery above, plus a byte-compile of the owned file. The
+owned file follows the repository's style (module docstring, `unittest.TestCase` classes, no
+third-party imports, the same source-layout path bootstrap as the repository's own tests) and stays
+within 100 columns.
 
 **This suite adds no failure to the repository's own tests.** The 7 failures in the baseline run are
 present with or without this file, all in `tests/test_queue_runway.py`
@@ -254,20 +397,28 @@ within 100 columns.
 
 ## 7. Exact remaining gaps
 
-1. **The suite does not pass on the owner final head either.** Four invariants still do not pass at
-   `9d2bd8db` — D2, D3, D4 and D5 (§3). Until the source owner repairs them — or records why the
+1. **The suite does not pass on the published head.** Seven invariants do not pass at `9d2bd8db` —
+   D2, D3, D4, D5, D6, D7 and D8 (§3). Until the source owner repairs them — or records why the
    invariant is wrong — this branch cannot be qualified.
-2. **The owner final head is not green in the repository's own suite either.** 7 tests in
-   `tests/test_queue_runway.py` fail at both `f4f26de` and `9d2bd8db` (§6). They are the runtime
-   owner's, and they are in the same queue-history area as D3.
-3. **D1 is repaired and kept as a regression.** Its test stays in the suite and now passes on
-   `9d2bd8db`; it is not deleted, so the repair remains covered.
-4. **D1–D5 are observations, not verdicts.** The owner may show that an invariant is wrong; this
+2. **The published head is not green in the repository's own suite either.** 7 tests in
+   `tests/test_queue_runway.py` fail at `9d2bd8db` with or without this qualification (§6). They
+   are the runtime owner's, and they are in the same queue-history area as D3.
+3. **D1 is repaired and kept as a regression.** Its test is retained in the suite and now passes on
+   `9d2bd8db`; it is not deleted, so the repair stays covered.
+4. **The owner's continuation has not published a head.** Task
+   `20261021-w5-fleet-lifecycle-seven-final-review-findings-repair-09` was still working with an
+   **uncommitted** tree when this ran (§1). That tree was not read and not integrated. When it
+   reaches a published checked head, the same suite must be re-run against that immutable head;
+   qualification is declared only if it passes there.
+5. **The published head could not be re-fetched for a second confirmation.** This worker has no
+   GitHub authorization, so `git ls-remote` fails (§1). The head this qualification ran against is
+   the commit `9d2bd8db` itself, and the local remote-tracking ref names it.
+6. **D1–D8 are observations, not verdicts.** The owner may show that an invariant is wrong; this
    document then records that, exactly as the earlier Fleet audits record withdrawn claims
    instead of editing them away.
-5. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
+7. **The native and production limits in §5 are not closed by this suite.** Closing them needs a
    disposable native CLI and a disposable fleet, which are outside this outcome's scope and outside
    its authority.
-6. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
+8. **The two owned paths are the whole delta.** No Fleet runtime, CLI, roster, existing test or
    documentation file was modified, and no live manager, session, configuration, registered
    worktree or resource was touched.
