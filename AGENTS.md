@@ -51,6 +51,13 @@ command prints JSON on stdout and exits non-zero on failure.
   authorization and dispatch revalidate the same record and fail closed if it is missing or the
   checkout changed. An adoption ID reused with an altered reference, evidence excerpt, decision,
   or any other field is rejected; an exact replay remains idempotent across restart.
+  The adoption also proves the native session it names, exactly as the direct-turn receipt
+  does: the session row is read from the native database and must still be the session the
+  roster names, in the recorded working directory. A native identity that has gone stale (the
+  session row is gone, or it points at another directory) is refused, and the adoption records
+  nothing. The same proof runs again when the adoption is consumed by `recover-opencode`, so a
+  session that went stale between the adoption and the authorization reserves no worker, no
+  worktree and no successor.
   A genuine native turn that predates the Fleet task ledger has no owner task row at all. For
   that case `bin/fleet recover-opencode --direct-turn-receipt PATH` is the ownership source
   instead of `--ownership-task` or `--adoption-id`; exactly one ownership source is accepted. The
@@ -172,7 +179,10 @@ command prints JSON on stdout and exits non-zero on failure.
   is unknown. A queue entry that is already in the task ledger was imported: it is history, and it
   does not block a removal. A worker whose state explicitly says it is running is never
   removed, and `--allow-unverified-native` does not override that: it only covers a native identity
-  that cannot be read at all. The native session and its history are kept, and no hold, task, queue
+  that cannot be read at all. A stale native identity — the row was read and it is gone, or it
+  points at another directory — is refused under the override as well: the override covers an
+  identity that cannot be read at all, never one that was read and does not name the session the
+  roster holds. The native session and its history are kept, and no hold, task, queue
   entry, worktree or credential is touched. There is no second removal path: a receipt-owned worker
   leaves the roster only through this command, with these barriers. The removal also converges: if
   it was interrupted between the roster write and the receipt write, the record and the roster

@@ -112,6 +112,40 @@ while a recovery holds the session, and while the native identity cannot be veri
 that is known to be running is never removed. After the manager is upgraded to a build that
 honours `draining`, the pause is no longer needed for the drain window.
 
+## Stale identity and the ownership adoption
+
+Two lifecycle facts are proved by the source rather than by an operator's judgement, and both
+are about a worker whose identity is no longer the one the roster records.
+
+- **A stale native identity is refused, not adopted.** The native session row is read from the
+  native database and must still be the session the roster names, in the recorded working
+  directory. The ownership adoption (`bin/fleet adopt-ownership`) proves that before it
+  records the operator's evidence, and the same proof runs again when the adoption is
+  consumed by `bin/fleet recover-opencode`. A session that has gone stale — the row is gone,
+  or it points at another directory — is refused: the adoption records nothing, and the
+  authorization reserves no worker, no worktree and no successor. The direct-turn receipt
+  path proves the same native session, and the launch proves it again before a turn runs.
+- **A stale identity never becomes a removal shortcut.** The removal still refuses while the
+  native identity cannot be verified, and the operator override covers only an identity that
+  cannot be read at all: a worker that is known to be running is never removed, and no hold,
+  task, queue entry, worktree or native session is touched by the override.
+
+The offline proof for this is `tests/test_stale_identity_adoption.py`. It owns a disposable
+native session identity next to a managed turn pointer, its turn receipts and a task ledger,
+so the proofs run against a real identity row: a stale identity is refused and records
+nothing, an identity that points at another directory is refused, a session that went stale
+after the adoption reserves nothing, and the proved identity authorizes the adopted recovery
+while the owner task's own message is never rewritten. The removal is proved there as well,
+against the same identity bound to a roster entry: a stale identity is refused even under the
+operator override, an identity that points at another directory is refused under the override
+too, and an identity that cannot be read at all is removed only with the override, which
+leaves every hold, task, queue entry, worktree and the native session untouched.
+
+What this does not do: it does not qualify the live manager, start a second manager, replace
+the pinned manager, change a credential, a permission or a model, clear a hold, or create a
+worker. The live qualification of the same paths against the pinned manager stays a separate,
+separately permitted step, and the periods and holds stay exactly as they are.
+
 ## Withdrawing a request
 
 There is no rollback command, because a fast path around the removal barriers is a way to lose

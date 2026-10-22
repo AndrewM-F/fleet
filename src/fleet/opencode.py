@@ -37,6 +37,16 @@ _MAX_EVENT_LINE_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 
 
+class NativeIdentityMismatch(ValueError):
+    """The native identity was read, and it does not name the roster's session.
+
+    The native database could be read and the row it holds is gone, or it points
+    at another directory. That is a fact about the identity, not an absence of
+    evidence: an override for an identity that cannot be read at all never
+    covers it, and a stale identity never becomes a removal shortcut.
+    """
+
+
 def _validate_model(model):
     if not isinstance(model, str) or model not in APPROVED_MODELS:
         raise ValueError("OpenCode model must be an exact approved free model ID; fallbacks are not allowed")
@@ -252,14 +262,16 @@ def verify_native_session(sid, cwd, database_path):
     except sqlite3.Error as error:
         raise ValueError("OpenCode native session database could not be read safely") from error
     if not row:
-        raise ValueError("OpenCode native session ID does not exist; refusing to let the CLI create it")
+        raise NativeIdentityMismatch(
+            "OpenCode native session ID does not exist; refusing to let the CLI create it")
     try:
         actual_cwd = Path(os.path.expanduser(row[1])).resolve()
     except (TypeError, OSError, RuntimeError) as error:
         raise ValueError("OpenCode native session directory is invalid") from error
     configured_cwd = Path(cwd).resolve()
     if actual_cwd != configured_cwd:
-        raise ValueError("OpenCode native session directory differs from configured cwd")
+        raise NativeIdentityMismatch(
+            "OpenCode native session directory differs from configured cwd")
     native_provider, native_model = _native_model_parts(row[3])
     return {"databasePath": str(db_path), "projectId": row[2], "nativeModel": row[3],
             "nativeModelProvider": native_provider, "nativeModelId": native_model,

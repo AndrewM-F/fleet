@@ -618,7 +618,7 @@ def main(argv=None):
     p.add_argument("--session", required=True)
     p.add_argument("--note", default="", help="operator note recorded with the receipt")
     p.add_argument("--allow-unverified-native", action="store_true",
-                   help="operator override for a native identity that cannot be read back")
+                   help="operator override for a native identity that cannot be read at all")
     p.set_defaults(fn=cmd_remove_opencode)
     sub.add_parser("supervise", help="restart dead components every 30s (launchd runs this)").set_defaults(
         fn=lambda a: ops.supervise())
