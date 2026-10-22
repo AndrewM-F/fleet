@@ -104,10 +104,17 @@ class StaleIdentityAdoptionTests(unittest.TestCase):
                            (session_id or self.sid, str(Path(directory).resolve()),
                             "project-test", model))
 
-    def drop_native_identity(self):
-        """Make the native identity stale: the session row is gone."""
+    def delete_native_identity_row(self):
+        """Make the native identity stale: the row the roster names is gone.
+
+        The table stays. The native database can still be read, and what makes
+        the identity stale is that the row it no longer holds is not the row
+        the roster names. That is the fact these proofs are about - an
+        identity that was read and does not match - and not the absence of a
+        database, which is a different case with a different answer.
+        """
         with sqlite3.connect(self.native_db) as native:
-            native.execute("DROP TABLE IF EXISTS session_v2")
+            native.execute("DELETE FROM session_v2 WHERE id=?", (self.sid,))
 
     def prepare_failure(self):
         """The managed turn that failed, with its pointer and its receipts."""
@@ -169,7 +176,7 @@ class StaleIdentityAdoptionTests(unittest.TestCase):
         self.assertEqual(record["owner_task_id"], self.owner_task)
 
     def test_a_stale_native_identity_is_refused_and_records_nothing(self):
-        self.drop_native_identity()
+        self.delete_native_identity_row()
         with self.assertRaisesRegex(ValueError, "native session identity"):
             self.adopt()
         self.assertIsNone(recovery.adoption_record(self.db, "adoption-1"))
@@ -187,7 +194,7 @@ class StaleIdentityAdoptionTests(unittest.TestCase):
 
     def test_a_session_that_went_stale_after_the_adoption_reserves_nothing(self):
         self.adopt()
-        self.drop_native_identity()
+        self.delete_native_identity_row()
         with self.assertRaisesRegex(ValueError, "native session identity"):
             self.authorize()
         self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
@@ -208,6 +215,24 @@ class StaleIdentityAdoptionTests(unittest.TestCase):
                          json.dumps({"message": "create the isolated worktree and branch for this "
                                                "work, then continue", "sessionId": self.sid,
                                      "rootAuthorized": True}))
+
+
+class _UnreadableDatabase:
+    """A native database read that fails the way a locked or damaged file fails.
+
+    The failure is injected at the read boundary instead of being produced by
+    the file's permissions. A permission bit does not prove unreadability when
+    the suite runs privileged - a privileged reader ignores it - so a chmod
+    could not carry the claim, and the proof would depend on who ran it. Here
+    the read fails for everybody, and the real verification code runs above
+    the injection, so the classification it makes is the one under test.
+    """
+
+    Error = sqlite3.Error
+
+    @staticmethod
+    def connect(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
 
 
 class StaleIdentityRemovalTests(unittest.TestCase):
@@ -272,8 +297,8 @@ class StaleIdentityRemovalTests(unittest.TestCase):
                            (self.sid, str(Path(directory).resolve()),
                             "project-test", opencode.MODEL))
 
-    def drop_native_identity(self):
-        """Make the native identity stale: the session row is gone."""
+    def delete_native_identity_row(self):
+        """Make the native identity stale: the row the roster names is gone."""
         with sqlite3.connect(self.native_db) as native:
             native.execute("DELETE FROM session_v2 WHERE id=?", (self.sid,))
 
@@ -288,7 +313,7 @@ class StaleIdentityRemovalTests(unittest.TestCase):
     def test_a_stale_native_identity_is_refused_even_with_the_override(self):
         # The native database was read and the row it holds is gone. That is a
         # fact about the worker, so the override does not cover it.
-        self.drop_native_identity()
+        self.delete_native_identity_row()
         before = self.native_db.read_bytes()
         with self.assertRaises(ValueError) as error:
             self.remove(allow_unverified_native=True)
@@ -315,13 +340,12 @@ class StaleIdentityRemovalTests(unittest.TestCase):
                                           "tasks": [{"id": "q-1", "sessionId": "ses_other",
                                                      "message": "m"}]}))
         original = self.native_db.read_bytes()
-        # The native database cannot be opened at all: the identity cannot be
-        # read, which is the only case the operator override covers.
-        self.native_db.chmod(0o000)
-        try:
+        # The native database cannot be read at all: the identity cannot be
+        # read, which is the only case the operator override covers. The read
+        # failure is injected at the boundary rather than produced by the
+        # file's permissions, so the proof holds whoever runs the suite.
+        with patch.object(opencode, "sqlite3", _UnreadableDatabase):
             result = self.remove(allow_unverified_native=True)
-        finally:
-            self.native_db.chmod(0o600)
         self.assertTrue(result["removed"])
         self.assertTrue(result["nativeSessionKept"])
         self.assertEqual(self.roster(), [])
