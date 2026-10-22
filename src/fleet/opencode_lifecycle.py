@@ -1250,10 +1250,13 @@ def remove_session(db, session_id, note="", allow_unverified_native=False):
     The removal refuses while a task or a turn is queued, in flight or
     uncertain, while a task for the worker is still waiting in the root-authored
     queue file, while a recovery holds the session, and while the native turn
-    state explicitly says the worker is running. The operator override only
-    covers a native identity that cannot be read at all; it never overrides a
-    known active worker. Nothing is cancelled, no hold is released, no queue
-    entry is touched and no native session is deleted.
+    state explicitly says the worker is running. A stale native identity - the
+    session row is gone, or it points at another directory - is refused as well:
+    the operator override only covers a native identity that cannot be read at
+    all; it never overrides a known active worker and never covers an identity
+    that was read and does not name the session the roster holds. Nothing is
+    cancelled, no hold is released, no queue entry is touched and no native
+    session is deleted.
 
     There is no other removal path: a receipt-owned worker leaves the roster
     only through this command, with these barriers.
@@ -1271,7 +1274,9 @@ def _removal_barriers(db, cfg, session_id, entry, allow_unverified_native):
     task for it is still waiting to be imported, while a recovery holds the
     session, and while the native turn state says the worker is active. The
     operator override only covers a native identity that cannot be read at all;
-    it never covers a worker that is known to be running.
+    it never covers a worker that is known to be running, and it never covers a
+    stale identity - the row that was read is gone, or it points at another
+    directory.
     """
     outstanding = _outstanding_tasks(db, session_id)
     try:
@@ -1307,14 +1312,21 @@ def _removal_barriers(db, cfg, session_id, entry, allow_unverified_native):
             raise ValueError("The native turn state of this worker could not be verified "
                              f"('{native_state}'); the removal is refused because the "
                              "ownership of the native session cannot be proven")
-    else:
-        try:
-            opencode.verify_native_session(session_id, entry.get("cwd"),
-                                           entry.get("databasePath"))
-        except (ValueError, OSError) as error:
-            if not allow_unverified_native:
-                raise ValueError("The native identity of this session could not be "
-                                 "verified: " + str(error)) from error
+    # The native identity is proved on every path, including the one the
+    # operator override covers. A stale identity is a fact, not an absence of
+    # evidence: the native database was read and the row it holds is gone, or
+    # it points at another directory. The override covers an identity that
+    # cannot be read at all, so it never covers that one.
+    try:
+        opencode.verify_native_session(session_id, entry.get("cwd"),
+                                       entry.get("databasePath"))
+    except opencode.NativeIdentityMismatch as error:
+        raise ValueError("The native identity of this session could not be "
+                         "verified: " + str(error)) from error
+    except (ValueError, OSError) as error:
+        if not allow_unverified_native:
+            raise ValueError("The native identity of this session could not be "
+                             "verified: " + str(error)) from error
 
 
 def _complete_removed_receipt(db, session_id, note, allow_unverified_native):

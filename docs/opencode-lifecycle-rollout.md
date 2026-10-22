@@ -135,7 +135,11 @@ native session identity next to a managed turn pointer, its turn receipts and a 
 so the proofs run against a real identity row: a stale identity is refused and records
 nothing, an identity that points at another directory is refused, a session that went stale
 after the adoption reserves nothing, and the proved identity authorizes the adopted recovery
-while the owner task's own message is never rewritten.
+while the owner task's own message is never rewritten. The removal is proved there as well,
+against the same identity bound to a roster entry: a stale identity is refused even under the
+operator override, an identity that points at another directory is refused under the override
+too, and an identity that cannot be read at all is removed only with the override, which
+leaves every hold, task, queue entry, worktree and the native session untouched.
 
 What this does not do: it does not qualify the live manager, start a second manager, replace
 the pinned manager, change a credential, a permission or a model, clear a hold, or create a

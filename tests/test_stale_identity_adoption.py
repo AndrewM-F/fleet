@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fleet import opencode, paths, recovery, store  # noqa: E402
+from fleet import opencode, opencode_lifecycle, paths, recovery, store  # noqa: E402
 
 
 class StaleIdentityAdoptionTests(unittest.TestCase):
@@ -208,6 +208,131 @@ class StaleIdentityAdoptionTests(unittest.TestCase):
                          json.dumps({"message": "create the isolated worktree and branch for this "
                                                "work, then continue", "sessionId": self.sid,
                                      "rootAuthorized": True}))
+
+
+class StaleIdentityRemovalTests(unittest.TestCase):
+    """A stale identity is never a removal shortcut.
+
+    The same disposable native identity the adoption proofs use is here bound to
+    a roster entry, so the removal barriers run against a real identity row. An
+    identity that was read and does not name the session the roster holds - the
+    row is gone, or it points at another directory - is a fact about the
+    worker, not an absence of evidence: the operator override covers only an
+    identity that cannot be read at all, and it never touches a hold, a task, a
+    queue entry, a worktree or the native session.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cwd = self.root / "worker"
+        self.cwd.mkdir()
+        self.other_cwd = self.root / "other-worker"
+        self.other_cwd.mkdir()
+        self.sid = "ses_stale_removal"
+        self.native_db = self.root / "native.db"
+        self.slot = {"sessionId": self.sid, "cwd": str(self.cwd.resolve()),
+                     "sessionCwd": str(self.cwd.resolve()),
+                     "databasePath": str(self.native_db), "model": opencode.MODEL,
+                     "provider": "opencode", "dispatchEnabled": True}
+        self.write_native_identity(self.cwd)
+        self.db_path = self.root / "fleet.sqlite"
+        self.db = store.database(self.db_path)
+        self.addCleanup(self.db.close)
+        self.addCleanup(self.tmp.cleanup)
+        self.data = self.root / "data"
+        self.queue = self.data / "queue.json"
+        self.queue.parent.mkdir(parents=True, exist_ok=True)
+        for name, value in (("OPENCODE", self.data / "opencode"), ("LOGS", self.root / "logs"),
+                            ("BIN", self.root / "bin" / "fleet"), ("QUEUE", self.queue),
+                            ("QUEUE_LOCK", self.data / "queue.lock"),
+                            ("PAUSE", self.data / "dispatch.paused"), ("DATA", self.data)):
+            patcher = patch.object(paths, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fake = self.root / "fake-opencode"
+        self.fake.write_text("#!/bin/sh\nexit 0\n")
+        self.fake.chmod(0o755)
+        self.config_path = self.root / "synthetic-fleet.json"
+        self.config_path.write_text(json.dumps(
+            {"executables": {"opencode": str(self.fake)},
+             "pi": [], "claude": [], "opencode": [self.slot]}))
+        config_patcher = patch.object(paths, "CONFIG", self.config_path)
+        config_patcher.start()
+        self.addCleanup(config_patcher.stop)
+
+    # --- the disposable owned identity and the roster -----------------------
+    def write_native_identity(self, directory):
+        """Record the native session identity this fixture owns."""
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("CREATE TABLE IF NOT EXISTS session_v2 (id TEXT, directory TEXT, "
+                           "project_id TEXT, model TEXT)")
+            native.execute("DELETE FROM session_v2")
+            native.execute("INSERT INTO session_v2 VALUES (?,?,?,?)",
+                           (self.sid, str(Path(directory).resolve()),
+                            "project-test", opencode.MODEL))
+
+    def drop_native_identity(self):
+        """Make the native identity stale: the session row is gone."""
+        with sqlite3.connect(self.native_db) as native:
+            native.execute("DELETE FROM session_v2 WHERE id=?", (self.sid,))
+
+    def roster(self):
+        return paths.config().get("opencode", [])
+
+    def remove(self, **kwargs):
+        return opencode_lifecycle.remove_session(self.db, self.sid, note="operator decision",
+                                                 **kwargs)
+
+    # --- the proofs ---------------------------------------------------------
+    def test_a_stale_native_identity_is_refused_even_with_the_override(self):
+        # The native database was read and the row it holds is gone. That is a
+        # fact about the worker, so the override does not cover it.
+        self.drop_native_identity()
+        before = self.native_db.read_bytes()
+        with self.assertRaises(ValueError) as error:
+            self.remove(allow_unverified_native=True)
+        self.assertIn("verified", str(error.exception))
+        # The roster still holds the worker and the native database is untouched.
+        self.assertEqual(len(self.roster()), 1)
+        self.assertEqual(self.native_db.read_bytes(), before)
+
+    def test_an_identity_that_points_elsewhere_is_refused_even_with_the_override(self):
+        self.write_native_identity(self.other_cwd)
+        with self.assertRaises(ValueError) as error:
+            self.remove(allow_unverified_native=True)
+        self.assertIn("verified", str(error.exception))
+        self.assertEqual(len(self.roster()), 1)
+
+    def test_an_identity_that_cannot_be_read_at_all_may_be_removed_with_the_override(self):
+        # A hold, a finished task and a root-authored queue entry that belong to
+        # other work: the override touches none of them.
+        self.db.execute("INSERT INTO task_holds VALUES ('t-other','held','held',1,1)")
+        self.db.execute("INSERT INTO tasks VALUES ('t-done','t-other',?,?,?,?)",
+                        (str(self.cwd), json.dumps({"message": "m"}), "finished", 1))
+        self.db.commit()
+        self.queue.write_text(json.dumps({"author": "root",
+                                          "tasks": [{"id": "q-1", "sessionId": "ses_other",
+                                                     "message": "m"}]}))
+        original = self.native_db.read_bytes()
+        # The native database cannot be opened at all: the identity cannot be
+        # read, which is the only case the operator override covers.
+        self.native_db.chmod(0o000)
+        try:
+            result = self.remove(allow_unverified_native=True)
+        finally:
+            self.native_db.chmod(0o600)
+        self.assertTrue(result["removed"])
+        self.assertTrue(result["nativeSessionKept"])
+        self.assertEqual(self.roster(), [])
+        # Nothing else is cancelled, released, dropped or deleted.
+        self.assertEqual(self.db.execute("SELECT status FROM task_holds WHERE task_id='t-other'")
+                         .fetchone()[0], "held")
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id='t-done'").fetchone()[0],
+                         "finished")
+        self.assertEqual(json.loads(self.queue.read_text())["tasks"],
+                         [{"id": "q-1", "sessionId": "ses_other", "message": "m"}])
+        self.assertEqual(self.native_db.read_bytes(), original)
 
 
 if __name__ == "__main__":

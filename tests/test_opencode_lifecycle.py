@@ -702,12 +702,17 @@ class RemovalRefusalTests(Sandbox):
         self.assertEqual(len(self.roster()), 1)
 
     def test_the_operator_override_is_recorded_and_removes_the_roster_entry(self):
-        with sqlite3.connect(self.native) as db:
-            db.execute("DELETE FROM session_v2 WHERE id=?", (self.existing,))
+        # The native database is gone, so the identity cannot be read at all.
+        # That is the only case the operator override covers; a stale identity
+        # - a row that was read and does not name the session - is refused.
+        self.native.unlink()
         result = opencode_lifecycle.remove_session(self.db, self.existing, note="operator decision",
                                                     allow_unverified_native=True)
         self.assertTrue(result["removed"])
+        self.assertTrue(result["nativeSessionKept"])
         self.assertEqual(self.roster(), [])
+        kinds = [row[0] for row in self.db.execute("SELECT kind FROM events ORDER BY id")]
+        self.assertIn("opencode_session_removed", kinds)
 
     def test_removal_keeps_the_native_session_and_every_hold(self):
         self.db.execute("INSERT INTO task_holds VALUES ('t-other','held','held',1,1)")

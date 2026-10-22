@@ -179,7 +179,10 @@ command prints JSON on stdout and exits non-zero on failure.
   is unknown. A queue entry that is already in the task ledger was imported: it is history, and it
   does not block a removal. A worker whose state explicitly says it is running is never
   removed, and `--allow-unverified-native` does not override that: it only covers a native identity
-  that cannot be read at all. The native session and its history are kept, and no hold, task, queue
+  that cannot be read at all. A stale native identity — the row was read and it is gone, or it
+  points at another directory — is refused under the override as well: the override covers an
+  identity that cannot be read at all, never one that was read and does not name the session the
+  roster holds. The native session and its history are kept, and no hold, task, queue
   entry, worktree or credential is touched. There is no second removal path: a receipt-owned worker
   leaves the roster only through this command, with these barriers. The removal also converges: if
   it was interrupted between the roster write and the receipt write, the record and the roster
