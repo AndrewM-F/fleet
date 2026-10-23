@@ -1,8 +1,9 @@
 # fleet
 
 Local, repo-independent manager that dispatches explicit root-authorized tasks to existing
-Pi (RPC) and Claude (`--print`) worker sessions, relays completions with receipts, and never
-calls a model in the control path. Agents: read [AGENTS.md](AGENTS.md).
+Pi (RPC), Claude (`--print`), and explicitly rostered OpenCode CLI worker sessions, relays
+completions with receipts, and never calls a model in the control path. Agents: read
+[AGENTS.md](AGENTS.md).
 
 ## Setup
 Python 3.11+, `pi` and `claude` on PATH (or set `executables` in config).
@@ -36,7 +37,8 @@ python3 -m unittest discover -s tests -t .
 bin/fleet          CLI          src/fleet/   manager, dispatch, events, control, pi, claude, store, paths
 config/            example (tracked) + fleet.local.json (ignored)
 data/              fleet.sqlite (authoritative), queue.json, status.json, dispatch.paused,
-                   receipts/, claude/<sid>/<turn>/ (request/state/result), lanes/<lane>/
+                   receipts/, claude/<sid>/<turn>/ and opencode/<sid>/turns/<turn>/
+                   (request/state/result), lanes/<lane>/
                    (commands.jsonl, controller.json, records/), records/ (relays, migration manifest)
 logs/              manager/, lanes/<lane>/ (events, stderr, controller), claude/<sid>/<turn>/ — rotated
 tests/ docs/ scripts/ (db-check, link-claude-transcripts, rehome-pi-session)

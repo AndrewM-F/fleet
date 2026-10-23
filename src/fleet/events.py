@@ -99,8 +99,7 @@ def capture(db, event_id, body, created):
     receipt = {"captureVersion": CAPTURE_VERSION,
                "eventId": event_id, "taskId": tid, "sessionId": sid,
                "completedAt": created, "state": body.get("state")}
-    pi_slots, claude_slots = paths.slots()
-    slot = next((s for s in pi_slots + claude_slots if s["sessionId"] == sid), None)
+    slot = next((s for s in paths.all_slots() if s["sessionId"] == sid), None)
     task = db.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()
     if not slot or not task:
         receipt["captureError"] = "Task or current roster entry unavailable"
@@ -108,7 +107,10 @@ def capture(db, event_id, body, created):
         task = json.loads(task[0])
         receipt.update(model=slot["model"], effort=slot.get("effort", slot.get("thinking")),
                        cwd=slot["cwd"])
-        if slot.get("mode") == "print":
+        if slot.get("provider") == "opencode":
+            from . import opencode
+            receipt.update(opencode.receipt(sid, tid, slot))
+        elif slot.get("mode") == "print":
             matches = []
             for request_file in claude.session_dir(sid).glob("*/request.json"):
                 request = json.loads(request_file.read_text())

@@ -43,7 +43,8 @@ def check_queue(db, slots, states, paused=False, minimum=1, now=None,
         runway = queue_runway(db, minimum)
     eligible = {
         sid for sid, slot in slots.items()
-        if (slot.get("provider") != "claude" or slot.get("dispatchEnabled", False))
+        if (slot.get("provider") not in {"claude", "opencode"}
+            or slot.get("dispatchEnabled", False))
         and states.get(sid, {}).get("state") in IDLE | BUSY
     }
     missing = []

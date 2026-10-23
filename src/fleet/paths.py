@@ -18,6 +18,7 @@ MANAGER_LOCK = DATA / "manager.lock"
 QUEUE_LOCK = DATA / "queue.lock"
 RECEIPTS = DATA / "receipts"
 CLAUDE = DATA / "claude"
+OPENCODE = DATA / "opencode"
 
 
 def config(path=None):
@@ -46,6 +47,28 @@ def slots(cfg=None):
                 slot[key] = _expand(slot[key])
         claude.append(slot)
     return pi, claude
+
+
+def opencode_slots(cfg=None):
+    """Return configured OpenCode sessions with their native provider tagged."""
+    cfg = config() if cfg is None else cfg
+    result = []
+    for raw in cfg.get("opencode", []):
+        slot = dict(raw, provider="opencode")
+        for key in ("cwd", "sessionCwd"):
+            if key in slot:
+                slot[key] = _expand(slot[key])
+        result.append(slot)
+    return result
+
+
+def all_slots(cfg=None):
+    """Return every configured worker while keeping the legacy provider pair stable."""
+    pi, claude = slots(cfg)
+    # Legacy unit fixtures often replace the provider pair without creating a config file.
+    if cfg is None and not CONFIG.exists():
+        return pi + claude
+    return pi + claude + opencode_slots(cfg)
 
 
 def known_cwds(slot):

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from . import claude, paths, pi
+from . import claude, opencode, paths, pi
 from .store import database, emit
 from .util import atomic
 
@@ -78,12 +78,13 @@ def cancel(db, task_id, note):
     if not row or row[1] not in {"sent", "running"}:
         raise ValueError("Only queued/sent/running tasks can be cancelled")
     sid = row[0]
-    pi_slots, claude_slots = paths.slots()
-    slot = next((s for s in pi_slots + claude_slots if s["sessionId"] == sid), None)
+    slot = next((s for s in paths.all_slots() if s["sessionId"] == sid), None)
     if slot is None:
         raise ValueError("Worker not in configuration")
     if slot["provider"] == "pi":
         action = pi.send(slot["lane"], {"type": "abort", "id": "fleet-cancel-" + task_id})
+    elif slot["provider"] == "opencode":
+        action = opencode.cancel(slot)
     elif slot.get("mode") == "print":
         state = claude.print_state(slot)
         launch = json.loads((claude.session_dir(sid) / "current.json").read_text())
@@ -123,7 +124,8 @@ def _check_cwd(cfg, cwd):
 
 
 def _ids(cfg):
-    return {s["sessionId"] for s in cfg.get("pi", []) + cfg.get("claude", [])}
+    return {s["sessionId"] for s in
+            cfg.get("pi", []) + cfg.get("claude", []) + cfg.get("opencode", [])}
 
 
 def add_pi(lane, cwd, session_file, provider, model, thinking, api_provider=None, role=None):
@@ -172,10 +174,12 @@ def remove(session_id):
     for slot in cfg.get("pi", []):
         if slot["sessionId"] == session_id and pi.running(slot["lane"]):
             raise ValueError("Stop the lane controller first (bin/fleet stop --lane)")
-    before = len(cfg.get("pi", [])) + len(cfg.get("claude", []))
+    before = (len(cfg.get("pi", [])) + len(cfg.get("claude", []))
+              + len(cfg.get("opencode", [])))
     cfg["pi"] = [s for s in cfg.get("pi", []) if s["sessionId"] != session_id]
     cfg["claude"] = [s for s in cfg.get("claude", []) if s["sessionId"] != session_id]
-    if before == len(cfg["pi"]) + len(cfg["claude"]):
+    cfg["opencode"] = [s for s in cfg.get("opencode", []) if s["sessionId"] != session_id]
+    if before == len(cfg["pi"]) + len(cfg["claude"]) + len(cfg["opencode"]):
         raise ValueError("Session not configured")
     _write_config(cfg)
     return {"removed": session_id, "note": "native session history left in place"}
@@ -207,6 +211,8 @@ def rotate_live_logs():
         logs = paths.lane_logs(slot["lane"])
         candidates += [logs / "events.jsonl", logs / "stderr.log", logs / "controller.log",
                        paths.lane_dir(slot["lane"]) / "commands.jsonl"]
+    for slot in paths.opencode_slots():
+        candidates.append(paths.LOGS / "opencode" / slot["sessionId"] / "events.jsonl")
     for path in candidates:
         if copytruncate(path, max_bytes, keep):
             rotated.append(str(path))

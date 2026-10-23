@@ -1,7 +1,8 @@
 # Fleet operating contract (for any agent: Claude, Codex, Pi, scripts)
 
 This directory is a small local manager that sends **root-authorized** tasks to existing
-Pi and Claude worker sessions. It never calls a model itself. Use `bin/fleet` for lifecycle and queue control; every
+Pi and Claude sessions and explicitly rostered existing OpenCode sessions. OpenCode turns call
+the configured CLI model only after root authorizes a queued task. Use `bin/fleet` for lifecycle and queue control; every
 command prints JSON on stdout and exits non-zero on failure.
 
 ## Safe, read-only
@@ -30,7 +31,12 @@ command prints JSON on stdout and exits non-zero on failure.
 
 ## Rules
 1. Never create, replace or duplicate worker sessions; identities live in
-   `config/fleet.local.json` (one entry per session).
+   `config/fleet.local.json` (one entry per session). OpenCode entries must reference an existing
+   `ses_` session, carry its independently checked native directory in `sessionCwd`, pin
+   `opencode/deepseek-v4.1-flash-free`, and leave `dispatchEnabled` false until the root authorizes
+   enabling that worker. Before enabling it, verify the session is exclusive, inspect merged config
+   so auxiliary models are pinned to the free model or disabled, and complete an exact-model free
+   canary. Never use a paid provider, agent override, or fallback for this roster.
 2. Never resend a task in state `uncertain`; inspect the worker and enqueue a new task ID.
 3. Acknowledge an event only after you have acted on it; unacked events persist across restarts.
 4. Don't edit `data/` by hand. Stop the fleet and run `scripts/db-check` before copying or moving it.

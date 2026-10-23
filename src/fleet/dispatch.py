@@ -23,7 +23,7 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         state = states.get(sid, {})
         if state.get("state") not in {"idle", "done", "completed", "stopped"}:
             continue
-        if slot.get("provider") == "claude" and not slot.get("dispatchEnabled", False):
+        if slot.get("provider") in {"claude", "opencode"} and not slot.get("dispatchEnabled", False):
             continue
         if any(other != sid and s["state"] in (BUSY | {"blocked"}) and
                s.get("cwd") and str(Path(s["cwd"]).resolve()) == cwd
@@ -42,7 +42,10 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         if claimed.rowcount != 1:
             continue  # An operator cancelled this task after the queue snapshot.
         try:
-            sender(slot, task["message"])
+            if slot.get("provider") == "opencode":
+                sender(slot, task["message"], task_id=task_id)
+            else:
+                sender(slot, task["message"])
         except Exception as error:
             db.execute("UPDATE tasks SET state='uncertain' WHERE id=?", (task_id,))
             emit(db, "task_uncertain", taskId=task_id, sessionId=sid, error=str(error))
@@ -54,7 +57,7 @@ def dispatch(db, slots, states, sender, paused=False, max_concurrent=0):
         states[sid] = dict(state, state="queued")
 
 
-def send(slot, message):
+def send(slot, message, task_id=None):
     if slot["provider"] == "pi":
         current = pi.query(slot)
         if current is None or current["state"] != "idle":
@@ -62,5 +65,8 @@ def send(slot, message):
         pi.query(slot, message)
     elif slot.get("mode") == "print":
         claude.send_print(slot, message)
+    elif slot.get("provider") == "opencode":
+        from . import opencode
+        opencode.send(slot, message, task_id)
     else:
         claude.send_native(slot, message)
