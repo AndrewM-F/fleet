@@ -59,6 +59,7 @@ executable in a temporary directory.
 | `recovery/worktree-prune-20261023-fafdf5b` | `fafdf5bd902ccddf471fcdd0f398d7abc880e68a` | 43 | recorded green at `20670971` |
 | `recovery/worktree-prune-20261023-c60b99e` | `c60b99e2125da085b41249bec372fc4d26752ebb` | 50 | the receipt-transition guard at `8ef01717` |
 | `recovery/worktree-prune-20261023-9ed5c02` | `9ed5c02f24e478ba07cbad7ddcdd53bb5cef7c22` | 61 | seven new lifecycle and recovery cases at `17890950` |
+| `codex/20261021-w8-independent-lifecycle-qualification-on-main` | `6ec9d23d3948fffb161b6d925a4cc5a38f8aea7d` | 61 | the same suite carried onto the merged owner head `c25f8fd7`; its test blob `9488b52eced3471a2e68a2989c55a54fb158dfe0` and doc blob `0cc826eb51088831b8b1fd331eaf9393eab4447c` equal `9ed5c02`'s |
 
 The earlier counts belong to the heads they were run on. None of them is
 evidence for any later head, including this one.
