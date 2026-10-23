@@ -47,9 +47,11 @@ bin/fleet add-opencode --target-total 25 --model opencode-go/minimax-m3.1-flash-
 
 `--target-total` states the size the roster should reach, so one command reaches it: from eight
 workers it adds exactly seventeen and the roster ends at twenty-five, not twenty-six. The dry
-run writes nothing at all — no receipt, no roster entry, no native state — and it also consults
-the installed CLI's own schema, so the report says whether the creation call is proved
-provider-free before anything is created.
+run writes nothing at all — no receipt, no roster entry, no native state. It verifies the native
+identity of a session it would reconcile, and it does **not** consult the installed CLI's own
+schema: that qualification belongs to the creation path, which proves the call before the request
+is sent. The dry run's report therefore says nothing about whether the creation call is proved
+provider-free, and this stage's later account of the dry run says the same thing.
 
 ## Stage 3 — the creation path is proved against the installed CLI
 

@@ -349,6 +349,22 @@ class DryRunWriteTests(FindingSandbox):
                                          "WHERE request_key='w5-dry-001'").fetchone()[0],
                          "creating")
 
+    def test_a_dry_run_does_not_qualify_the_native_schema(self):
+        # The documented contract: a dry run writes nothing, and it does not
+        # consult the installed CLI's own schema. The schema is qualified on
+        # the creation path, before the request is sent, so the dry run's
+        # report says nothing about whether the call is proved provider-free.
+        def refuse_probe(executable, timeout=None):
+            raise AssertionError("the dry run consulted the installed CLI's own schema")
+
+        with patch.object(opencode_lifecycle, "verify_native_api_support", refuse_probe):
+            result = opencode_lifecycle.add_sessions(
+                self.db, count=1, model=MODEL, cwd=str(self.wt), root=str(self.root),
+                request_key="w5-dry-003", dry_run=True)
+        self.assertTrue(result["dryRun"])
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM opencode_sessions").fetchone()[0], 0)
+
     def test_a_dry_run_with_a_named_session_writes_nothing(self):
         identifier = "ses_NAMED0000000000001"
         with sqlite3.connect(self.native) as db:
