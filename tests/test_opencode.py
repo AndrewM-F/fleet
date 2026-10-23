@@ -240,12 +240,29 @@ class OpenCodeAdapterTests(unittest.TestCase):
             return FakeProcess(*args, events=events, code=code, on_exit=on_exit, **kwargs)
         def fake_identity(pid):
             return dict(self.identity, pid=int(pid), pgid=int(pid))
+        # Fake PIDs have no owned OS group; querying the host can collide with
+        # an unrelated real group. Real subprocess cleanup uses separate tests.
         with patch.object(opencode.subprocess, "Popen", side_effect=fake_popen) as popen, \
                 patch.object(opencode, "process_identity", side_effect=fake_identity), \
+                patch.object(opencode, "_group_exists", return_value=False), \
                 patch.object(opencode, "_terminate_owned_group",
                              return_value={"confirmed": True, "uncertain": False}) as terminate:
             result = opencode.run_turn(request_path)
         return result, popen, terminate
+
+    def test_synthetic_events_do_not_probe_host_process_groups(self):
+        request = self.request()
+        events = [
+            self.event("step_start", {"type": "step-start", "messageID": "msg_1"}),
+            self.event("text", {"type": "text", "messageID": "msg_1", "text": "OK"}),
+            self.event("step_finish", {"type": "step-finish", "messageID": "msg_1",
+                                       "reason": "stop"}),
+        ]
+        with patch.object(opencode.os, "killpg", side_effect=AssertionError(
+                "a synthetic process must not probe host process groups")) as killpg:
+            result, _, _ = self.run_events(request, events, completion=True)
+        self.assertEqual(result["state"], "done")
+        killpg.assert_not_called()
 
     def model_request(self, model):
         request_path = self.request()

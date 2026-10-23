@@ -20,8 +20,8 @@
   `resume`, `dispatchEnabled`.
 - `opencode[]`: an existing native `sessionId` (`ses_…`), absolute `databasePath` for its native
   OpenCode database, `cwd`, `sessionCwd` (must resolve to the same directory), `model` (one of
-  `opencode/deepseek-v4.1-flash-free`, `opencode/minimax-m3.1-flash-free`, or
-  `opencode-go/minimax-m3.1-flash-free`), and `dispatchEnabled`
+  `opencode/deepseek-v4.1-flash-free`, `opencode/minimax-m3.1-flash-free`,
+  `opencode-go/minimax-m3.1-flash-free`, or `opencode/mimo-v2.6-flash-free`), and `dispatchEnabled`
   (defaults false). There is no automatic model switch or fallback. Set `databasePath`
   from `opencode debug paths db`; this read-only command does not start a server or open the DB.
   Before each `--session` launch, Fleet reads only that exact `session_v2` identity row in SQLite

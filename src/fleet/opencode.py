@@ -26,7 +26,8 @@ MODEL = "opencode/deepseek-v4.1-flash-free"
 # a turn starts, and the isolated runtime is pinned to the approved model and
 # its provider, so no other provider can be reached at all.
 APPROVED_FREE_MODELS = (MODEL, "opencode/minimax-m3.1-flash-free",
-                        "opencode-go/minimax-m3.1-flash-free")
+                        "opencode-go/minimax-m3.1-flash-free",
+                        "opencode/mimo-v2.6-flash-free")
 APPROVED_MODELS = frozenset(APPROVED_FREE_MODELS)
 _SESSION_ID = re.compile(r"ses_[A-Za-z0-9_-]+\Z")
 _TURN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")

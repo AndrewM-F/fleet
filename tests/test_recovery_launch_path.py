@@ -26,6 +26,7 @@ from fleet import dispatch, opencode, paths, recovery, store  # noqa: E402
 
 # The approved free model the fleet roster configures for this session.
 CONFIGURED_MODEL = "opencode-go/minimax-m3.1-flash-free"
+MIMO_MODEL = "opencode/mimo-v2.6-flash-free"
 CONFIGURED_PROVIDER = "opencode-go"
 CONFIGURED_MODEL_ID = "minimax-m3.1-flash-free"
 # The fleet default, which must keep behaving exactly as before.
@@ -559,6 +560,7 @@ class RecoveryLaunchPathTests(unittest.TestCase):
         self.assertIn(opencode.MODEL, opencode.APPROVED_FREE_MODELS)
         self.assertEqual(opencode.APPROVED_FREE_MODELS[0], opencode.MODEL)
         self.assertIn(CONFIGURED_MODEL, opencode.APPROVED_FREE_MODELS)
+        self.assertIn(MIMO_MODEL, opencode.APPROVED_FREE_MODELS)
 
     def test_a_native_completion_naming_another_model_is_refused(self):
         self.prepare_failure(model=CONFIGURED_MODEL)
@@ -638,6 +640,24 @@ class RecoveryLaunchPathTests(unittest.TestCase):
                 opencode.send(self.slot, "continue", self.successor, record)
         self.assertEqual([call for call in popen.call_args_list
                           if call.args and call.args[0] and call.args[0][0] != "git"], [])
+
+    def test_mimo_free_model_is_pinned_to_its_native_provider(self):
+        mimo_db = self.root / "native-mimo.db"
+        self._create_native_db(mimo_db, self.sid, self.native_cwd, MIMO_MODEL)
+        self.slot["model"] = MIMO_MODEL
+        self.slot["databasePath"] = str(mimo_db)
+        self.prepare_failure(model=MIMO_MODEL)
+        self.authorize()
+        self.queue_successor()
+        self.dispatch_successor()
+        request = json.loads(self.written_request().read_text())
+        self.assertEqual(request["model"], MIMO_MODEL)
+        _, popen = self.run_turn(self.written_request())
+        env = popen.call_args.kwargs["env"]
+        config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["model"], MIMO_MODEL)
+        self.assertEqual(config["small_model"], MIMO_MODEL)
+        self.assertEqual(config["enabled_providers"], ["opencode"])
 
 
 if __name__ == "__main__":
