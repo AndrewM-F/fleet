@@ -92,9 +92,12 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
         if state_extra:
             state_receipt.update(state_extra)
         (turn_dir / "state.json").write_text(json.dumps(state_receipt))
-        result = dict(taskId=self.task_id, sessionId=self.sid, cwd=self.cwd,
+        result = dict(turn=self.turn, taskId=self.task_id, sessionId=self.sid, cwd=self.cwd,
+                      expectedModel=model,
                       state=state, cleanup=cleanup, error=error, toolFailures=[],
-                      finishedAt=100)
+                      finishedAt=100,
+                      managedProcessIdentity={"pid": 9999999, "pgid": 9999999,
+                                              "start": [1], "executable": "/usr/bin/opencode"})
         if tool_failures is not None:
             result["toolFailures"] = tool_failures
         if process_identity is not None:
@@ -199,7 +202,7 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
         cases = {
             "launch sessionId": {"launch": {"sessionId": self.other_sid}},
             "launch cwd": {"launch": {"cwd": str(self.other_cwd.resolve())}},
-            "launch model": {"model": OTHER_MODEL},
+            "launch model unapproved": {"model": "opencode/paid-model"},
             "turn model": {"model": CONFIGURED_MODEL, "state_extra": {"model": OTHER_MODEL}},
             "turn sessionId": {"state_extra": {"sessionId": self.other_sid}},
             "turn cwd": {"state_extra": {"cwd": str(self.other_cwd.resolve())}},
@@ -210,6 +213,7 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
                 state_extra = override.pop("state_extra", None)
                 launch = override.pop("launch", None)
                 turn_dir = self.write_working_turn(model=model, state_extra=state_extra)
+                (turn_dir / "cancel.json").unlink(missing_ok=True)
                 if launch is not None:
                     session = self.data / "opencode" / self.sid
                     receipt = {"turn": self.turn, "taskId": self.task_id,
@@ -228,12 +232,13 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
                 opencode.cancel(self.slot)
         self.assertFalse((turn_dir / "cancel.json").exists())
 
-    def test_cancellation_requires_a_configured_model(self):
+    def test_cancellation_uses_the_inflight_model_after_the_next_selection_changes(self):
         self.write_working_turn()
-        with self.assertRaisesRegex(ValueError, "must name its configured model"):
-            opencode.cancel(dict(self.slot, model=""))
-        with self.assertRaisesRegex(ValueError, "must name its configured model"):
-            opencode.cancel(dict(self.slot, model=None))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            result = opencode.cancel(dict(self.slot, model=OTHER_MODEL))
+        self.assertEqual(result["turn"], self.turn)
+        self.assertTrue((self.data / "opencode" / self.sid / "turns" / self.turn /
+                         "cancel.json").exists())
 
     # -- rate limit and quota --------------------------------------------
     def test_rate_limit_and_quota_failures_remain_rejected(self):
@@ -255,7 +260,8 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
                                         CONFIGURED_MODEL)
 
     def test_a_live_native_process_group_still_blocks_recovery(self):
-        self.write_receipts(process_identity={"pid": 4242, "pgid": 4242})
+        self.write_receipts(process_identity={"pid": 4242, "pgid": 4242, "start": [1],
+                                              "executable": "/usr/bin/opencode"})
         with patch.object(opencode, "_group_exists", return_value=True):
             with self.assertRaisesRegex(ValueError, "process group is still live"):
                 recovery.verify_failed_turn(self.sid, self.task_id, self.turn, self.cwd,
@@ -263,7 +269,7 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
 
     def test_an_invalid_native_process_identity_remain_rejected(self):
         self.write_receipts(process_identity={"pid": 4242})
-        with self.assertRaisesRegex(ValueError, "invalid native process identity"):
+        with self.assertRaisesRegex(ValueError, "no complete native process identity"):
             recovery.verify_failed_turn(self.sid, self.task_id, self.turn, self.cwd,
                                         CONFIGURED_MODEL)
 
@@ -279,7 +285,8 @@ class ConfiguredModelIdentityTests(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=forbidden), \
                 patch("subprocess.run", side_effect=forbidden), \
                 patch("subprocess.check_output", side_effect=forbidden), \
-                patch.object(opencode, "identity_matches", return_value=True):
+                patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
             recovery.verify_failed_turn(self.sid, self.task_id, self.turn, self.cwd,
                                         CONFIGURED_MODEL)
             recovery._verify_pointer_identity(self.sid, self.task_id, self.turn, self.cwd,

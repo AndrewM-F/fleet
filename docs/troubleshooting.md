@@ -55,12 +55,14 @@
   ```sh
   cat > "$FLEET_ROOT/data/recovery/direct-turn-<id>.json" <<'JSON'
   {
-    "schemaVersion": "pi-direct-turn-ownership/v1",
+    "schemaVersion": "pi-direct-turn-ownership/v2",
     "originalSession": "ses_...",
     "ownedWorktree": "/absolute/path/to/the/owned/worktree",
     "branch": "branch-name",
     "initialHead": "full commit sha the direct turn started from",
     "startedAt": 1792480175,
+    "originalUserMessageId": "msg_...",
+    "completionIdleMessageId": "msg_...",
     "note": "substantive operator statement about that direct turn"
   }
   JSON
@@ -68,7 +70,9 @@
   ```
   The receipt is proved before anything is authorized: its session must be the recovering worker,
   the native session row must show that session in the recorded worktree with the configured model,
-  a succeeded idle outcome and completed assistant output, the recorded branch must be the
+  and those exact native message IDs must bound the original user turn, its final completed
+  assistant, and its successful idle marker before the failed managed turn. A later session-wide
+  idle outcome or assistant message cannot prove the original turn. The recorded branch must be the
   checkout's branch, the recorded initial head must be an ancestor of the current head, and the
   current snapshot must be unchanged. The receipt's path and digest are recorded with the recovery
   and re-proved before the successor dispatches, so a receipt that is later edited is refused. A
@@ -121,4 +125,94 @@
   cleanup and no live process identity/group — and refuse a bare state flip. Retirement and
   reconciliation touch only that recovery row and task; global pause, per-worker `dispatchEnabled`,
   capacity/quota gates, and unrelated recovery reservations stay in force.
+- **Stale `running` row after a fleet replacement** — a managed turn can finish while no manager is
+  observing its worker, so the ledger row stays `running` and keeps the same-cwd dispatch
+  exclusivity. `bin/fleet resolve` only accepts `uncertain` rows and `bin/fleet cancel` aborts a live
+  turn, so neither can close it. Verify the retained native receipt and use
+  `bin/fleet reconcile-completed` (see below).
 - **Moving `data/`** — `bin/fleet stop`, `scripts/db-check`, then move including no `-wal/-shm`.
+
+## A managed turn completed but its ledger row is still running
+
+A fleet replacement, or a manager outage while the turn ended, leaves the task row in
+`running` even though the native turn finished. The manager closes such a row only while it
+observes that worker, so a worker that left the roster leaves the row behind, and the row keeps
+the same-cwd dispatch exclusivity for every other task in that working directory.
+
+One supported operation closes exactly that row. It is not a release and not a state flip: it
+requires the exact task, turn, worker, session and working-directory identity, the retained native
+completion receipt, and proof that the native execution stopped.
+
+```sh
+bin/fleet reconcile-completed --task 20261020-fleet-replacement-cutover-w5-01 \
+  --turn 86f3236e-6327-4862-ace1-b23c0da84896 \
+  --worker ses_eaa694010ffebFoPIycvHTD3uB \
+  --receipt-root /tmp/opencode-three-fleet-20261018 \
+  --note 'retained receipt proves a terminal done turn with exit 0 and confirmed cleanup'
+```
+
+`--receipt-root` is the Fleet root that still holds the turn, which after a replacement is the
+retired root: the command reads `<root>/data/opencode/<session>/turns/<turn>/` and never the live
+root's other data. It requires the retained `request.json`, `state.json`, `result.json` and the
+session's `current.json` pointer to identify the same task, turn, session and cwd; the native state
+and result to be terminal `done` with exit code 0 and confirmed cleanup; a full recorded native
+process identity and a recorded wrapper PID that are provably gone; the worker to be one this fleet
+no longer manages; and no other task to own that working directory. A completed turn ran a process,
+so a receipt that records no process identity, or records a null identity beside a successful
+completion, fails closed. An unknown is never read as "nothing there": a missing, invalid or
+unreadable roster refuses, a missing, unreadable or corrupt other-root ledger refuses, and
+ownership in another root is matched by task id, by session and by canonical working directory.
+That root's ledger is fenced with its own write lock from the verified ownership query through the
+current-ledger commit, because a transaction on the current ledger does not fence a separate
+database: a claim written into the retired root in between is blocked instead of slipping through.
+The session's dispatch lock is held from the first validation through the ledger commit, and the
+roster and the competing ownership are rechecked inside that transaction, so a native launch or a
+task that claims the working directory in between is refused instead of raced. A missing, unreadable, uncertain or
+inconsistent receipt is a refusal, and the ledger is left unchanged.
+
+The command records one `opencode_completed_reconciled` event with the receipt digests and moves
+the row to `finished`. The task body, the retained receipt, every hold, the global pause, the
+per-worker `dispatchEnabled`, the model and the account are untouched, and the same-cwd dispatch
+exclusion rule is unchanged — only this one stale row stops blocking that directory. A task that is
+still `uncertain` is refused here and still needs `bin/fleet resolve`; a turn that is still running
+is refused and still needs `bin/fleet cancel`. Never edit SQLite or delete history to close a
+stale row.
+
+## OpenCode wrapper selected stale source before native execution
+
+`FLEET_ROOT` selects durable data/config/logs; `paths.SOURCE_ROOT` and `paths.BIN`
+select the installed source that imported Fleet. Child wrappers use that source's
+entrypoint, even when the data root contains an old `bin/fleet` or source snapshot.
+A missing native `state.json` after the launch grace period is `launchFailure`;
+the manager preserves the terminal `finished` ledger convention and emits
+`review_ready` with `state: blocked`, explicit `outcome: launch_failed`, and the
+launch error. This is a failed wrapper attempt, not successful audit completion.
+A claimed recovery reservation is not marked completed by this launch failure.
+
+For the known legacy model-guard failure, after root reviews and applies this fix,
+an operator may run the reviewed source entrypoint with the intended `FLEET_ROOT`:
+
+```
+FLEET_ROOT=/tmp/opencode-three-fleet-20261018 FLEET_CONFIG=/tmp/opencode-three-fleet-20261018/config/fleet.local.json python3 /Users/amf/Developer/.codex/fleet/bin/fleet reconcile-opencode-launch --task 20261019-go-adea-ci-migration-inventory-e7f19faa --turn 5e62374a-d022-4256-8b69-bee5c0837f68 --note "Root reviewed stale-source rejection before native execution; audit remains incomplete"
+```
+
+This requires durable pause, a stopped manager, a disabled exact worker, a free
+session lock, no active recovery reservation or task in flight, matching task /
+turn / model / native database identity, no native state or result, a dead wrapper
+PID and process group, zero native message metadata at/after launch (including a
+one-second margin), and the bounded traceback ending at the known legacy guard.
+An unknown error, quota failure, existing native messages/state, or uncertain
+process proof blocks reconciliation. It reads no auth data or native message text.
+
+The command commits an audit event before writing an identity-bound
+`launch-reconciled.json`. The worker then reports `stopped`; the original request,
+launch pointer, wrapper log and task row remain unchanged. The old `finished`
+state is preserved as historical evidence, not an audit success. A task already
+`uncertain` stays uncertain and requires an explicit supported operator resolution
+before its checkout can dispatch again. No dispatch/quota/task hold is released.
+
+Never reuse the failed task ID. Root must authorize a new same-session task ID
+linked by `previousTaskId`, preserving its scoped checkout and transfer exclusions.
+Do not use native error-turn recovery for this missing-state case. Session creation,
+roster enablement and manager resume are separate controller actions after review;
+the reconciliation command does none of them. Do not edit SQLite or delete history.

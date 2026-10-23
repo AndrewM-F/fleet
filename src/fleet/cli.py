@@ -10,8 +10,9 @@ import subprocess
 import sys
 import time
 
-from . import claude, control, events, holds, manager, opencode, ops, paths, pi, recovery
-from .store import BUSY, database
+from . import (claude, completion, control, events, holds, manager, model_selection, opencode,
+               opencode_lifecycle, ops, paths, pi, recovery)
+from .store import BUSY, database, planning_database
 
 
 def out(value):
@@ -266,16 +267,57 @@ def cmd_recover_opencode(args):
     if sum(sources) != 1:
         raise SystemExit("Choose exactly one ownership source: --ownership-task, "
                          "--adoption-id or --direct-turn-receipt")
-    out(recovery.authorize_opencode(database(), session_id=args.worker,
+    db = database()
+    ownership_task_id = args.ownership_task
+    if args.adoption_id:
+        adoption = recovery.adoption_record(db, args.adoption_id)
+        if not adoption:
+            raise ValueError("Recovery adoption record is missing")
+        ownership_task_id = adoption["owner_task_id"]
+    out(recovery.authorize_opencode(db, session_id=args.worker,
                                     failed_task_id=args.task, turn=args.turn,
                                     recovery_id=args.recovery_id,
                                     successor_task_id=args.successor_task,
-                                    ownership_task_id=args.ownership_task,
+                                    ownership_task_id=ownership_task_id,
                                     owned_worktree=args.owned_worktree,
                                     branch=args.branch, head=args.head,
                                     worktree_sha256=args.worktree_sha256, note=args.note,
                                     adoption_id=args.adoption_id,
                                     direct_turn_receipt=args.direct_turn_receipt))
+
+
+def cmd_reconcile_opencode_launch(args):
+    try:
+        out(recovery.reconcile_launch_failure(database(), args.task, args.turn, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_reconcile_completed(args):
+    try:
+        out(completion.reconcile_completed(database(), args.task, args.turn, args.worker,
+                                           args.receipt_root, args.note))
+    except Exception as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_opencode_model(args):
+    """Report or set the approved model for managed OpenCode workers."""
+    if args.inspect:
+        # Inspection never writes and never reaches a provider.
+        out(model_selection.inspect(database()))
+        return
+    if not args.model:
+        out(model_selection.inspect(database()))
+        return
+    if args.worker and args.all:
+        raise SystemExit("Choose one worker or all of them")
+    if not args.worker and not args.all:
+        raise SystemExit("Choose --worker SESSION or --all")
+    out(model_selection.apply(None, args.model, args.worker, dry_run=args.dry_run,
+                              db=database()))
 
 
 def cmd_adopt_ownership(args):
@@ -326,6 +368,63 @@ def cmd_controller(args):
         pi.serve(args.lane)
     else:
         out(pi.send(args.lane, json.loads(args.command)))
+
+
+def cmd_add_opencode(args):
+    """Add OpenCode sessions to the roster, or report the current state."""
+    try:
+        if args.status:
+            db = planning_database() if args.dry_run else database()
+            try:
+                out(opencode_lifecycle.status(db))
+            finally:
+                db.close()
+            return
+        missing = [name for name, value in (("--model", args.model), ("--cwd", args.cwd),
+                                            ("--root", args.root))
+                   if value in (None, "")]
+        if missing:
+            raise SystemExit("Missing required arguments: " + ", ".join(missing))
+        if args.count is None and args.target_total is None:
+            raise SystemExit("Choose --count or --target-total")
+        if args.count is not None and args.target_total is not None:
+            raise SystemExit("Choose --count or --target-total, not both")
+        db = planning_database() if args.dry_run else database()
+        try:
+            result = opencode_lifecycle.add_sessions(
+                db, count=args.count, target_total=args.target_total, model=args.model,
+                cwd=args.cwd, root=args.root, database_path=args.database_path,
+                request_key=args.request_key, enable_dispatch=args.enable_dispatch,
+                max_concurrent=args.max_concurrent, dry_run=args.dry_run, note=args.note or "",
+                reconciled_sessions=args.reconciled_session)
+        finally:
+            db.close()
+        out(result)
+        if (result.get("failed") or result.get("uncertain")
+                or result.get("status") in {"failed", "uncertain"}):
+            sys.exit(1)
+    except (ValueError, OSError, opencode_lifecycle.ProvisioningError) as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_drain_opencode(args):
+    """Stop dispatching to one worker and report the work it still owns."""
+    try:
+        out(opencode_lifecycle.drain_session(database(), args.session, note=args.note))
+    except (ValueError, OSError) as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
+
+
+def cmd_remove_opencode(args):
+    """Remove one worker from the roster, keeping its native session."""
+    try:
+        out(opencode_lifecycle.remove_session(database(), args.session, note=args.note,
+                                              allow_unverified_native=args.allow_unverified_native))
+    except (ValueError, OSError) as error:
+        print(json.dumps({"error": type(error).__name__, "message": str(error)}), flush=True)
+        sys.exit(1)
 
 
 def main(argv=None):
@@ -412,6 +511,11 @@ def main(argv=None):
                    help="durable direct-turn ownership receipt when no owner task exists")
     p.add_argument("--note", required=True)
     p.set_defaults(fn=cmd_recover_opencode)
+    p = sub.add_parser("reconcile-opencode-launch", help="audit a proven pre-provider launch failure")
+    p.add_argument("--task", required=True)
+    p.add_argument("--turn", required=True)
+    p.add_argument("--note", required=True)
+    p.set_defaults(fn=cmd_reconcile_opencode_launch)
     p = sub.add_parser("adopt-ownership",
                        help="append immutable ownership evidence for a recovery successor")
     p.add_argument("--id", dest="adoption_id", required=True)
@@ -436,6 +540,23 @@ def main(argv=None):
     p.add_argument("--task", required=True, help="dispatched successor task owned by a recovery")
     p.add_argument("--note", required=True, help="operator evidence that native execution stopped")
     p.set_defaults(fn=cmd_reconcile_recovery)
+    p = sub.add_parser("reconcile-completed",
+                       help="close a stale running row whose managed OpenCode turn completed")
+    p.add_argument("--task", required=True, help="exact stale task id")
+    p.add_argument("--turn", required=True, help="exact managed OpenCode turn id")
+    p.add_argument("--worker", required=True, help="exact worker session id that ran the turn")
+    p.add_argument("--receipt-root", required=True,
+                   help="Fleet root that retains the turn receipt, such as a retired root")
+    p.add_argument("--note", required=True, help="operator evidence for the reconciliation")
+    p.set_defaults(fn=cmd_reconcile_completed)
+    p = sub.add_parser("opencode-model",
+                       help="inspect or set the approved OpenCode provider/model for a worker")
+    p.add_argument("--model", help="approved provider/model to run for the next productive turn")
+    p.add_argument("--worker", help="one existing OpenCode session id")
+    p.add_argument("--all", action="store_true", help="every configured OpenCode worker")
+    p.add_argument("--inspect", action="store_true", help="report the current model state only")
+    p.add_argument("--dry-run", action="store_true", help="report the change without writing it")
+    p.set_defaults(fn=cmd_opencode_model)
     p = sub.add_parser("hold", help="hold an unstarted queued task without cancelling it")
     p.add_argument("task")
     p.add_argument("--note", required=True, help="operator reason kept with the hold")
@@ -466,6 +587,39 @@ def main(argv=None):
     p = sub.add_parser("remove", help="remove a worker from configuration (history kept)")
     p.add_argument("session_id")
     p.set_defaults(fn=lambda a: out(ops.remove(a.session_id)))
+    p = sub.add_parser("add-opencode",
+                       help="add OpenCode sessions to the roster (idempotent per request key)")
+    p.add_argument("--count", type=int, help="how many sessions to add")
+    p.add_argument("--target-total", type=int,
+                   help="the total roster size to reach; only the difference is added")
+    p.add_argument("--model", help="the exact approved provider/model of the account")
+    p.add_argument("--cwd", help="the worktree the sessions are created for")
+    p.add_argument("--root", help="the fleet root this request is for")
+    p.add_argument("--database-path", help="native account database; defaults to the roster's account")
+    p.add_argument("--request-key", help="idempotency key; the same key never adds twice")
+    p.add_argument("--enable-dispatch", action="store_true",
+                   help="make the new workers dispatchable immediately (opt-in)")
+    p.add_argument("--max-concurrent", type=int,
+                   help="explicitly raise the fleet admission limit, inside the validated limits")
+    p.add_argument("--dry-run", action="store_true", help="report the exact plan without writing it")
+    p.add_argument("--status", action="store_true", help="report the account, roster and receipts only")
+    p.add_argument("--reconciled-session", action="append", default=[],
+                   help="a native session id a previous uncertain attempt created; it is "
+                        "verified before it is registered")
+    p.add_argument("--note", default="", help="operator note recorded with the receipt")
+    p.set_defaults(fn=cmd_add_opencode)
+    p = sub.add_parser("drain-opencode",
+                       help="stop dispatching to one worker and report the work it still owns")
+    p.add_argument("--session", required=True)
+    p.add_argument("--note", default="", help="operator note recorded with the receipt")
+    p.set_defaults(fn=cmd_drain_opencode)
+    p = sub.add_parser("remove-opencode",
+                       help="remove one worker from the roster, keeping its native session")
+    p.add_argument("--session", required=True)
+    p.add_argument("--note", default="", help="operator note recorded with the receipt")
+    p.add_argument("--allow-unverified-native", action="store_true",
+                   help="operator override for a native identity that cannot be read at all")
+    p.set_defaults(fn=cmd_remove_opencode)
     sub.add_parser("supervise", help="restart dead components every 30s (launchd runs this)").set_defaults(
         fn=lambda a: ops.supervise())
     p = sub.add_parser("supervisor", help="install/uninstall the launchd supervisor")
@@ -473,5 +627,6 @@ def main(argv=None):
     p.set_defaults(fn=lambda a: out(ops.install_launchd() if a.action == "install"
                                     else ops.uninstall_launchd()))
     args = parser.parse_args(argv)
-    paths.DATA.mkdir(parents=True, exist_ok=True)
+    if not (args.cmd == "add-opencode" and args.dry_run):
+        paths.DATA.mkdir(parents=True, exist_ok=True)
     args.fn(args)

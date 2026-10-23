@@ -35,7 +35,8 @@ class FleetTests(unittest.TestCase):
     def test_pause_and_once(self):
         self.task()
         calls = []
-        sender = lambda *args: calls.append(args)
+        def sender(*args):
+            calls.append(args)
         dispatch.dispatch(self.db, self.slots, self.states, sender, paused=True)
         self.assertEqual(calls, [])
         dispatch.dispatch(self.db, self.slots, self.states, sender)
@@ -135,6 +136,10 @@ class ClaudeResumeTests(unittest.TestCase):
                      "provider": "claude", "model": "claude-haiku-5-5", "effort": "medium"}
         self.row = {"sessionId": self.sid, "id": "00000000",
                     "cwd": "/tmp/approved", "state": "done"}
+        # This native transport fixture must not read an ignored source config.
+        config = patch.object(claude.paths, "config", return_value={})
+        config.start()
+        self.addCleanup(config.stop)
         exe = patch.object(claude.paths, "executable", return_value="claude")
         exe.start()
         self.addCleanup(exe.stop)

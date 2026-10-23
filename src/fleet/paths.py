@@ -4,11 +4,12 @@ import os
 from pathlib import Path
 import shutil
 
-ROOT = Path(os.environ.get("FLEET_ROOT") or Path(__file__).resolve().parents[2])
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("FLEET_ROOT") or SOURCE_ROOT)
 CONFIG = Path(os.environ.get("FLEET_CONFIG") or ROOT / "config" / "fleet.local.json")
 DATA = ROOT / "data"
 LOGS = ROOT / "logs"
-BIN = ROOT / "bin" / "fleet"
+BIN = SOURCE_ROOT / "bin" / "fleet"
 
 DB = DATA / "fleet.sqlite"
 QUEUE = DATA / "queue.json"
@@ -24,6 +25,13 @@ OPENCODE = DATA / "opencode"
 
 def config(path=None):
     return json.loads(Path(path or CONFIG).read_text())
+
+
+def write_config(cfg):
+    """Write the configuration atomically: a reader never sees a partial file."""
+    tmp = CONFIG.with_name(CONFIG.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, CONFIG)
 
 
 def _expand(value):

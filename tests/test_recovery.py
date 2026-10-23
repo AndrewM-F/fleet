@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -17,6 +18,16 @@ from fleet import control, dispatch, holds, manager, opencode, ops, paths, recov
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
+        # Synthetic adapter fixture: boundary contract is tested separately.
+        for boundary, replacement in (
+                ("pre_prompt", lambda request: None),
+                ("launch", lambda request, args, **kwargs: SimpleNamespace(
+                    process=opencode.subprocess.Popen(args, **kwargs),
+                    containment_domain="synthetic-domain", binding=SimpleNamespace(digest="synthetic"),
+                    finish=lambda: None))):
+            gate = patch.object(opencode.credential_isolation, boundary, side_effect=replacement)
+            gate.start()
+            self.addCleanup(gate.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.cwd = self.root / "worktree"
@@ -43,8 +54,15 @@ class RecoveryTests(unittest.TestCase):
                      "sessionCwd": str(self.native_cwd),
                      "databasePath": str(self.root / "native.db"), "model": opencode.MODEL,
                      "provider": "opencode", "dispatchEnabled": True}
-        with sqlite3.connect(self.slot["databasePath"]):
-            pass
+        # The disposable owned native identity of this worker: the session row the
+        # native side records, so the ownership paths can prove the session they
+        # name instead of patching the proof away.
+        with sqlite3.connect(self.slot["databasePath"]) as native:
+            native.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, project_id TEXT, "
+                           "model TEXT)")
+            native.execute("INSERT INTO session_v2 VALUES (?,?,?,?)",
+                           (self.sid, str(self.native_cwd.resolve()), "project-test",
+                            opencode.MODEL))
         self.other_slot = dict(self.slot, sessionId=self.other_sid,
                                cwd=str(self.other_native_cwd),
                                sessionCwd=str(self.other_native_cwd))
@@ -72,7 +90,15 @@ class RecoveryTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.slot_patch = patch.object(paths, "opencode_slots", return_value=[self.slot])
+        # Never depend on an ignored local fleet config in the source checkout.
+        config_path = self.root / "synthetic-fleet.json"
+        config_path.write_text(json.dumps({"pi": [], "claude": [], "opencode": [self.slot, self.other_slot]}))
+        for name, value in (("CONFIG", config_path), ("DATA", self.data)):
+            fixture_path = patch.object(paths, name, value)
+            fixture_path.start()
+            self.addCleanup(fixture_path.stop)
+        self.slot_patch = patch.object(paths, "opencode_slots",
+                                       return_value=[self.slot, self.other_slot])
         self.slot_patch.start()
         self.addCleanup(self.slot_patch.stop)
         self.exec_patch = patch.object(paths, "executable", return_value="/usr/bin/opencode")
@@ -90,9 +116,12 @@ class RecoveryTests(unittest.TestCase):
         state = dict(launch, state="error", cleanup="confirmed",
                      error="OpenCode turn did not produce a verified native completion",
                      finishedAt=100)
-        result = dict(taskId=task_id, sessionId=sid, cwd=str(cwd),
+        result = dict(turn=turn, taskId=task_id, sessionId=sid, cwd=str(cwd),
+                      expectedModel=opencode.MODEL,
                       state="error", cleanup="confirmed", error=state["error"], toolFailures=[],
-                      finishedAt=100)
+                      finishedAt=100, managedProcessIdentity={
+                          "pid": 9999999, "pgid": 9999999, "start": [1],
+                          "executable": "/usr/bin/opencode"})
         (turn_dir / "state.json").write_text(json.dumps(state))
         (turn_dir / "result.json").write_text(json.dumps(result))
 
@@ -728,7 +757,8 @@ class RecoveryTests(unittest.TestCase):
     def test_live_recorded_native_process_blocks_recovery(self):
         result_path = paths.OPENCODE / self.sid / "turns" / self.turn / "result.json"
         result = json.loads(result_path.read_text())
-        result["managedProcessIdentity"] = {"pid": 123, "pgid": 123}
+        result["managedProcessIdentity"] = {"pid": 123, "pgid": 123, "start": [1],
+                                            "executable": "/usr/bin/opencode"}
         result_path.write_text(json.dumps(result))
         with patch.object(opencode, "identity_matches", return_value=True):
             with self.assertRaisesRegex(ValueError, "process group is still live"):
@@ -747,12 +777,92 @@ class RecoveryTests(unittest.TestCase):
                           lambda *args, **kwargs: None)
         manager.observe(self.db, self.sid, {"state": "working", "cwd": str(self.native_cwd),
                                             "progress": 1}, now=10)
-        manager.observe(self.db, self.sid, {"state": "done", "cwd": str(self.native_cwd),
-                                            "progress": 2}, now=20)
+        self.write_successor_turn("done")
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]), \
+                patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            manager.observe(self.db, self.sid, {"state": "done", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "finished")
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "completed")
+
+    def test_terminal_successor_without_retained_process_identity_keeps_claim(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="running")
+        self.write_successor_turn("done")
+        result_path = paths.OPENCODE / self.sid / "turns/turn_successor/result.json"
+        result = json.loads(result_path.read_text())
+        result.pop("managedProcessIdentity")
+        result_path.write_text(json.dumps(result))
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]):
+            manager.observe(self.db, self.sid, {"state": "done", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "uncertain")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE kind='task_uncertain'")
+                         .fetchone()[0], 1)
+
+    def test_blocked_successor_with_uncertain_cleanup_keeps_claim(self):
+        self.authorize()
+        self.enqueue_successor()
+        self.mark_claimed_uncertain(state="running")
+        self.write_successor_turn("blocked")
+        turn_dir = paths.OPENCODE / self.sid / "turns/turn_successor"
+        for name in ("state.json", "result.json"):
+            path = turn_dir / name
+            payload = json.loads(path.read_text())
+            payload["cleanup"] = "uncertain"
+            path.write_text(json.dumps(payload))
+        with patch.object(paths, "opencode_slots", return_value=[self.slot]):
+            manager.observe(self.db, self.sid, {"state": "blocked", "taskId": self.successor,
+                                                "cwd": str(self.native_cwd), "progress": 2}, now=20)
+        self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
+                                         (self.successor,)).fetchone()[0], "uncertain")
+        self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
+                         .fetchone()[0], "claimed")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM events WHERE kind='task_uncertain'")
+                         .fetchone()[0], 1)
+
+    def test_stopped_proof_checks_retained_result_and_process_group(self):
+        self.write_successor_turn("done")
+        result_path = paths.OPENCODE / self.sid / "turns/turn_successor/result.json"
+        original = json.loads(result_path.read_text())
+        for changed in ({"managedProcessIdentity": None}, {"cleanup": "uncertain"},
+                        {"taskId": "another-task"}, {"finishedAt": 101}):
+            with self.subTest(changed=changed):
+                result_path.write_text(json.dumps(dict(original, **changed)))
+                stopped, _ = recovery.verify_stopped_native_execution(self.slot, self.successor)
+                self.assertFalse(stopped)
+        result_path.write_text(json.dumps(original))
+        with patch.object(opencode, "identity_matches", return_value=True):
+            stopped, reason = recovery.verify_stopped_native_execution(self.slot,
+                                                                         self.successor)
+        self.assertFalse(stopped)
+        self.assertIn("still live", reason)
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=True):
+            stopped, reason = recovery.verify_stopped_native_execution(self.slot,
+                                                                         self.successor)
+        self.assertFalse(stopped)
+        self.assertIn("group is still present", reason)
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            stopped, _ = recovery.verify_stopped_native_execution(self.slot, self.successor)
+        self.assertTrue(stopped)
+
+    def test_failed_turn_without_full_retained_identity_cannot_be_authorized(self):
+        result_path = paths.OPENCODE / self.sid / "turns" / self.turn / "result.json"
+        result = json.loads(result_path.read_text())
+        result["managedProcessIdentity"] = {"pid": 9999999, "pgid": 9999999}
+        result_path.write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, "no complete native process identity"):
+            self.authorize()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM recoveries").fetchone()[0], 0)
 
     # --- retirement / reconciliation --------------------------------------
     def enqueue_successor(self):
@@ -776,6 +886,15 @@ class RecoveryTests(unittest.TestCase):
             payload["processIdentity"] = identity
         if state in {"stopped", "error", "done", "completed", "blocked"}:
             payload["cleanup"] = "confirmed"
+            payload["finishedAt"] = 100
+            retained = identity if identity is not None else {
+                "pid": 4242, "pgid": 4242, "start": [1, 2],
+                "executable": "/usr/bin/opencode"}
+            (turn_dir / "result.json").write_text(json.dumps({
+                "turn": turn, "taskId": self.successor, "sessionId": self.sid,
+                "cwd": str(self.native_cwd), "expectedModel": opencode.MODEL,
+                "state": state, "cleanup": "confirmed", "finishedAt": 100,
+                "managedProcessIdentity": retained}))
         (turn_dir / "state.json").write_text(json.dumps(payload))
         (paths.OPENCODE / self.sid / "current.json").write_text(json.dumps(
             {"turn": turn, "taskId": self.successor, "sessionId": self.sid,
@@ -841,8 +960,10 @@ class RecoveryTests(unittest.TestCase):
                                          (self.successor,)).fetchone()[0], "uncertain")
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
-        self.write_successor_turn("stopped")   # no live identity, cleanup confirmed
-        resolved = ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
+        self.write_successor_turn("stopped")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            resolved = ops.resolve_task(self.db, self.successor, "cancelled", "manual resolution")
         self.assertEqual(resolved["state"], "cancelled")
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "cancelled")
@@ -861,7 +982,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
         self.write_successor_turn("stopped")
-        result = recovery.reconcile_successor(self.db, self.successor, "operator evidence")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            result = recovery.reconcile_successor(self.db, self.successor, "operator evidence")
         self.assertTrue(result["reconciled"])
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "reconciled")
@@ -939,8 +1062,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "claimed")
 
-        result = recovery.reconcile_successor(
-            self.db, self.successor, "verified stopped successor")
+        with patch.object(opencode, "identity_matches", return_value=False), \
+                patch.object(opencode, "_group_exists", return_value=False):
+            result = recovery.reconcile_successor(
+                self.db, self.successor, "verified stopped successor")
         self.assertTrue(result["reconciled"])
         self.assertEqual(self.db.execute("SELECT state FROM tasks WHERE id=?",
                                          (self.successor,)).fetchone()[0], "cancelled")
@@ -1356,6 +1481,24 @@ class RecoveryTests(unittest.TestCase):
                          owner_before)
         self.assertEqual(self.db.execute("SELECT status FROM recoveries WHERE id='recovery-1'")
                          .fetchone()[0], "retired")
+
+    def test_minimax_recovery_verifies_selected_model_and_rejects_provider_switch(self):
+        model = "opencode-go/minimax-m3.1-flash-free"
+        self.slot["model"] = model
+        session = paths.OPENCODE / self.sid
+        for path in (session / "current.json", session / "turns" / self.turn / "state.json"):
+            data = json.loads(path.read_text())
+            data["model"] = model
+            path.write_text(json.dumps(data))
+        result_path = session / "turns" / self.turn / "result.json"
+        result = json.loads(result_path.read_text())
+        result["expectedModel"] = model
+        result_path.write_text(json.dumps(result))
+        self.slot["model"] = "opencode/minimax-m3.1-flash-free"
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.authorize()
+        self.slot["model"] = model
+        self.assertEqual(self.authorize()["status"], "authorized")
 
 
 if __name__ == "__main__":

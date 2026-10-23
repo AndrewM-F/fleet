@@ -19,9 +19,11 @@
   immutable `recovery_adoptions` record when history predates the exact path/branch convention, or
   a durable direct-turn ownership receipt in `data/recovery/` when the original native turn
   predates the task ledger entirely and no task row exists). A direct-turn receipt records the
-  original session, the canonical owned worktree, the branch and the initial head, and is proved
-  against the native session row (its directory, configured model, succeeded idle outcome and
-  completed assistant output) and the unchanged checkout before authorization; its path and digest
+  original session, the canonical owned worktree, the branch, the initial head, and the exact
+  original user and successful idle message IDs. Those IDs bind a completed assistant to one
+  native turn before the failed managed turn; the mutable session-wide idle outcome cannot
+  substitute for that proof. The native session directory/model and unchanged checkout are also
+  checked before authorization; its path and digest
   are stored with the recovery and re-proved before the successor dispatches. It never creates,
   edits or fabricates a Fleet task.
   Native session CWD stays
@@ -42,6 +44,28 @@
   The adoption separates a locator (`evidence_reference`) from substantive ownership prose
   (`ownership_evidence`); a URL, checksum, or path alone is rejected as evidence, and the operator
   must inspect and verify the referenced source. The locator is not proof by itself.
+- **completed-turn reconciliation**: a managed turn can finish while the manager is not observing
+  its worker — after a fleet replacement, or during a manager outage — and the ledger row then stays
+  `running` forever, because only that worker could close it. The surviving row keeps the same-cwd
+  dispatch exclusivity, so nothing else can use that working directory. `reconcile-completed` closes
+  exactly that row: it requires the exact task/turn/worker/session/cwd identity, the retained native
+  receipt (terminal `done`, exit 0, cleanup confirmed), a full recorded native process identity and
+  a recorded wrapper PID that are both provably gone, a worker this fleet no longer manages, and no
+  competing task for the same cwd. A completed turn ran a process, so a receipt that records no
+  identity, or a null identity beside a successful completion, fails closed. An unknown is never
+  read as "nothing there": a missing, invalid or unreadable roster refuses, a missing, unreadable
+  or corrupt other-root ledger refuses, and ownership in another root is matched by task id, by
+  session and by canonical working directory. That root's ledger is fenced with its own write lock
+  from the verified ownership query through the current-ledger commit, because a transaction on the
+  current ledger does not fence a separate database: a claim written into the retired root in
+  between is blocked instead of slipping through. The session's dispatch lock is held from the
+  first validation through the ledger commit, and the roster and the competing ownership are
+  rechecked inside the transaction that closes the row, so a new native launch or a task that
+  claims the working directory in between is refused instead of raced. It writes one audit event carrying the receipt digests and moves the row
+  to `finished`; the task body, the retained receipt, every hold, the pause, the dispatch flags, the
+  model and the account stay untouched, and the same-cwd dispatch exclusion rule is unchanged. A
+  missing, uncertain or inconsistent receipt is a refusal, an `uncertain` row still needs `resolve`,
+  and the dispatch exclusion rule itself is unchanged.
 - **events**: `review_ready`, `task_uncertain`, `task_unconsumed`, `runner_error`,
   `needs_attention`, `possibly_stalled` (20 min no progress) are relayed; `review_ready` captures
   a receipt in `data/receipts/<event>.json` from the Claude `result.json` or Pi session transcript.

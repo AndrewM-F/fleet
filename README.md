@@ -2,8 +2,10 @@
 
 Local, repo-independent manager that dispatches explicit root-authorized tasks to existing
 Pi (RPC), Claude (`--print`), and explicitly rostered OpenCode CLI worker sessions, relays
-completions with receipts, and never calls a model in the control path. Agents: read
-[AGENTS.md](AGENTS.md).
+completions with receipts, and never calls a model in the control path. An OpenCode session
+is normally created by the operator and then rostered; `bin/fleet add-opencode` creates one on
+demand through the supported OpenCode CLI, which is the only path that may create a session.
+Agents: read [AGENTS.md](AGENTS.md).
 
 ## Setup
 Python 3.11+, `pi` and `claude` on PATH (or set `executables` in config).
@@ -29,11 +31,15 @@ python3 -m unittest discover -s tests -t .
 | `bin/fleet completions collect\|wait\|ack` | relay events + receipts (was `fleet-events.py`) |
 | `bin/fleet resolve …` / `cancel TASK` | operator decisions, abort a running turn |
 | `bin/fleet hold TASK` / `release TASK` | durably pause/resume one unstarted queued task (never a cancel; never clears pause/dispatch/profile/recovery holds) |
+| `bin/fleet reconcile-completed --task ID --turn ID --worker SID --receipt-root PATH --note "..."` | close a stale `running` row whose managed OpenCode turn provably completed |
 | `bin/fleet recovery-snapshot --cwd PATH` / `recover-opencode …` | fingerprint a checkout and authorize one verified OpenCode successor |
 | `bin/fleet adopt-ownership …` / `recover-opencode --adoption-id ID` | append immutable ownership evidence for an owner task whose history predates the exact checkout/branch convention; the reference locates a source the operator must verify and the evidence field must contain substantive prose, not a bare URL or checksum |
 | `bin/fleet recover-opencode --direct-turn-receipt PATH` | ownership source for a genuine native turn that predates the task ledger: a durable receipt in `data/recovery/` recording the original session, canonical worktree, branch and initial head, proved against the native completed turn and the unchanged checkout |
 | `bin/fleet reconcile-recovery --task ID` | release a claimed recovery reservation after verified native stop |
 | `bin/fleet add-pi` / `add-claude` / `remove` | roster edits (validated) |
+| `bin/fleet add-opencode (--count N \|--target-total N) --model PROVIDER/MODEL --cwd PATH --root PATH [--request-key KEY] [--enable-dispatch] [--max-concurrent N] [--reconciled-session SID] [--dry-run\|--status]` | create and register OpenCode sessions on demand, idempotently per request key |
+| `bin/fleet drain-opencode --session SID --note "..."` | stop dispatching to one worker and report the work it still owns (nothing is dropped) |
+| `bin/fleet remove-opencode --session SID --note "..."` | remove one worker from the roster, keeping its native session and history |
 | `bin/fleet supervisor install\|uninstall` | launchd agent running `bin/fleet supervise` |
 | `bin/fleet run` / `wait` / `ack --event-id N` | foreground manager / any-event wait (was `fleet.py`) |
 
@@ -62,3 +68,10 @@ An errored OpenCode task remains terminal. After verifying cleanup and preservin
 worktree, `recover-opencode` records a one-use successor authorization. The manager dispatches a
 separately root-authorized task; it never replays the failed task or changes model/dispatch settings.
 See [OpenCode recovery](docs/troubleshooting.md#opencode-error-turn).
+
+## On-demand OpenCode sessions
+`bin/fleet add-opencode` creates sessions through the supported OpenCode CLI, never through a
+database write. The staged activation and rollback plan, including the pinned older manager and
+the durable state migration, is [docs/opencode-lifecycle-rollout.md](docs/opencode-lifecycle-rollout.md).
+The native creation call is proved against the installed CLI's own OpenAPI schema in
+[docs/opencode-native-api-evidence.md](docs/opencode-native-api-evidence.md).

@@ -1,5 +1,6 @@
 """The authoritative SQLite store: events (ack-tracked), worker snapshots, tasks."""
 import json
+from pathlib import Path
 import sqlite3
 import time
 
@@ -46,6 +47,63 @@ _RECOVERY_ADOPTIONS_COLUMNS = (
     "id", "owner_task_id", "owner_sid", "failed_sid", "failed_turn", "failed_task_id",
     "cwd", "owned_worktree", "branch", "head", "worktree_sha256", "decision",
     "evidence_reference", "ownership_evidence", "note", "created")
+
+
+# Durable receipts for on-demand OpenCode sessions. The request row is the
+# idempotency key of one add request; the session row is the ownership receipt
+# of one native session, so a retry never creates a second session and a removal
+# can always prove which native session it removed from the roster.
+_OPENCODE_PROVISIONING_TABLE = """
+CREATE TABLE IF NOT EXISTS opencode_provisioning (
+  request_key TEXT PRIMARY KEY,
+  model TEXT NOT NULL, account TEXT NOT NULL, cwd TEXT NOT NULL, root TEXT NOT NULL,
+  requested_count INTEGER NOT NULL, dispatch_enabled INTEGER NOT NULL,
+  status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  payload_digest TEXT NOT NULL DEFAULT '',
+  creator_pid INTEGER NOT NULL DEFAULT 0);
+"""
+_OPENCODE_SESSIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS opencode_sessions (
+  session_id TEXT PRIMARY KEY,
+  request_key TEXT NOT NULL, native_id TEXT NOT NULL, model TEXT NOT NULL,
+  account TEXT NOT NULL, cwd TEXT NOT NULL, root TEXT NOT NULL,
+  status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
+  detail TEXT NOT NULL DEFAULT '');
+"""
+
+
+def _upgrade_opencode_provisioning(db):
+    """Add the payload digest to a provisioning table created by an earlier build.
+
+    The idempotency key is bound to the whole request, so the digest of the
+    request has to be kept with it. A table created before that column existed
+    keeps its rows and gains the column; an existing row without a digest is
+    treated as unbound, so a key that is reused with different options is
+    refused rather than silently accepted.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(opencode_provisioning)")}
+    if not columns or "payload_digest" in columns:
+        return
+    db.execute("ALTER TABLE opencode_provisioning ADD COLUMN payload_digest "
+               "TEXT NOT NULL DEFAULT ''")
+    db.commit()
+
+
+def _upgrade_opencode_creator_pid(db):
+    """Add the creator pid to a provisioning table created by an earlier build.
+
+    The pid tells a live attempt from an interrupted one: a request that finds
+    a live creator is told that the request is in progress, while a request
+    that finds a dead one knows the attempt was interrupted and that its
+    outcome has to be reconciled explicitly.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(opencode_provisioning)")}
+    if not columns or "creator_pid" in columns:
+        return
+    db.execute("ALTER TABLE opencode_provisioning ADD COLUMN creator_pid "
+               "INTEGER NOT NULL DEFAULT 0")
+    db.commit()
 
 
 def _upgrade_recovery_adoptions(db):
@@ -123,6 +181,10 @@ def database(path=None):
     if path is None:
         paths.DATA.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path or paths.DB, timeout=10)
+    return _initialize_database(db)
+
+
+def _initialize_database(db):
     db.executescript("""
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS events (
@@ -140,6 +202,10 @@ def database(path=None):
     """)
     db.executescript(_RECOVERIES_TABLE)
     db.executescript(_RECOVERY_ADOPTIONS_TABLE)
+    db.executescript(_OPENCODE_PROVISIONING_TABLE)
+    db.executescript(_OPENCODE_SESSIONS_TABLE)
+    _upgrade_opencode_provisioning(db)
+    _upgrade_opencode_creator_pid(db)
     _upgrade_recovery_adoptions(db)
     _retire_legacy_recoveries(db)
     recovery_columns = {row[1] for row in db.execute("PRAGMA table_info(recoveries)")}
@@ -173,3 +239,31 @@ def emit(db, kind, **body):
                      (kind, json.dumps(body), time.time()))
     db.commit()
     return cur.lastrowid
+
+
+def planning_database(path=None):
+    """Upgrade an in-memory snapshot; never initialize/migrate the source store.
+
+    Read-only SQLite opens can write WAL sidecars. Refuse a WAL store
+    rather than touching its sidecars or silently ignoring committed WAL data.
+    Missing stores are represented by an empty in-memory schema.
+    """
+    source_path = paths.DB if path is None else Path(path)
+    snapshot = sqlite3.connect(":memory:")
+    try:
+        if source_path.exists():
+            wal = source_path.with_name(source_path.name + "-wal")
+            if wal.exists():
+                # SQLite's shared-memory WAL index may be written even by a
+                # read-only connection. A strict no-write plan refuses this
+                # case rather than touching source sidecars or ignoring WAL.
+                raise ValueError("Read-only planning requires a checkpointed store without WAL")
+            uri = source_path.resolve().as_uri() + "?mode=ro&immutable=1"
+            with sqlite3.connect(uri, uri=True) as source:
+                source.backup(snapshot)
+            if wal.exists():
+                raise ValueError("Store changed to WAL during read-only planning; retry later")
+        return _initialize_database(snapshot)
+    except Exception:
+        snapshot.close()
+        raise

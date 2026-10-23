@@ -41,6 +41,10 @@ class QueuedHoldTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # The dispatcher reloads the roster inside the shared model lock.
+        roster = patch.object(paths, "opencode_slots", return_value=[self.slot])
+        roster.start()
+        self.addCleanup(roster.stop)
 
     def add_task(self, task_id, state="queued", sid="worker"):
         self.db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?)",
@@ -251,6 +255,13 @@ class HeldRecoverySuccessorTests(unittest.TestCase):
             patcher = patch.object(paths, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # Keep the fresh-checkout suite independent of local source configuration.
+        config_path = self.root / "synthetic-fleet.json"
+        config_path.write_text(json.dumps({"pi": [], "claude": [], "opencode": [self.slot]}))
+        for name, value in (("CONFIG", config_path), ("DATA", self.data)):
+            fixture_path = patch.object(paths, name, value)
+            fixture_path.start()
+            self.addCleanup(fixture_path.stop)
         slots = patch.object(paths, "opencode_slots", return_value=[self.slot])
         slots.start()
         self.addCleanup(slots.stop)
@@ -273,9 +284,12 @@ class HeldRecoverySuccessorTests(unittest.TestCase):
                   "cwd": str(self.native.resolve()), "model": opencode.MODEL}
         (session / "current.json").write_text(json.dumps(launch))
         state = dict(launch, state="error", cleanup="confirmed", error="failed", finishedAt=100)
-        result = dict(taskId=self.failed, sessionId=self.sid, cwd=str(self.native.resolve()),
+        result = dict(turn=self.turn, taskId=self.failed, sessionId=self.sid,
+                      cwd=str(self.native.resolve()), expectedModel=opencode.MODEL,
                       state="error", cleanup="confirmed", error="failed", toolFailures=[],
-                      finishedAt=100)
+                      finishedAt=100, managedProcessIdentity={
+                          "pid": 9999999, "pgid": 9999999, "start": [1],
+                          "executable": "/usr/bin/opencode"})
         (turn_dir / "state.json").write_text(json.dumps(state))
         (turn_dir / "result.json").write_text(json.dumps(result))
 
