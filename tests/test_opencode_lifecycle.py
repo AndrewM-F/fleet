@@ -715,10 +715,20 @@ class RemovalRefusalTests(Sandbox):
         self.assertIn("opencode_session_removed", kinds)
 
     def test_removal_keeps_the_native_session_and_every_hold(self):
+        unpublished = self.wt / "unpublished-work.txt"
+        unpublished.write_text("preserve this uncommitted work\n")
+        worktree_status = subprocess.run(
+            ["git", "-C", str(self.wt), "status", "--porcelain"],
+            check=True, capture_output=True, text=True).stdout
+        self.assertIn("?? unpublished-work.txt", worktree_status)
         self.db.execute("INSERT INTO task_holds VALUES ('t-other','held','held',1,1)")
         self.db.commit()
         result = opencode_lifecycle.remove_session(self.db, self.existing, note="retiring")
         self.assertTrue(result["nativeSessionKept"])
+        self.assertEqual(unpublished.read_text(), "preserve this uncommitted work\n")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.wt), "status", "--porcelain"],
+            check=True, capture_output=True, text=True).stdout, worktree_status)
         with sqlite3.connect(self.native) as db:
             self.assertEqual(
                 db.execute("SELECT count(*) FROM session_v2 WHERE id=?", (self.existing,)).fetchone()[0],

@@ -3,7 +3,11 @@
 This plan is **not executed**. It describes how the on-demand OpenCode session lifecycle is
 activated on a live fleet and how it is withdrawn again, for root review.
 
-Three facts about the live deployment shape the plan and are stated here rather than assumed:
+The plan was written for a previously pinned manager deployment. On 2026-10-24, the current
+read-only `bin/fleet status` reported no running manager, a disabled supervisor, and no configured
+sessions or tasks. No live activation has been performed. The following compatibility facts apply
+if that older installation is activated again; they are not claims about a currently running
+manager:
 
 - **The running manager is a pinned older build.** It does not know the `draining` flag, so a
   drained worker keeps receiving queued work from it. The drain is therefore *advisory* against

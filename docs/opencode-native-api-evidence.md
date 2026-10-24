@@ -3,7 +3,29 @@
 The Fleet creates a native OpenCode session only through the supported CLI API. This note is the
 evidence that the call the Fleet makes exists, what shape it has, and what is still unproven.
 
-## The installed CLI
+## Current installed CLI verification (2026-10-24)
+
+The current binary was checked with an isolated temporary home and database. The request was only
+`GET /openapi.json`; the command wrote its output to a regular temporary file so the CLI's
+large-response pipe truncation cannot produce misleading evidence. No native session or provider
+request was made. The temporary database contained zero rows in `session_v2`.
+
+| Item | Value |
+| --- | --- |
+| Executable | `/Users/amf/.bun/install/global/node_modules/.bun/@opencode+cli@2.1.3/node_modules/@opencode/cli/bin/opencode.exe` |
+| Version | `opencode v2.1.3` |
+| OpenAPI bytes | 284,874 |
+| OpenAPI SHA-256 | `4554c5dbd2ee9333ca23456833e8c52f14854b2fc39f4c5d332b386ce360adc0` |
+| Session create operation | `POST /api/session`, operationId `session.create`, OpenAPI 3.1.0 |
+| Create body | Optional `id`, `parentID`, `title`, `agent`, `model`, `location`, `metadata`, `permissions`; no prompt/message/content field |
+| Create-operation security | `[]` |
+
+`Model.Ref` remains a closed object with required `id` and `providerID` (optional `variant`);
+`Location.PublicRef` remains a closed object with required `directory`. The implementation's
+schema gate therefore still matches the installed CLI contract. This is contract evidence only;
+it does not prove live account behavior.
+
+## Historical CLI verification (v2.0.29)
 
 | Item | Value |
 | --- | --- |
@@ -77,21 +99,25 @@ carry an inference, and the inference operation is a separate route. **The remai
 precondition is explicit: root's first live request confirms the property on the account**, and the
 command's schema gate is what keeps the request inside the documented contract until then.
 
-## The pinned live manager
+## Manager lifecycle boundary
 
-The live fleet runs the pinned installation
-`~/.codex/archive/2026-10-20/task-2/installations/fleet-3cd7c49efdee`. `tests/test_pinned_manager.py`
-runs that exact code in a temporary root with a synthetic configuration and establishes:
+The source checkout qualified by the current tests is Fleet `main` at the revision recorded in the
+Issue #12 qualification note. The pinned-manager fixture in `tests/test_pinned_manager.py` locates
+an explicitly configured or currently running manager and runs it in a temporary root. It is not
+evidence for a manager that is not running. At the current check there was no Fleet manager process;
+the disposable-root command test and source tests are the applicable offline evidence. The current
+source dispatcher honors `draining`; the older pinned dispatcher's behavior remains a historical
+compatibility condition, not a claim about a running manager.
 
 | Question | Answer | Evidence |
 | --- | --- | --- |
-| Is a new roster entry picked up without stopping or replacing the manager? | **Yes** | the pinned manager is started in a temporary root, a second OpenCode entry is added to the configuration, and the pinned manager's own status file lists it — the same process, no restart |
-| Is the admission limit re-read? | **Yes** | the pinned manager passes `int(paths.config().get("maxConcurrent", 0))` on every cycle; the test changes the limit between two cycles and observes the change |
-| Does the pinned manager honour the `draining` flag? | **No** | the pinned dispatch has no `draining` handling: a drain is **advisory** against it, so the fleet must be paused for the drain window, or the manager upgraded |
-| Do the receipt tables disturb the pinned manager? | **No** | the pinned store does not mention them; they are created with `CREATE TABLE IF NOT EXISTS` and are additive, so the pinned manager keeps running against the same file |
-| Is the heavy-job admission the agent count? | **No** | the pinned `heavy.py` has `SLOT_COUNT = 2` and never reads `maxConcurrent`: heavy-job admission, the logical session count and the admission limit are three separate numbers |
+| Is a new roster entry picked up without stopping or replacing the source manager? | **Yes, offline** | `tests/test_pinned_manager.py` exercises roster reload in a disposable root when the exact manager source is available |
+| Is the admission limit re-read? | **Yes, offline** | the same fixture changes the limit between cycles and observes the next cycle's value |
+| Does current source honor `draining`? | **Yes, offline** | dispatch and stale-snapshot regressions in `tests/test_opencode_lifecycle.py` prove a drained worker is not claimed |
+| Do additive receipt tables disturb an older source manager? | **Yes, source-checked** | the pinned store fixture verifies the old store ignores the additive tables |
+| Is heavy-job admission the agent count? | **No** | `heavy.py` has its own fixed two-slot limit, independent of `maxConcurrent` |
 
-So the roster and the admission limit can be reloaded safely under the pinned manager, and only the
-*drain* needs the fleet paused (or the manager upgraded). The plan in
-[opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md) says exactly that, and does not claim
-drain or removal support the pinned manager does not have.
+These results do not establish lifecycle behavior against a live pinned manager. The reversible
+activation plan in [opencode-lifecycle-rollout.md](opencode-lifecycle-rollout.md) remains separate
+from offline qualification. A live manager must be identified and explicitly activated before
+recording native-turn evidence or claiming the live acceptance complete.
