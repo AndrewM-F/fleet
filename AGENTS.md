@@ -4,6 +4,16 @@ This directory is a small local manager that sends **root-authorized** tasks to 
 Pi and Claude worker sessions. It never calls a model itself. Use `bin/fleet` for lifecycle and queue control; every
 command prints JSON on stdout and exits non-zero on failure.
 
+The separately authorized new-only OpenCode route is
+`bin/fleet disposable-opencode --config PATH [--inspect]`; see
+[docs/disposable-opencode.md](docs/disposable-opencode.md). Its lifecycle uses a
+new native session per admitted job and retires it after completion, with the
+explicit MiMo free model and at most three concurrent jobs. It does not use the
+legacy roster, queue, ledger, resume or recovery commands below. The native
+driver, enforcing backend and current eligibility proofs are not established:
+preserve its admission refusal, and do not bypass it using the legacy launcher.
+Old runtime and history cleanup belongs to its separately authorized controller.
+
 ## Safe, read-only
 - `bin/fleet status` — pause flag, process liveness, per-session state, task counts.
 - `bin/fleet doctor` — validates config, worktrees, session identities, executables, DB.

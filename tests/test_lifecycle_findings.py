@@ -32,7 +32,7 @@ class FindingSandbox(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        root = Path(self.tmp.name)
+        root = Path(self.tmp.name).resolve()
         self.root = root
         self.wt = root / "wt" / "repo"
         self.wt.mkdir(parents=True)
