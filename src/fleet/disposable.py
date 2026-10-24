@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 import time
 from urllib.parse import quote, urlencode
@@ -98,6 +99,8 @@ class NativeExecutor:
     _JOB_TIMEOUT = 12 * 60 * 60
     _STOP_TIMEOUT = 60
     _POLL_SECONDS = 2
+    _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+    _MAX_MESSAGE_PAGES = 100
 
     def _call(self, config, method, path, body=None, timeout=None):
         command = [config.executable, "api"]
@@ -105,22 +108,32 @@ class NativeExecutor:
             command.extend(["--data", json.dumps(body, separators=(",", ":"))])
         command.extend([method, path])
         try:
-            result = subprocess.run(
-                command, cwd=config.cwd, capture_output=True, text=True,
-                timeout=timeout or self._REQUEST_TIMEOUT, check=False)
+            # The native CLI can exit before piped stdout finishes flushing.
+            # A private regular file receives the full response before exit.
+            # Never log response bodies; they can contain job or account data.
+            with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+                result = subprocess.run(
+                    command, cwd=config.cwd, stdout=output, stderr=errors,
+                    timeout=timeout or self._REQUEST_TIMEOUT, check=False)
+                output.seek(0)
+                payload = output.read(self._MAX_RESPONSE_BYTES + 1)
+                errors.seek(0)
+                diagnostic = errors.read(4096)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise AdmissionRefused(
                 f"OpenCode API request could not complete ({method} {path})") from error
         if result.returncode != 0:
-            match = re.search(r"HTTP (\d{3})", result.stdout + result.stderr)
+            match = re.search(rb"HTTP (\d{3})", payload + diagnostic)
             status = int(match.group(1)) if match else None
             detail = f"HTTP {status}" if status else "OpenCode API request failed"
             raise OpenCodeApiError(f"{detail} ({method} {path})", status=status)
-        if not result.stdout.strip():
+        if len(payload) > self._MAX_RESPONSE_BYTES:
+            raise AdmissionRefused("OpenCode API response exceeded the bounded response size")
+        if not payload.strip():
             return None
         try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError as error:
+            return json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise AdmissionRefused(
                 f"OpenCode API returned invalid JSON ({method} {path})") from error
 
@@ -264,16 +277,36 @@ class NativeExecutor:
         return set(self._active(config))
 
     def _messages(self, config, session_id):
-        response = self._call(
-            config, "GET", self._session_path(session_id, "/message?limit=50&order=desc"))
-        data = self._data(response)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for key in ("messages", "items", "data"):
-                if isinstance(data.get(key), list):
-                    return data[key]
-        raise AdmissionRefused("OpenCode message response is malformed")
+        params = {"limit": "10", "order": "desc"}
+        messages = []
+        seen = set()
+        for _ in range(self._MAX_MESSAGE_PAGES):
+            response = self._call(config, "GET", self._session_path(
+                session_id, "/message?" + urlencode(params)))
+            data = self._data(response)
+            if isinstance(data, dict):
+                data = next((data[key] for key in ("messages", "items", "data")
+                             if isinstance(data.get(key), list)), None)
+            if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+                raise AdmissionRefused("OpenCode message response is malformed")
+            messages.extend(data)
+            # Newest-first ordering is retained across cursor pages. Once an
+            # assistant is found, older messages cannot change that selection.
+            if self._latest_assistant(data)[0]:
+                return messages
+            cursor = response.get("cursor", {})
+            if not isinstance(cursor, dict):
+                raise AdmissionRefused("OpenCode message cursor is malformed")
+            following = cursor.get("next")
+            if following is None:
+                return messages
+            if not isinstance(following, str) or not following or len(following) > 4096:
+                raise AdmissionRefused("OpenCode message cursor is malformed")
+            if following in seen:
+                raise AdmissionRefused("OpenCode message cursor repeated")
+            seen.add(following)
+            params = {"limit": "10", "cursor": following}
+        raise AdmissionRefused("OpenCode message pagination exceeded its page bound")
 
     def _permissions_pending(self, config, session_id):
         data = self._data(self._call(

@@ -465,12 +465,97 @@ class NativeExecutorTests(unittest.TestCase):
         })
         self.executor = disposable.NativeExecutor()
 
+    def test_api_collects_complete_large_cli_response(self):
+        executable = Path(self.config.executable)
+        executable.write_text("""#!/usr/bin/env python3
+import json, os, stat
+payload = json.dumps({'data': 'x' * 400000}).encode()
+# Model the observed CLI: its pipe output ends early despite exit zero.
+if not stat.S_ISREG(os.fstat(1).st_mode):
+    payload = payload[:262144]
+os.write(1, payload)
+""")
+        response = self.executor._call(self.config, "GET", "/fixture")
+        self.assertEqual(len(response["data"]), 400000)
+
+    def test_api_rejects_truncated_json_without_exposing_content(self):
+        executable = Path(self.config.executable)
+        executable.write_text("#!/usr/bin/env python3\nprint('{\"data\": \"private')\n")
+        with self.assertRaisesRegex(disposable.AdmissionRefused, "invalid JSON") as error:
+            self.executor._call(self.config, "GET", "/fixture")
+        self.assertNotIn("private", str(error.exception))
+
+    def test_api_preserves_authentication_error_without_exposing_body(self):
+        executable = Path(self.config.executable)
+        executable.write_text("#!/usr/bin/env python3\nimport sys\nprint('HTTP 401 private-detail', file=sys.stderr)\nsys.exit(1)\n")
+        with self.assertRaises(disposable.OpenCodeApiError) as error:
+            self.executor._call(self.config, "GET", "/fixture")
+        self.assertEqual(error.exception.status, 401)
+        self.assertNotIn("private-detail", str(error.exception))
+
+    def test_api_refuses_oversized_response(self):
+        executable = Path(self.config.executable)
+        executable.write_text("#!/usr/bin/env python3\nprint('{\"data\": \"' + 'x' * 100 + '\"}')\n")
+        self.executor._MAX_RESPONSE_BYTES = 50
+        with self.assertRaisesRegex(disposable.AdmissionRefused, "bounded response size"):
+            self.executor._call(self.config, "GET", "/fixture")
+
+    def test_paginated_completion_requires_inactive_tree_before_retirement(self):
+        pages = [{"data": [{"type": "tool"}], "cursor": {"next": "older"}},
+                 {"data": [{"type": "assistant", "finish": "stop",
+                             "content": [{"type": "text", "text": "done"}]}]}]
+        with patch.object(self.executor, "_call", side_effect=[None] + pages), \
+                patch.object(self.executor, "_session_tree", return_value=["ses_test"]), \
+                patch.object(self.executor, "_active_ids", return_value=set()):
+            result = self.executor.run(self.config, "ses_test", disposable.Job("one", "do"),
+                                       threading.Event())
+        self.assertEqual(result, disposable.RunResult("finished", "done", stopped=True))
+        with patch.object(self.executor, "_session_tree", return_value=["ses_test"]), \
+                patch.object(self.executor, "_active_ids", return_value=set()), \
+                patch.object(self.executor, "_call", side_effect=[None,
+                    disposable.OpenCodeApiError("HTTP 404", status=404)]) as call:
+            self.assertTrue(self.executor.retire(self.config, "ses_test"))
+        self.assertEqual([c.args[1] for c in call.call_args_list], ["DELETE", "GET"])
+
+    def test_malformed_messages_never_establish_terminal_stop(self):
+        with patch.object(self.executor, "_call", side_effect=[None, {"data": "truncated"}]), \
+                patch.object(self.executor, "_session_tree", return_value=["ses_test"]), \
+                patch.object(self.executor, "_active_ids", return_value=set()):
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "malformed"):
+                self.executor.run(self.config, "ses_test", disposable.Job("one", "do"),
+                                  threading.Event())
+
+    def test_message_pagination_is_bounded(self):
+        self.executor._MAX_MESSAGE_PAGES = 2
+        pages = [{"data": [], "cursor": {"next": str(n)}} for n in range(2)]
+        with patch.object(self.executor, "_call", side_effect=pages):
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "page bound"):
+                self.executor._messages(self.config, "ses_test")
+
+    def test_message_pagination_finds_assistant_past_tool_page(self):
+        pages = [{"data": [{"type": "tool"}], "cursor": {"next": "opaque"}},
+                 {"data": [{"type": "assistant", "finish": "stop",
+                             "content": [{"type": "text", "text": "done"}]}]}]
+        with patch.object(self.executor, "_call", side_effect=pages) as call:
+            messages = self.executor._messages(self.config, "ses_test")
+        self.assertEqual(self.executor._latest_assistant(messages)[1], "done")
+        self.assertIn("cursor=opaque", call.call_args_list[1].args[2])
+        self.assertNotIn("order=", call.call_args_list[1].args[2])
+
+    def test_message_pagination_refuses_repeated_cursor(self):
+        page = {"data": [], "cursor": {"next": "repeat"}}
+        with patch.object(self.executor, "_call", return_value=page):
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "cursor repeated"):
+                self.executor._messages(self.config, "ses_test")
+
     def test_verify_requires_exact_model_and_existing_provider(self):
         provider_response = {"data": [{"id": "opencode", "integrationID": "opencode"}]}
-        with patch("fleet.disposable.subprocess.run", side_effect=[
-                SimpleNamespace(returncode=0, stdout=disposable.MODEL + "\n", stderr=""),
-                SimpleNamespace(returncode=0, stdout=json.dumps(provider_response), stderr=""),
-        ]) as run:
+        def response(command, **kwargs):
+            if command[-1] == "models":
+                return SimpleNamespace(returncode=0, stdout=disposable.MODEL + "\n", stderr="")
+            kwargs["stdout"].write(json.dumps(provider_response).encode())
+            return SimpleNamespace(returncode=0)
+        with patch("fleet.disposable.subprocess.run", side_effect=response) as run:
             self.assertTrue(self.executor.verify(self.config))
         self.assertEqual(run.call_args_list[0].args[0], [self.config.executable, "models"])
         self.assertEqual(run.call_args_list[1].args[0][-2:], ["GET", "/api/provider"])
