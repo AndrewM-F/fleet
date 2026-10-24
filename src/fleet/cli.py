@@ -10,13 +10,22 @@ import subprocess
 import sys
 import time
 
-from . import (claude, completion, control, events, holds, manager, model_selection, opencode,
+from . import (claude, completion, control, disposable, events, holds, manager, model_selection, opencode,
                opencode_lifecycle, ops, paths, pi, recovery)
 from .store import BUSY, database, planning_database
 
 
 def out(value):
     print(json.dumps(value, indent=2) if not isinstance(value, str) else value, flush=True)
+
+
+def cmd_disposable_opencode(args):
+    try:
+        disposable.command(args.config, sys.stdin,
+                           lambda value: print(json.dumps(value), flush=True), args.inspect)
+    except (disposable.AdmissionRefused, ValueError, OSError) as error:
+        out({"refused": str(error)})
+        raise SystemExit(2)
 
 
 def alive(pid):
@@ -626,7 +635,12 @@ def main(argv=None):
     p.add_argument("action", choices=["install", "uninstall"])
     p.set_defaults(fn=lambda a: out(ops.install_launchd() if a.action == "install"
                                     else ops.uninstall_launchd()))
+    p = sub.add_parser("disposable-opencode",
+                       help="new jobs only; fresh session per job, at most three MiMo jobs")
+    p.add_argument("--config", required=True, help="explicit disposable dispatch configuration")
+    p.add_argument("--inspect", action="store_true", help="report activation gaps without effects")
+    p.set_defaults(fn=cmd_disposable_opencode)
     args = parser.parse_args(argv)
-    if not (args.cmd == "add-opencode" and args.dry_run):
+    if args.cmd != "disposable-opencode" and not (args.cmd == "add-opencode" and args.dry_run):
         paths.DATA.mkdir(parents=True, exist_ok=True)
     args.fn(args)
