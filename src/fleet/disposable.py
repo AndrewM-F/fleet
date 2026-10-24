@@ -284,8 +284,10 @@ class NativeExecutor:
     def _latest_assistant(messages):
         for item in messages:
             info = item.get("info", item) if isinstance(item, dict) else {}
-            if isinstance(info, dict) and info.get("role") == "assistant":
-                parts = item.get("parts", []) if isinstance(item, dict) else []
+            if (isinstance(info, dict)
+                    and (info.get("role") == "assistant"
+                         or info.get("type") == "assistant")):
+                parts = item.get("parts", item.get("content", []))
                 text = "".join(
                     part.get("text", "") for part in parts
                     if isinstance(part, dict) and part.get("type") == "text")
