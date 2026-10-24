@@ -510,6 +510,16 @@ class NativeExecutorTests(unittest.TestCase):
                 self.executor.retire(self.config, session_id)
         call.assert_not_called()
 
+    def test_latest_assistant_reads_current_native_type_content_response(self):
+        info, text = self.executor._latest_assistant([
+            {"id": "msg_idle", "type": "idle", "outcome": "succeeded"},
+            {"id": "msg_answer", "type": "assistant", "finish": "stop",
+             "content": [{"type": "reasoning", "text": "short reply"},
+                         {"type": "text", "text": "pong."}]},
+        ])
+        self.assertEqual(info["finish"], "stop")
+        self.assertEqual(text, "pong.")
+
     def test_manager_lock_is_singleton_under_durable_fleet_state(self):
         with patch("fleet.disposable.Path.home", return_value=Path(self.tmp.name)):
             lock_fd = disposable._acquire_manager_lock(self.config)
