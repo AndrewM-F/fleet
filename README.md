@@ -8,10 +8,10 @@ demand through the supported OpenCode CLI, which is the only path that may creat
 Agents: read [AGENTS.md](AGENTS.md).
 
 The separate [disposable OpenCode route](docs/disposable-opencode.md) accepts only
-new jobs and qualifies a fresh-session lifecycle with a three-job MiMo free cap.
-`bin/fleet disposable-opencode --config PATH --inspect` reports its activation
-gaps without native effects. Live execution remains blocked pending the enforcing
-native driver and verified account/model eligibility.
+new jobs, creates a fresh session per job, and enforces a three-job MiMo free cap
+through the signed-in local OpenCode service. It uses OpenCode's normal
+same-user permissions; it does not claim OS-level credential isolation. Inspect
+checks the local service/provider/model without creating sessions or probing quota.
 
 ## Setup
 Python 3.11+, `pi` and `claude` on PATH (or set `executables` in config).
@@ -29,7 +29,7 @@ python3 -m unittest discover -s tests -t .
 ## Commands
 | command | effect |
 |---|---|
-| `bin/fleet disposable-opencode --config PATH [--inspect]` | process-local new-job route; fresh session per job, cap three; live admission currently refused |
+| `bin/fleet disposable-opencode --config PATH [--inspect]` | foreground new-job route; fresh session per job, cap three; JSON-lines queue/status/cancel/stop |
 | `bin/fleet start [--lane L] [--controllers-only]` | start missing lane controllers + manager (pause unchanged) |
 | `bin/fleet pause` / `resume` | gate dispatch (`data/dispatch.paused`) |
 | `bin/fleet stop [--force] [--manager-only]` | SIGTERM and verify exit; refuses if a Pi lane is busy |
