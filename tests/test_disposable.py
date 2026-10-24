@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fleet import disposable
@@ -41,6 +42,9 @@ class FakeExecutor:
         if not self.allowed:
             raise disposable.AdmissionRefused("Exact account eligibility proof unavailable")
         self.bindings.append(config)
+
+    def verify_clean_start(self, config):
+        return True
 
     def create(self, config, job):
         with self.condition:
@@ -355,8 +359,7 @@ class DisposableTests(unittest.TestCase):
                                          FLEET_CONFIG=str(Path(self.tmp.name) / "no-legacy.json")))
         report = json.loads(result.stdout)
         self.assertFalse(report["ready"])
-        self.assertIn("quota eligibility unverified", report["reason"])
-        self.assertIn("No production enforcing backend", report["reason"])
+        self.assertIn("Configured OpenCode executable is missing or changed", report["reason"])
         self.assertEqual(set(Path(self.tmp.name).iterdir()), before)
 
     def test_supported_entrypoint_refusal_is_json_nonzero_and_has_no_effect(self):
@@ -368,7 +371,8 @@ class DisposableTests(unittest.TestCase):
                                 capture_output=True, text=True,
                                 env=dict(os.environ, FLEET_ROOT=str(Path(self.tmp.name) / "no-root")))
         self.assertEqual(result.returncode, 2)
-        self.assertIn("quota eligibility unverified", json.loads(result.stdout)["refused"])
+        self.assertIn("Configured OpenCode executable is missing or changed",
+                      json.loads(result.stdout)["refused"])
         self.assertEqual(result.stderr, "")
         self.assertFalse((Path(self.tmp.name) / "no-root").exists())
 
@@ -396,7 +400,11 @@ class DisposableTests(unittest.TestCase):
 
         drain = (patch.object(disposable.Fleet, "drain", side_effect=KeyboardInterrupt)
                  if interrupt_drain else nullcontext())
-        with patch.object(disposable, "NativeExecutor", return_value=self.fake), drain:
+        lock_file = Path(self.tmp.name) / "manager.lock"
+        lock_file.touch()
+        lock_fd = os.open(lock_file, os.O_RDWR)
+        with patch.object(disposable, "NativeExecutor", return_value=self.fake), \
+                patch.object(disposable, "_acquire_manager_lock", return_value=lock_fd), drain:
             if interrupt or interrupt_drain:
                 with self.assertRaises(KeyboardInterrupt):
                     disposable.command(config_path, stream(), outputs.append)
@@ -441,6 +449,74 @@ class DisposableTests(unittest.TestCase):
         self.assertEqual(len(self.fake.created), 3)
         self.assertEqual(len(self.fake.retired), 3)
         self.assertTrue(outputs[-1]["closed"])
+
+
+class NativeExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        executable = root / "opencode"
+        executable.write_text("stub")
+        executable.chmod(0o755)
+        self.config = disposable.Config.parse({
+            "executable": str(executable), "account": "opencode",
+            "cwd": str(root), "model": disposable.MODEL, "maxConcurrent": 3,
+        })
+        self.executor = disposable.NativeExecutor()
+
+    def test_verify_requires_exact_model_and_existing_provider(self):
+        provider_response = {"data": [{"id": "opencode", "integrationID": "opencode"}]}
+        with patch("fleet.disposable.subprocess.run", side_effect=[
+                SimpleNamespace(returncode=0, stdout=disposable.MODEL + "\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout=json.dumps(provider_response), stderr=""),
+        ]) as run:
+            self.assertTrue(self.executor.verify(self.config))
+        self.assertEqual(run.call_args_list[0].args[0], [self.config.executable, "models"])
+        self.assertEqual(run.call_args_list[1].args[0][-2:], ["GET", "/api/provider"])
+
+    def test_verify_refuses_when_exact_model_is_not_listed(self):
+        with patch("fleet.disposable.subprocess.run", return_value=SimpleNamespace(
+                returncode=0, stdout="opencode/other-model\n", stderr="")):
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "Exact configured"):
+                self.executor.verify(self.config)
+
+    def test_create_sets_exact_model_and_worktree_then_reads_identity_back(self):
+        worktree = str(Path(self.tmp.name).resolve() / "job")
+        session_id = "ses_native123"
+        responses = [
+            {"data": {"id": session_id}},
+            {"data": {"id": session_id, "directory": worktree,
+                       "model": {"providerID": "opencode", "id": "mimo-v2.6-flash-free"}}},
+        ]
+        with patch.object(self.executor, "job_cwd", return_value=worktree), \
+                patch.object(self.executor, "_call", side_effect=responses) as call:
+            self.assertEqual(self.executor.create(
+                self.config, disposable.Job("job", "do work", worktree)), session_id)
+        self.assertEqual(call.call_args_list[0].args[1:3], ("POST", "/api/session"))
+        self.assertEqual(call.call_args_list[0].args[3], {
+            "title": "Fleet-disposable:job", "location": {"directory": worktree},
+            "model": {"providerID": "opencode", "id": "mimo-v2.6-flash-free"},
+        })
+        self.assertEqual(call.call_args_list[1].args[1:3],
+                         ("GET", "/api/session/" + session_id))
+
+    def test_retire_refuses_while_native_session_is_active(self):
+        session_id = "ses_native123"
+        with patch.object(self.executor, "_session_tree", return_value=[session_id]), \
+                patch.object(self.executor, "_active_ids", return_value={session_id}), \
+                patch.object(self.executor, "_call") as call:
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "active OpenCode session"):
+                self.executor.retire(self.config, session_id)
+        call.assert_not_called()
+
+    def test_manager_lock_is_singleton_under_durable_fleet_state(self):
+        with patch("fleet.disposable.Path.home", return_value=Path(self.tmp.name)):
+            lock_fd = disposable._acquire_manager_lock(self.config)
+            self.addCleanup(os.close, lock_fd)
+            with self.assertRaisesRegex(disposable.AdmissionRefused, "already owns"):
+                disposable._acquire_manager_lock(self.config)
+        self.assertTrue((Path(self.tmp.name) / "Developer/.codex/fleet").is_dir())
 
 
 if __name__ == "__main__":

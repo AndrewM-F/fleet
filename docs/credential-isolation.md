@@ -1,11 +1,18 @@
-# Credential isolation contract — source-only, not ready
+# Credential isolation for legacy persistent OpenCode turns
 
-No supported enforcing backend has been established on Andrew's Mac. This
-packet supplies a fail-closed trust contract and synthetic tests, not OS
-confinement. The production backend registry is deliberately empty. Applying
-this branch would block new OpenCode prompts/launches; it must not be activated
-on a running fleet without separate review and approval. No policy, credentials,
-security settings, accounts, installed launcher, or manager were changed.
+This contract applies to the legacy rostered-session transport. The new
+disposable-job route uses the local OpenCode service and its normal same-user
+permission boundary instead; see [Disposable OpenCode jobs](disposable-opencode.md).
+That route does not claim OS-level credential isolation.
+
+## Legacy transport status
+
+No supported enforcing backend has been established on Andrew's Mac for the
+legacy rostered-session transport. This packet supplies a fail-closed trust
+contract and synthetic tests, not OS confinement. Its production backend
+registry remains deliberately empty, so the legacy transport refuses turns.
+The disposable route has a separate local-service execution boundary described
+in `disposable-opencode.md`.
 
 Fresh HOME/XDG directories, environment stripping, command regexes, native
 permission declarations, and worker-written `enforced: true` JSON are not a
