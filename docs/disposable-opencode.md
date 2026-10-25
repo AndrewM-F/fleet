@@ -103,7 +103,11 @@ Any paid failure stops without another provider request. Verified paid exhaustio
 is recorded separately from the free hold; an unclassified paid failure is marked
 `paidFailure`, not mislabeled verified quota. The native session and partial work
 are retained, admission closes, and future paid admission refuses until operator
-review. Malformed evidence, uncertain prompt/model-update outcomes, cancellation,
+review. Paid deadline expiry records `paidFailure.kind: timeout` before awaiting
+native interruption; context is retained after confirmed inactivity and also
+when stop remains unverified. Timeout is not mislabeled verified quota. Operator
+cancellation remains distinct and follows normal verified-cancellation retirement
+without creating a paid-failure hold. Malformed evidence, uncertain prompt/model-update outcomes, cancellation,
 changed session identity and failed retirement all fail closed. Never restart the
 manager to bypass a hold or its leftover-session guard. Controllers remain
 status/relay only; implementation runs only as the explicitly authorized job.

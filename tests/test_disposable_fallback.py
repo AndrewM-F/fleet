@@ -310,6 +310,161 @@ class FallbackTests(unittest.TestCase):
         with self.assertRaises(d.AdmissionRefused):
             fleet.enqueue({"id": "another", "message": "do", "rootAuthorized": True})
 
+    def test_paid_timeout_interrupt_inactive_preserves_session_and_blocks_admission(self):
+        for held_at_start in (True, False):
+            with self.subTest(held_at_start=held_at_start):
+                self.calls.clear()
+                self.state(held=held_at_start, signatures=[self.signature()])
+                self.cancel.clear()
+                activity = {"running": False}
+                frames = [] if held_at_start else [self.quota()]
+                original_api = self.api
+                def api(config, method, path, body=None, **kwargs):
+                    result = original_api(config, method, path, body, **kwargs)
+                    if path.endswith("/prompt") and self.model["providerID"] == "opencode-go":
+                        activity["running"] = True
+                    if path.endswith("/interrupt"):
+                        activity["running"] = False
+                    return result
+                def messages(*args):
+                    return [frames.pop(0)] if frames else []
+                with patch.object(self.executor, "_call", side_effect=api), \
+                        patch.object(self.executor, "_messages", side_effect=messages), \
+                        patch.object(self.executor, "_active_ids", side_effect=lambda c:
+                                     {self.sid} if activity["running"] else set()), \
+                        patch.object(self.executor, "_JOB_TIMEOUT", 0), \
+                        patch.object(self.executor, "_STOP_TIMEOUT", 5), \
+                        patch("fleet.disposable.time.monotonic", return_value=100), \
+                        patch.object(self.executor, "retire", return_value=True) as retire:
+                    fleet = d.Fleet(self.config, self.executor)
+                    fleet.enqueue({"id": self.job.id, "message": self.job.message,
+                                   "rootAuthorized": True})
+                    fleet.drain()
+                    status = fleet.status()
+                    retire.assert_not_called()
+                    self.assertTrue(status["blocked"])
+                    terminal = status["results"][0]
+                    self.assertEqual(terminal["state"], "failed")
+                    self.assertFalse(terminal["retired"])
+                    self.assertEqual(terminal["sessionId"], self.sid)
+                    self.assertIn("timed out", terminal["error"])
+                    self.assertFalse(any(c[0] == "DELETE" for c in self.calls))
+                    self.assertEqual(sum(c[1].endswith("/interrupt") for c in self.calls), 1)
+                    self.assertEqual(len(self.prompts()), 1 if held_at_start else 2)
+                    with self.assertRaises(d.AdmissionRefused):
+                        fleet.enqueue({"id": "next", "message": "do", "rootAuthorized": True})
+                    with self.assertRaisesRegex(d.AdmissionRefused, "Paid model is held"):
+                        self.executor.verify(self.config)
+                state = json.loads(self.path.read_text())
+                self.assertEqual(state["paidFailure"]["kind"], "timeout")
+                self.assertNotIn(d.PAID_MODEL, state["holds"])
+
+    def test_operator_cancel_of_paid_turn_does_not_latch_paid_failure(self):
+        self.state(held=True)
+        self.frames = []
+        activity = {"running": False}
+        original_api = self.api
+        def api(config, method, path, body=None, **kwargs):
+            result = original_api(config, method, path, body, **kwargs)
+            if path.endswith("/prompt"):
+                activity["running"] = True
+                self.cancel.set()
+            if path.endswith("/interrupt"):
+                activity["running"] = False
+            return result
+        with patch.object(self.executor, "_call", side_effect=api), \
+                patch.object(self.executor, "_active_ids", side_effect=lambda c:
+                             {self.sid} if activity["running"] else set()), \
+                patch.object(self.executor, "_JOB_TIMEOUT", 0):
+            result = self.run_job()
+        self.assertEqual(result.state, "cancelled")
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.preserve_session)
+        self.assertNotIn("paidFailure", json.loads(self.path.read_text()))
+        self.assertEqual(len(self.prompts()), 1)
+
+    def test_unconfirmed_paid_timeout_still_latches_failure_without_claiming_stop(self):
+        self.state(held=True)
+        self.frames = []
+        activity = {"running": False}
+        original_api = self.api
+        def api(config, method, path, body=None, **kwargs):
+            result = original_api(config, method, path, body, **kwargs)
+            if path.endswith("/prompt"):
+                activity["running"] = True
+            return result  # Interrupt remains unconfirmed.
+        with patch.object(self.executor, "_call", side_effect=api), \
+                patch.object(self.executor, "_active_ids", side_effect=lambda c:
+                             {self.sid} if activity["running"] else set()), \
+                patch.object(self.executor, "_JOB_TIMEOUT", 0), \
+                patch.object(self.executor, "_STOP_TIMEOUT", 0), \
+                patch("fleet.disposable.time.monotonic", return_value=100):
+            result = self.run_job()
+        self.assertEqual(result.state, "failed")
+        self.assertFalse(result.stopped)
+        self.assertTrue(result.preserve_session)
+        self.assertEqual(json.loads(self.path.read_text())["paidFailure"]["kind"], "timeout")
+        self.assertFalse(any(c[0] == "DELETE" for c in self.calls))
+
+    def test_paid_timeout_hold_is_durable_even_when_interrupt_fails(self):
+        self.state(held=True)
+        self.frames = []
+        activity = {"running": False}
+        original_api = self.api
+        def api(config, method, path, body=None, **kwargs):
+            result = original_api(config, method, path, body, **kwargs)
+            if path.endswith("/prompt"):
+                activity["running"] = True
+            if path.endswith("/interrupt"):
+                raise d.OpenCodeApiError("Interrupt transport failed")
+            return result
+        with patch.object(self.executor, "_call", side_effect=api), \
+                patch.object(self.executor, "_active_ids", side_effect=lambda c:
+                             {self.sid} if activity["running"] else set()), \
+                patch.object(self.executor, "_JOB_TIMEOUT", 0), \
+                patch("fleet.disposable.time.monotonic", return_value=100), \
+                patch.object(self.executor, "retire", return_value=True) as retire:
+            fleet = d.Fleet(self.config, self.executor)
+            fleet.enqueue({"id": self.job.id, "message": self.job.message, "rootAuthorized": True})
+            fleet.drain()
+            self.assertTrue(fleet.status()["blocked"])
+            retire.assert_not_called()
+            self.assertEqual(json.loads(self.path.read_text())["paidFailure"]["kind"], "timeout")
+            with self.assertRaisesRegex(d.AdmissionRefused, "Paid model is held"):
+                self.executor.verify(self.config)
+        self.assertFalse(any(c[0] == "DELETE" for c in self.calls))
+
+    def test_cancel_between_loop_check_and_deadline_is_not_paid_timeout(self):
+        self.state(held=True)
+        self.frames = []
+        activity = {"running": False}
+        clock_calls = []
+        original_api = self.api
+        def api(config, method, path, body=None, **kwargs):
+            result = original_api(config, method, path, body, **kwargs)
+            if path.endswith("/prompt"):
+                activity["running"] = True
+            if path.endswith("/interrupt"):
+                activity["running"] = False
+            return result
+        def clock():
+            clock_calls.append(1)
+            if len(clock_calls) == 2:
+                self.cancel.set()  # After loop-top check, before timeout decision.
+            return 100
+        with patch.object(self.executor, "_call", side_effect=api), \
+                patch.object(self.executor, "_active_ids", side_effect=lambda c:
+                             {self.sid} if activity["running"] else set()), \
+                patch.object(self.executor, "_JOB_TIMEOUT", 0), \
+                patch.object(self.executor, "_STOP_TIMEOUT", 5), \
+                patch("fleet.disposable.time.monotonic", side_effect=clock):
+            result = self.run_job()
+        self.assertEqual(result.state, "cancelled")
+        self.assertTrue(result.stopped)
+        self.assertFalse(result.preserve_session)
+        self.assertNotIn("paidFailure", json.loads(self.path.read_text()))
+        self.assertEqual(len(self.prompts()), 1)
+
     def test_free_and_go_managers_share_the_same_three_slot_lock(self):
         paid = replace(self.config, model=d.PAID_MODEL, account="opencode-go", fallback_model=None)
         with patch("fleet.disposable.Path.home", return_value=self.root):

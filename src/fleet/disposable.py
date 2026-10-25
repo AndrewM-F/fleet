@@ -187,7 +187,7 @@ class NativeExecutor:
                 return signature
         return None
 
-    def _record_quota(self, config, model, info, proof=None):
+    def _record_quota(self, config, model, info, proof=None, reason="native-error"):
         if not config.quota_evidence_path:
             return
         with self._quota_lock:
@@ -199,7 +199,7 @@ class NativeExecutor:
             elif model == PAID_MODEL:
                 # Preserve a paid failure separately; do not mislabel it verified quota.
                 error = info.get("error", {})
-                state["paidFailure"] = {"assistantID": info.get("id"),
+                state["paidFailure"] = {"kind": reason, "assistantID": info.get("id"),
                                         "status": error.get("status") if isinstance(error, dict)
                                         and type(error.get("status")) is int else None,
                                         "source": "native-paid-failure;operator-review-required"}
@@ -522,6 +522,12 @@ class NativeExecutor:
             if previous_assistant and info.get("id") == previous_assistant:
                 info = {}  # Await the paid turn; the prior free error is not its result.
             if not active and interrupted:
+                if not cancelled and model == PAID_MODEL:
+                    return RunResult(
+                        "failed", text or "Paid job timed out", stopped=True,
+                        preserve_session=True,
+                        error="Paid model timed out; no retry; native context preserved",
+                        transitions=tuple(transitions))
                 status = "cancelled" if cancelled else "failed"
                 output = text or ("Cancelled by operator" if cancelled else "Job timed out")
                 return RunResult(status, output, stopped=True, transitions=tuple(transitions))
@@ -575,11 +581,21 @@ class NativeExecutor:
                                  error="Unclassified native failure; no provider retry",
                                  transitions=tuple(transitions))
             if not interrupted and time.monotonic() >= deadline:
-                self._interrupt_tree(config, session_id)
+                # Classify once at the deadline decision. A cancellation already
+                # requested after the loop-top check wins over timeout.
+                cancelled = cancel.is_set()
                 interrupted = True
                 stop_deadline = time.monotonic() + self._STOP_TIMEOUT
+                try:
+                    if not cancelled and model == PAID_MODEL:
+                        self._record_quota(config, model, info, reason="timeout")
+                finally:
+                    # Persist first, but still attempt a stop if evidence I/O fails.
+                    self._interrupt_tree(config, session_id)
             if interrupted and stop_deadline is not None and time.monotonic() >= stop_deadline:
-                return RunResult("failed", text, stopped=False, transitions=tuple(transitions))
+                return RunResult("failed", text, stopped=False,
+                                 preserve_session=model == PAID_MODEL,
+                                 transitions=tuple(transitions))
             cancel.wait(self._POLL_SECONDS)
 
     def retire(self, config, session_id):
