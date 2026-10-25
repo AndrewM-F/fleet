@@ -168,3 +168,23 @@ evidence; it is not OS descendant-containment evidence.
 No live model request or quota probe is part of configuration inspection. The
 offline lifecycle tests use an in-memory fake executor and do not establish
 provider availability or quota.
+
+## Review-gated Adea #536 one-use exception
+
+`scripts/continue-adea536-once.py` is a separately reviewed one-use helper for
+`ses_e8c720ce7ffe00SZeLu9ixDNM8`, whose earlier admission stopped before prompting.
+It is not a generic adoption/resume route and has no session or path arguments.
+Do not execute it before root approves its exact source and fresh reconciliation.
+The normal new-only queue continues to reject preserved sessions.
+
+The helper pins the owned job, clean branch/head, task/config/runtime bytes and
+owner record; takes the same account lock; and requires the exact audited
+model-switch event with no user/assistant work, empty inbox, zero usage, no
+children, no active native work, no other disposable session and no pending
+permission. It selects the already authorized paid model only with the verified
+free hold. Exclusive durable attempt and prompt-intent records prevent replay,
+including after a crash or ambiguous response. A prompt-accepted receipt records
+the actual native inbox ID and implementation owner; intent is not execution.
+The reviewed NativeExecutor handles the productive turn and paid stops. Success,
+failure, uncertainty and cancellation all preserve this session for review; the
+helper never creates, deletes or retires a session, and never clears its latch.
