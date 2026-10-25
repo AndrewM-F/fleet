@@ -69,6 +69,8 @@ class ReviewTests(unittest.TestCase):
         self.extra = []
         self.history_response = None
         self.pages = False
+        self.missing_session = False
+        self.session_inventory = None
         self.calls = []
         self.git_values = iter([self.pin["head"], self.pin["branch"], ""])
         self.executor = d.NativeExecutor()
@@ -104,6 +106,8 @@ class ReviewTests(unittest.TestCase):
             raise AssertionError("Operator review must never mutate a native session")
         base = self.executor._session_path(self.pin["session"])
         if path == base:
+            if self.missing_session:
+                raise d.OpenCodeApiError("HTTP 404", status=404)
             return {"data": copy.deepcopy(self.session)}
         if path == base + "/inbox":
             return copy.deepcopy(self.inbox)
@@ -119,7 +123,16 @@ class ReviewTests(unittest.TestCase):
         if path.startswith("/api/session?"):
             if "parentID=" in path:
                 return {"data": copy.deepcopy(self.children)}
-            return {"data": [copy.deepcopy(self.session), *copy.deepcopy(self.extra)]}
+            if self.session_inventory is not None:
+                if isinstance(self.session_inventory, list):
+                    page = 0 if "cursor=" not in path else 1
+                    return copy.deepcopy(self.session_inventory[page])
+                return copy.deepcopy(self.session_inventory)
+            items = [copy.deepcopy(self.session), *copy.deepcopy(self.extra)]
+            if "search=Fleet-disposable" in path:
+                items = [item for item in items if isinstance(item, dict)
+                         and "Fleet-disposable" in item.get("title", "")]
+            return {"data": items}
         raise AssertionError(path)
 
     def review(self, apply=True):
@@ -163,6 +176,39 @@ class ReviewTests(unittest.TestCase):
             fleet.enqueue({"id": self.pin["job"], "message": "must not run", "rootAuthorized": True})
         self.assertEqual([], fleet.status()["active"])
         self.assertTrue(all(method == "GET" for method, _ in self.calls))
+
+    def test_renamed_or_missing_exact_session_cannot_hide_behind_search(self):
+        self.review()
+        self.session["title"] = "renamed"
+        with self.assertRaises(d.AdmissionRefused):
+            self.executor.verify_clean_start(self.config)
+        self.session["title"] = "Fleet-disposable:" + self.pin["job"]
+        self.missing_session = True
+        with self.assertRaises(d.AdmissionRefused):
+            self.executor.verify_clean_start(self.config)
+
+    def test_renamed_unreviewed_session_still_requires_operator_review(self):
+        self.session["title"] = "renamed"
+        with self.assertRaises(d.AdmissionRefused):
+            self.executor.verify_clean_start(self.config)
+
+    def test_incomplete_or_malformed_inventory_cannot_hide_other_leftovers(self):
+        self.review()
+        for response in ({"data": [self.session], "cursor": {"next": ""}},
+                         {"data": [self.session], "cursor": None},
+                         {"data": [self.session, None]},
+                         {"data": [self.session, {}]},
+                         {"data": [self.session, {"id": "ses_bad", "title": 42}]}):
+            with self.subTest(response=response):
+                self.session_inventory = response
+                with self.assertRaises(d.AdmissionRefused):
+                    self.executor.verify_clean_start(self.config)
+        self.session_inventory = [
+            {"data": [self.session], "cursor": {"next": "next"}},
+            {"data": [{"id": "ses_other", "title": "Fleet-disposable:other"}]},
+        ]
+        with self.assertRaises(d.AdmissionRefused):
+            self.executor.verify_clean_start(self.config)
 
     def test_unknown_leftover_still_blocks_after_review(self):
         self.review()
@@ -270,6 +316,27 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(d.AdmissionRefused):
             self.review()
         self.assertEqual('{}', target.read_text())
+
+
+class SessionInventoryTests(unittest.TestCase):
+    def test_cursor_and_session_identity_validation_is_bounded(self):
+        executor = d.NativeExecutor()
+        for cursor in ("", False, 1, [], "x" * 4097):
+            with self.subTest(cursor=cursor), patch.object(executor, "_call", return_value={
+                    "data": [{"id": "ses_one"}], "cursor": {"next": cursor}}):
+                with self.assertRaises(d.AdmissionRefused):
+                    executor._list_sessions(None)
+        with patch.object(executor, "_MAX_SESSION_PAGES", 2), patch.object(executor, "_call",
+                side_effect=[{"data": [{"id": "ses_one"}], "cursor": {"next": "a"}},
+                             {"data": [{"id": "ses_two"}], "cursor": {"next": "b"}}]):
+            with self.assertRaisesRegex(d.AdmissionRefused, "page bound"):
+                executor._list_sessions(None)
+        with patch.object(executor, "_call", side_effect=[
+                {"data": [{"id": "ses_one"}], "cursor": {"next": "a"}},
+                {"data": [{"id": "ses_one"}]}]):
+            with self.assertRaisesRegex(d.AdmissionRefused, "identity repeated"):
+                executor._list_sessions(None)
+
 
 
 if __name__ == "__main__":

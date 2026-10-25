@@ -29,7 +29,7 @@ PIN = {
     },
     "configSHA256": "324b7ef96dec57a56e134a12d5cf9afa8492ba8837c92bc9911f892ae6b16326",
     "quotaSHA256": "f3fbd25870257f50ece0dd50672664395d42f5e27adf5c1494bb18a79b6e747f",
-    "runtimeSHA256": "7e37f3e1088b789d5f4acc346788ec0310f5011d62e9250e2446f23c7058e3c8",
+    "runtimeSHA256": "a5b1f1e7885f27a61495c679d96409d0177c08e299a439f791f2d93a2246ceee",
     "sessionSHA256": "8c98bd0c96d6ffc6a7c7c1d61ff83710ef0313c1b71dd46761771bf63645fb31"
 }
 PIN.update({
@@ -144,10 +144,11 @@ def review_record(proof):
             "quotaSHA256AtReview": PIN["quotaSHA256"], "retryAllowed": False}
 
 
-def verify_reviewed_terminal(executor, config, listed):
+def verify_reviewed_terminal(executor, config, listed=None):
     """Only this immutable, live-revalidated disposition can pass clean start."""
     try:
-        if not isinstance(listed, dict) or listed.get("id") != PIN["session"]:
+        if listed is not None and (
+                not isinstance(listed, dict) or listed.get("id") != PIN["session"]):
             raise ValueError("different leftover")
         preserved_inputs()
         path = RUN / RECEIPT
@@ -160,6 +161,17 @@ def verify_reviewed_terminal(executor, config, listed):
         raise d.AdmissionRefused(
             "Unretired Fleet-disposable session lacks its exact reviewed terminal disposition") from error
     return True
+
+
+
+def verify_known_terminal(executor, config):
+    # The preserved session cannot disappear behind a changed title/search filter.
+    # Other users without this custody record/config retain normal new-only mode.
+    known_quota = ROOT / "runs/mimo-verified-paid-fallback-20261025/quota-evidence.json"
+    if (config.account in {"opencode", "opencode-go"}
+            and (RUN.exists() or RUN.is_symlink()
+                 or config.quota_evidence_path == str(known_quota))):
+        verify_reviewed_terminal(executor, config)
 
 
 def refuse_reviewed_job(job):

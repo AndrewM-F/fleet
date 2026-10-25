@@ -222,7 +222,10 @@ and original latches are preserved. Quota evidence is read and hash-checked,
 never cleared or rewritten.
 
 Clean start recognizes only that exact receipt and revalidates the unchanged
-native history and identity every time. A missing/malformed/partial receipt,
+native history and identity every time. The exact preserved ID is checked
+independently of title search, including after a rename or disappearance. Session
+inventory is strictly typed and cursor-paged with an explicit bound; malformed,
+empty or repeated cursors and duplicate IDs refuse admission. A missing/malformed/partial receipt,
 new native work or any other leftover still blocks admission. The completed
 original job ID is refused before dispatch. Receipt creation is exclusive and
 fsynced; an interrupted partial file fails closed and is never overwritten.

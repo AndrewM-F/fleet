@@ -128,6 +128,7 @@ class NativeExecutor:
     _POLL_SECONDS = 2
     _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     _MAX_MESSAGE_PAGES = 100
+    _MAX_SESSION_PAGES = 100
 
     def __init__(self):
         self._quota_lock = threading.RLock()
@@ -318,6 +319,8 @@ class NativeExecutor:
         return True
 
     def verify_clean_start(self, config):
+        from .terminal_review import verify_known_terminal
+        verify_known_terminal(self, config)
         sessions = self._list_sessions(config, search="Fleet-disposable")
         leftovers = [item for item in sessions if isinstance(item, dict)
                      and isinstance(item.get("title"), str)
@@ -330,22 +333,33 @@ class NativeExecutor:
 
     def _list_sessions(self, config, **filters):
         params = {"limit": "100", "order": "desc", **filters}
-        result = []
-        seen = set()
-        while True:
+        result, seen, identities = [], set(), set()
+        for _ in range(self._MAX_SESSION_PAGES):
             response = self._call(config, "GET", "/api/session?" + urlencode(params))
             data = self._data(response)
-            if not isinstance(data, list):
+            if (not isinstance(data, list) or any(
+                    not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                    or not _SESSION.fullmatch(item["id"])
+                    or ("title" in item and not isinstance(item["title"], str))
+                    for item in data)):
                 raise AdmissionRefused("OpenCode session-list response is malformed")
+            for item in data:
+                if item["id"] in identities:
+                    raise AdmissionRefused("OpenCode session-list identity repeated")
+                identities.add(item["id"])
             result.extend(data)
             cursor = response.get("cursor", {})
-            next_cursor = cursor.get("next") if isinstance(cursor, dict) else None
-            if not next_cursor:
+            if not isinstance(cursor, dict):
+                raise AdmissionRefused("OpenCode session-list cursor is malformed")
+            following = cursor.get("next")
+            if following is None:
                 return result
-            if next_cursor in seen:
-                raise AdmissionRefused("OpenCode session-list cursor repeated")
-            seen.add(next_cursor)
-            params["cursor"] = next_cursor
+            if (not isinstance(following, str) or not following or len(following) > 4096
+                    or following in seen):
+                raise AdmissionRefused("OpenCode session-list cursor is invalid or repeated")
+            seen.add(following)
+            params["cursor"] = following
+        raise AdmissionRefused("OpenCode session-list exceeded its page bound")
 
     def _session_tree(self, config, session_id):
         result = [session_id]
