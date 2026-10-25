@@ -92,8 +92,12 @@ select paid. Unknown failures retain the owned session and stop for review.
 On a verified match, the wrapper records a durable free hold, confirms the whole
 native session tree is inactive, uses `session.switchModel` at
 `POST /api/session/{sessionID}/model`, then reads back the exact ID, directory and
-model. The installed v2 `/prompt` schema has no model field; model selection is
-explicit before the paid turn through that supported route. It sends one
+model. Native `Model.Ref` may omit `variant` or materialize `variant: "default"`
+for that same unqualified model selection; switch readback accepts only those two
+shapes, with exact provider/model IDs and no extra model keys. Other variants,
+session IDs and directories remain refused. The installed v2 `/prompt` schema
+has no model field; model selection is explicit before the paid turn through
+that supported route. It sends one
 stably identified continuation in the **same** session, asking the worker
 to inspect existing work rather than replaying the original task. The original
 prompt is never resent. The failed free assistant ID is fenced out while waiting

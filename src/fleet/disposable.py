@@ -227,8 +227,13 @@ class NativeExecutor:
         if not isinstance(session, dict):
             raise AdmissionRefused("Native model-switch readback is malformed")
         location = session.get("directory") or session.get("location", {}).get("directory")
-        if (session.get("id") != session_id or session.get("model") != {
-                "providerID": provider, "id": identifier}
+        native_model = session.get("model")
+        expected_model = {"providerID": provider, "id": identifier}
+        # Native v2 may materialize its default variant after an unqualified
+        # model switch. Keep exact equality so other variants/keys fail closed.
+        if isinstance(native_model, dict) and native_model.get("variant") == "default":
+            expected_model["variant"] = "default"
+        if (session.get("id") != session_id or native_model != expected_model
                 or location != self.job_cwd(config, job)):
             raise AdmissionRefused("Native switch did not preserve session/worktree/exact model")
 

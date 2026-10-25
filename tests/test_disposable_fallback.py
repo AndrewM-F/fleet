@@ -270,6 +270,73 @@ class FallbackTests(unittest.TestCase):
                 self.run_job()
         self.assertFalse(self.prompts())
 
+    def test_native_default_variant_readback_on_both_paid_entry_paths(self):
+        # Sanitized shape from the held-free admission: native v2 materializes
+        # variant="default" and reports the directory under location.
+        for held in (True, False):
+            with self.subTest(held=held):
+                self.calls.clear()
+                self.state(held=held, signatures=[] if held else [self.signature()])
+                self.frames = [self.success()] if held else [self.quota(), self.success()]
+                original_api = self.api
+                def api(config, method, path, body=None, **kwargs):
+                    result = original_api(config, method, path, body, **kwargs)
+                    if method == "GET" and path == "/api/session/" + self.sid:
+                        result["data"] = {
+                            "id": self.sid,
+                            "location": {"directory": str(self.root)},
+                            "model": {**self.model, "variant": "default"},
+                        }
+                    return result
+                with patch.object(self.executor, "_call", side_effect=api):
+                    result = self.run_job()
+                self.assertEqual(result.state, "finished")
+                self.assertEqual(len(self.switches()), 1)
+                self.assertEqual(len(self.prompts()), 1 if held else 2)
+                self.assertEqual(sum(c[1] == "/api/session" for c in self.calls), 1)
+                self.assertEqual(sum(c[2]["text"] == self.job.message
+                                     for c in self.prompts()), 1)
+
+    def test_default_variant_does_not_relax_readback_identity(self):
+        changes = [
+            {"id": "ses_other"},
+            {"location": {"directory": "/other"}},
+            {"model": {"providerID": "other", "id": "mimo-v2.6-flash", "variant": "default"}},
+            {"model": {"providerID": "opencode-go", "id": "other", "variant": "default"}},
+        ]
+        models = [
+            {"providerID": "opencode-go", "id": "mimo-v2.6-flash", "variant": variant}
+            for variant in ("high", "", None, False, ["default"])
+        ]
+        models.extend([
+            {"providerID": "opencode-go", "id": "mimo-v2.6-flash", "variant": "default", "extra": True},
+            {"providerID": "opencode-go", "variant": "default"},
+            {"id": "mimo-v2.6-flash", "variant": "default"},
+            None,
+        ])
+        changes.extend({"model": model} for model in models)
+        for change in changes:
+            with self.subTest(change=change):
+                self.calls.clear()
+                self.state(held=True)
+                original_api = self.api
+                def api(config, method, path, body=None, **kwargs):
+                    result = original_api(config, method, path, body, **kwargs)
+                    if (method == "GET" and path == "/api/session/" + self.sid
+                            and self.switches()):
+                        result["data"] = {
+                            "id": self.sid,
+                            "location": {"directory": str(self.root)},
+                            "model": {**self.model, "variant": "default"},
+                            **change,
+                        }
+                    return result
+                with patch.object(self.executor, "_call", side_effect=api):
+                    with self.assertRaisesRegex(d.AdmissionRefused, "preserve session"):
+                        self.run_job()
+                self.assertFalse(self.prompts())
+                self.assertFalse(any(c[0] == "DELETE" for c in self.calls))
+
     def test_cancel_after_switch_prevents_paid_prompt(self):
         self.state(held=True)
         original_api = self.api
