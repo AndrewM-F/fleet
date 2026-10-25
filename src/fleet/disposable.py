@@ -348,7 +348,7 @@ class NativeExecutor:
                     raise AdmissionRefused("OpenCode session-list identity repeated")
                 identities.add(item["id"])
             result.extend(data)
-            cursor = response.get("cursor", {})
+            cursor = response.get("cursor")
             if not isinstance(cursor, dict):
                 raise AdmissionRefused("OpenCode session-list cursor is malformed")
             following = cursor.get("next")

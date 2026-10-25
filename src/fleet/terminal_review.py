@@ -29,7 +29,7 @@ PIN = {
     },
     "configSHA256": "324b7ef96dec57a56e134a12d5cf9afa8492ba8837c92bc9911f892ae6b16326",
     "quotaSHA256": "f3fbd25870257f50ece0dd50672664395d42f5e27adf5c1494bb18a79b6e747f",
-    "runtimeSHA256": "a5b1f1e7885f27a61495c679d96409d0177c08e299a439f791f2d93a2246ceee",
+    "runtimeSHA256": "4c6c400c1c9cf532e9f881983160ce1a26797b2a7308f3977e5937db300a4884",
     "sessionSHA256": "8c98bd0c96d6ffc6a7c7c1d61ff83710ef0313c1b71dd46761771bf63645fb31"
 }
 PIN.update({
@@ -81,7 +81,7 @@ def history(executor, config):
         if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
             raise d.AdmissionRefused("Terminal review history is malformed")
         messages.extend(data)
-        cursor = response.get("cursor", {})
+        cursor = response.get("cursor")
         if not isinstance(cursor, dict):
             raise d.AdmissionRefused("Terminal review cursor is malformed")
         following = cursor.get("next")

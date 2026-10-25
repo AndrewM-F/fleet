@@ -116,13 +116,13 @@ class ReviewTests(unittest.TestCase):
         if path.startswith(base + "/message?"):
             if self.pages:
                 return ({"data": copy.deepcopy(self.messages[:1]), "cursor": {"next": "next"}}
-                        if "order=asc" in path else {"data": copy.deepcopy(self.messages[1:])})
-            return copy.deepcopy(self.history_response or {"data": self.messages})
+                        if "order=asc" in path else {"data": copy.deepcopy(self.messages[1:]), "cursor": {}})
+            return copy.deepcopy(self.history_response or {"data": self.messages, "cursor": {}})
         if path == "/api/session/active":
             return {"data": copy.deepcopy(self.active)}
         if path.startswith("/api/session?"):
             if "parentID=" in path:
-                return {"data": copy.deepcopy(self.children)}
+                return {"data": copy.deepcopy(self.children), "cursor": {}}
             if self.session_inventory is not None:
                 if isinstance(self.session_inventory, list):
                     page = 0 if "cursor=" not in path else 1
@@ -132,7 +132,7 @@ class ReviewTests(unittest.TestCase):
             if "search=Fleet-disposable" in path:
                 items = [item for item in items if isinstance(item, dict)
                          and "Fleet-disposable" in item.get("title", "")]
-            return {"data": items}
+            return {"data": items, "cursor": {}}
         raise AssertionError(path)
 
     def review(self, apply=True):
@@ -194,7 +194,8 @@ class ReviewTests(unittest.TestCase):
 
     def test_incomplete_or_malformed_inventory_cannot_hide_other_leftovers(self):
         self.review()
-        for response in ({"data": [self.session], "cursor": {"next": ""}},
+        for response in ({"data": [self.session]},
+                         {"data": [self.session], "cursor": {"next": ""}},
                          {"data": [self.session], "cursor": None},
                          {"data": [self.session, None]},
                          {"data": [self.session, {}]},
@@ -205,7 +206,7 @@ class ReviewTests(unittest.TestCase):
                     self.executor.verify_clean_start(self.config)
         self.session_inventory = [
             {"data": [self.session], "cursor": {"next": "next"}},
-            {"data": [{"id": "ses_other", "title": "Fleet-disposable:other"}]},
+            {"data": [{"id": "ses_other", "title": "Fleet-disposable:other"}], "cursor": {}},
         ]
         with self.assertRaises(d.AdmissionRefused):
             self.executor.verify_clean_start(self.config)
@@ -277,7 +278,7 @@ class ReviewTests(unittest.TestCase):
         self.session = original
 
     def test_terminal_history_and_pagination_fail_closed(self):
-        for response in ({"data": None}, {"data": ["not a message"]},
+        for response in ({"data": self.messages}, {"data": None}, {"data": ["not a message"]},
                          {"data": self.messages, "cursor": None},
                          {"data": self.messages, "cursor": {"next": "loop"}}):
             with self.subTest(response=response):
@@ -319,6 +320,12 @@ class ReviewTests(unittest.TestCase):
 
 
 class SessionInventoryTests(unittest.TestCase):
+    def test_missing_required_cursor_is_not_a_complete_inventory(self):
+        executor = d.NativeExecutor()
+        with patch.object(executor, "_call", return_value={"data": []}):
+            with self.assertRaises(d.AdmissionRefused):
+                executor._list_sessions(None)
+
     def test_cursor_and_session_identity_validation_is_bounded(self):
         executor = d.NativeExecutor()
         for cursor in ("", False, 1, [], "x" * 4097):
@@ -333,7 +340,7 @@ class SessionInventoryTests(unittest.TestCase):
                 executor._list_sessions(None)
         with patch.object(executor, "_call", side_effect=[
                 {"data": [{"id": "ses_one"}], "cursor": {"next": "a"}},
-                {"data": [{"id": "ses_one"}]}]):
+                {"data": [{"id": "ses_one"}], "cursor": {}}]):
             with self.assertRaisesRegex(d.AdmissionRefused, "identity repeated"):
                 executor._list_sessions(None)
 
