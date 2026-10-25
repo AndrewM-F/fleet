@@ -61,6 +61,7 @@ class OnceTests(unittest.TestCase):
         self.history = [copy.deepcopy(once.EVENT)]
         self.after = [{"id": "msg_done", "type": "assistant", "finish": "stop",
                        "content": [{"type": "text", "text": "Completed approved work"}]}]
+        self.permission_reply = {"data": []}
         self.prompt_error = None
         self.accept_reply = {"data": {"id": "msg_productive_inbox"}}
         self.stack = ExitStack()
@@ -81,8 +82,6 @@ class OnceTests(unittest.TestCase):
         self.active_mock = self.stack.enter_context(patch.object(d.NativeExecutor, "_active_ids",
             return_value=set()))
         self.stack.enter_context(patch.object(d.NativeExecutor, "_messages", side_effect=self.messages))
-        self.permission_mock = self.stack.enter_context(patch.object(d.NativeExecutor,
-            "_permissions_pending", return_value=False))
         self.stack.enter_context(patch.object(d.NativeExecutor, "_call", side_effect=self.api))
 
     def write_owner(self):
@@ -113,6 +112,8 @@ class OnceTests(unittest.TestCase):
     def api(self, config, method, path, body=None, **kwargs):
         self.calls.append((method, path, body))
         if method == "GET":
+            if path.endswith("/permission"):
+                return self.permission_reply
             return {"data": copy.deepcopy(self.session)}
         if path.endswith("/model"):
             self.session["model"] = {**body["model"], "variant": "default"}
@@ -255,7 +256,7 @@ class OnceTests(unittest.TestCase):
             ("another manager", lambda: setattr(self.list_mock, "side_effect", lambda *a, **k: [{"id": "ses_other"}])),
             ("malformed child", lambda: setattr(self.list_mock, "side_effect",
                 lambda *a, **k: [{}] if "parentID" in k else [{"id": self.pin["session"]}])),
-            ("permission", lambda: setattr(self.permission_mock, "return_value", True)),
+            ("permission", lambda: setattr(self, "permission_reply", {"data": [{"id": "pending"}]})),
             ("inbox", lambda: setattr(self.inbox_mock, "side_effect", d.AdmissionRefused("inbox changed"))),
             ("owner", lambda: (self.owner.update(implementationOwner="other"), self.write_owner())),
         ]
@@ -267,7 +268,7 @@ class OnceTests(unittest.TestCase):
                 self.active_mock.return_value = set()
                 self.tree_mock.return_value = [self.pin["session"]]
                 self.list_mock.side_effect = lambda *a, **k: [] if "parentID" in k else [{"id": self.pin["session"]}]
-                self.permission_mock.return_value = False
+                self.permission_reply = {"data": []}
                 self.inbox_mock.side_effect = None
                 self.owner["implementationOwner"] = self.pin["job"]
                 self.write_owner()
@@ -278,6 +279,30 @@ class OnceTests(unittest.TestCase):
                 with self.assertRaises(d.AdmissionRefused):
                     once.run_once()
                 self.assertFalse(self.prompts())
+                self.assert_no_create_delete()
+
+    def test_permission_requires_exact_empty_proof_before_prompt(self):
+        replies = [
+            {"data": {"unexpected": "shape"}},
+            {"data": None},
+            {"data": "unexpected"},
+            {"data": False},
+            {"data": [{"id": "permission_pending"}]},
+            {"data": [], "cursor": {"next": "unread"}},
+            {},
+            None,
+        ]
+        for reply in replies:
+            with self.subTest(reply=reply):
+                for name in ("continuation-attempt.json", "continuation-result.json"):
+                    (self.run / name).unlink(missing_ok=True)
+                self.calls.clear()
+                self.permission_reply = reply
+                with self.assertRaisesRegex(d.AdmissionRefused, "permission response"):
+                    once.run_once()
+                self.assertFalse(self.prompts())
+                self.assertFalse((self.run / "continuation-prompt-intent.json").exists())
+                self.assertFalse((self.run / "continuation-prompt-accepted.json").exists())
                 self.assert_no_create_delete()
 
     def test_changed_inputs_or_dirty_checkout_refuse_without_prompt(self):

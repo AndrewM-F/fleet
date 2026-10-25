@@ -117,8 +117,11 @@ def preflight(executor, config, job):
             or executor._session_tree(config, sid) != [sid] or executor._active_ids(config)):
         raise d.AdmissionRefused("Native work or children exist; admission refused")
     # Exactly the audited switch event is allowed; no user, assistant or new event.
-    if executor._messages(config, sid) != [EVENT] or executor._permissions_pending(config, sid):
-        raise d.AdmissionRefused("Session history or pending permission changed")
+    if executor._messages(config, sid) != [EVENT]:
+        raise d.AdmissionRefused("Session history changed")
+    permission = executor._call(config, "GET", executor._session_path(sid, "/permission"))
+    if permission != {"data": []}:
+        raise d.AdmissionRefused("Owned permission response is not exactly empty")
     inbox(config)
 
 

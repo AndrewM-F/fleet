@@ -181,7 +181,9 @@ The helper pins the owned job, clean branch/head, task/config/runtime bytes and
 owner record; takes the same account lock; and requires the exact audited
 model-switch event with no user/assistant work, empty inbox, zero usage, no
 children, no active native work, no other disposable session and no pending
-permission. It selects the already authorized paid model only with the verified
+permission. Permission and inbox reads must return exactly empty data; malformed,
+pending or unread responses refuse before any prompt. It selects the already
+authorized paid model only with the verified
 free hold. Exclusive durable attempt and prompt-intent records prevent replay,
 including after a crash or ambiguous response. A prompt-accepted receipt records
 the actual native inbox ID and implementation owner; intent is not execution.
