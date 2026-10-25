@@ -190,3 +190,47 @@ the actual native inbox ID and implementation owner; intent is not execution.
 The reviewed NativeExecutor handles the productive turn and paid stops. Success,
 failure, uncertainty and cancellation all preserve this session for review; the
 helper never creates, deletes or retires a session, and never clears its latch.
+
+
+## Reviewed terminal bookkeeping for the completed #536 source slice
+
+The default local checkout may still predate merged Fleet #21. That older
+`Config.parse` rejects `fallbackModel` and `quotaEvidencePath`; removing those
+fields is not a repair. The verified main implementation accepts the authorized
+free-to-existing-Go policy. After root reviews the new exact repair head, advance
+the installed tracked checkout through the normal owned fast-forward path,
+preserving its untracked configuration and run records. No schedule change is
+needed, and the controller remains status-only.
+
+The preserved #536 native turn ended without delivering source; its bounded
+source task was subsequently completed in merged Adea #1637. It must not be
+resent, resumed, deleted, or treated as a native implementation success.
+`scripts/reconcile-adea536-terminal.py` is a narrowly pinned operator review,
+not generic old-session adoption. With no argument it only reports the plan;
+`--apply` appends one private `terminal-reviewed-no-replay.json` receipt only
+**after root personally reviews the exact source and authorizes activation**.
+Do not execute the old continuation helper or clear any original latch.
+
+The review uses the same per-account manager lock, exact current configuration
+and wrapper hashes, original receipt hashes and reviewed source completion. It
+requires the original worktree's clean published head at review time. Native
+checks require the exact session/project/directory/model, complete immutable
+history and terminal IDs, no children/activity, and exactly empty permissions
+and inbox. It performs GET requests only: no prompt, model switch, archive,
+rename, DELETE, session creation, quota probe or manager dispatch. Native context
+and original latches are preserved. Quota evidence is read and hash-checked,
+never cleared or rewritten.
+
+Clean start recognizes only that exact receipt and revalidates the unchanged
+native history and identity every time. A missing/malformed/partial receipt,
+new native work or any other leftover still blocks admission. The completed
+original job ID is refused before dispatch. Receipt creation is exclusive and
+fsynced; an interrupted partial file fails closed and is never overwritten.
+An exact repeat verifies the existing receipt without changing it.
+
+Offline tests do not establish live route readiness. After reviewed activation,
+perform the normal `--inspect` capability/hold/clean-start check. Run a productive
+turn only when root has a genuinely eligible singly owned new scope; do not
+rerun #536, probe quota or fill slots with busywork. Free remains first, the
+verified free hold permits only the authorized Go fallback, paid failure still
+stops admission, and the existing maximum of three remains unchanged.

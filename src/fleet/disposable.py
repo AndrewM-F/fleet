@@ -323,8 +323,9 @@ class NativeExecutor:
                      and isinstance(item.get("title"), str)
                      and item["title"].startswith("Fleet-disposable:")]
         if leftovers:
-            raise AdmissionRefused(
-                "Unretired Fleet-disposable sessions need operator review before restart")
+            from .terminal_review import verify_reviewed_terminal
+            for session in leftovers:
+                verify_reviewed_terminal(self, config, session)
         return True
 
     def _list_sessions(self, config, **filters):
@@ -666,6 +667,8 @@ class Fleet:
 
     def enqueue(self, raw):
         job = Job.parse(raw)
+        from .terminal_review import refuse_reviewed_job
+        refuse_reviewed_job(job)
         with self._lock:
             if job.id in self._jobs:
                 if self._jobs[job.id] != job:

@@ -43,7 +43,8 @@ class OnceTests(unittest.TestCase):
             "fallbackModel": d.PAID_MODEL, "quotaEvidencePath": str(self.quota)}))
         self.task = self.run / "task.txt"
         self.task.write_text("One approved test-only task\n")
-        self.pin = {**once.PIN, "cwd": str(self.cwd), "config": self.config,
+        self.pin = {**once.PIN, "runtimeSHA": hashlib.sha256(Path(d.__file__).read_bytes()).hexdigest(),
+                    "cwd": str(self.cwd), "config": self.config,
                     "configSHA": hashlib.sha256(self.config.read_bytes()).hexdigest(),
                     "taskSHA": hashlib.sha256(self.task.read_bytes()).hexdigest()}
         self.owner = {"jobID": self.pin["job"], "implementationOwner": self.pin["job"],
