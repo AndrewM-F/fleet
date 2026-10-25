@@ -322,6 +322,11 @@ class NativeExecutor:
         from .terminal_review import verify_known_terminal
         verify_known_terminal(self, config)
         sessions = self._list_sessions(config, search="Fleet-disposable")
+        # Session.Info permits an absent title for child listings, but a search
+        # inventory without ownership titles cannot prove clean-start eligibility.
+        if any(not isinstance(item, dict) or not isinstance(item.get("title"), str)
+               or not item["title"].strip() for item in sessions):
+            raise AdmissionRefused("OpenCode clean-start title inventory is incomplete")
         leftovers = [item for item in sessions if isinstance(item, dict)
                      and isinstance(item.get("title"), str)
                      and item["title"].startswith("Fleet-disposable:")]

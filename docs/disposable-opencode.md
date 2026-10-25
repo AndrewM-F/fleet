@@ -223,7 +223,8 @@ never cleared or rewritten.
 
 Clean start recognizes only that exact receipt and revalidates the unchanged
 native history and identity every time. The exact preserved ID is checked
-independently of title search, including after a rename or disappearance. Session
+independently of title search, including after a rename or disappearance. Clean-start search rows without nonblank ownership titles refuse admission;
+child listings retain the supported optional-title shape. Session
 inventory is strictly typed and cursor-paged with an explicit bound; malformed,
 empty or repeated cursors and duplicate IDs refuse admission. A missing/malformed/partial receipt,
 new native work or any other leftover still blocks admission. The completed

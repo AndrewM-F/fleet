@@ -211,6 +211,15 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(d.AdmissionRefused):
             self.executor.verify_clean_start(self.config)
 
+    def test_missing_or_blank_search_title_cannot_hide_an_unreviewed_leftover(self):
+        self.review()
+        for other in ({"id": "ses_other"}, {"id": "ses_other", "title": ""},
+                      {"id": "ses_other", "title": "   "}):
+            with self.subTest(other=other):
+                self.session_inventory = {"data": [self.session, other], "cursor": {}}
+                with self.assertRaisesRegex(d.AdmissionRefused, "title inventory"):
+                    self.executor.verify_clean_start(self.config)
+
     def test_unknown_leftover_still_blocks_after_review(self):
         self.review()
         self.extra = [{"id": "ses_other", "title": "Fleet-disposable:other"}]
@@ -320,6 +329,12 @@ class ReviewTests(unittest.TestCase):
 
 
 class SessionInventoryTests(unittest.TestCase):
+    def test_child_listing_keeps_supported_title_optional_shape(self):
+        executor = d.NativeExecutor()
+        child = {"id": "ses_child"}
+        with patch.object(executor, "_call", return_value={"data": [child], "cursor": {}}):
+            self.assertEqual([child], executor._list_sessions(None, parentID="ses_parent"))
+
     def test_missing_required_cursor_is_not_a_complete_inventory(self):
         executor = d.NativeExecutor()
         with patch.object(executor, "_call", return_value={"data": []}):
