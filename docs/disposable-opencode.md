@@ -77,8 +77,8 @@ or raw provider bodies. For the current root-verified free hold, its shape is:
 
 Do not fabricate an observation or clear a hold to test availability. Keep the
 actual receipt and its provenance until separately verified reset/expiry
-justifies an operator update. A held free provider is not contacted again: a new
-owned session selects Go before its single original productive prompt. No quota
+justifies an operator update. The wrapper sends no free prompt while held: a new owned session selects Go
+before its single original productive prompt. No quota
 probe or failed free request is needed for this admission.
 
 For exhaustion observed during a productive free turn, an operator-verified
