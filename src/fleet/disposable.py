@@ -1,6 +1,6 @@
-"""Process-local new-job queue. No roster, ledger, recovery or session reuse."""
+"""New-job queue; verified model continuation stays inside one owned session."""
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -14,6 +14,7 @@ import time
 from urllib.parse import quote, urlencode
 
 MODEL = "opencode/mimo-v2.6-flash-free"
+PAID_MODEL = "opencode-go/mimo-v2.6-flash"
 MAX_CONCURRENT = 3
 MAX_QUEUED = 32
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -32,15 +33,19 @@ class Config:
     cwd: str
     model: str
     max_concurrent: int
+    fallback_model: str | None = None
+    quota_evidence_path: str | None = None
 
     @classmethod
     def parse(cls, raw):
-        if not isinstance(raw, dict) or set(raw) != {
-                "executable", "account", "cwd", "model", "maxConcurrent"}:
+        required = {"executable", "account", "cwd", "model", "maxConcurrent"}
+        optional = {"fallbackModel", "quotaEvidencePath"}
+        if (not isinstance(raw, dict) or not required <= set(raw)
+                or set(raw) - required - optional):
             raise AdmissionRefused("Exact disposable executable/account/cwd/model/cap required")
-        if raw["model"] != MODEL or type(raw["maxConcurrent"]) is not int or not (
+        if raw["model"] not in (MODEL, PAID_MODEL) or type(raw["maxConcurrent"]) is not int or not (
                 1 <= raw["maxConcurrent"] <= MAX_CONCURRENT):
-            raise AdmissionRefused("Only authorized MiMo free model and at most three jobs allowed")
+            raise AdmissionRefused("Only authorized MiMo Flash models and at most three jobs allowed")
         account = raw["account"]
         if (not isinstance(account, str) or not account.strip()
                 or account != account.strip() or len(account) > 256
@@ -51,8 +56,27 @@ class Config:
             if (not isinstance(value, str) or not Path(value).is_absolute()
                     or str(Path(value).resolve()) != value):
                 raise AdmissionRefused("Disposable paths must be explicit and canonical")
+        fallback = raw.get("fallbackModel")
+        quota_path = raw.get("quotaEvidencePath")
+        if fallback is not None and (fallback != PAID_MODEL or raw["model"] != MODEL):
+            raise AdmissionRefused("Only free MiMo to authorized Go Flash fallback is allowed")
+        if quota_path is not None and (
+                not isinstance(quota_path, str) or not Path(quota_path).is_absolute()
+                or str(Path(quota_path).resolve()) != quota_path):
+            raise AdmissionRefused("Quota evidence path must be explicit and canonical")
+        if (fallback or raw["model"] == PAID_MODEL) and not quota_path:
+            raise AdmissionRefused("Paid selection requires separate verified quota evidence")
         return cls(raw["executable"], raw["account"], raw["cwd"], raw["model"],
-                   raw["maxConcurrent"])
+                   raw["maxConcurrent"], fallback, quota_path)
+
+    def raw(self):
+        result = {"executable": self.executable, "account": self.account,
+                  "cwd": self.cwd, "model": self.model, "maxConcurrent": self.max_concurrent}
+        if self.fallback_model is not None:
+            result["fallbackModel"] = self.fallback_model
+        if self.quota_evidence_path is not None:
+            result["quotaEvidencePath"] = self.quota_evidence_path
+        return result
 
 
 @dataclass(frozen=True)
@@ -85,6 +109,9 @@ class RunResult:
     state: str
     output: str = ""
     stopped: bool = False
+    preserve_session: bool = False
+    error: str | None = None
+    transitions: tuple = ()
 
 
 class NativeExecutor:
@@ -101,6 +128,114 @@ class NativeExecutor:
     _POLL_SECONDS = 2
     _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     _MAX_MESSAGE_PAGES = 100
+
+    def __init__(self):
+        self._quota_lock = threading.RLock()
+
+    def _quota(self, config):
+        if not config.quota_evidence_path:
+            return {"version": 1, "holds": {}, "signatures": []}
+        path = Path(config.quota_evidence_path)
+        try:
+            state = json.loads(path.read_text()) if path.exists() else {
+                "version": 1, "holds": {}, "signatures": []}
+            if (not isinstance(state, dict) or type(state.get("version")) is not int
+                    or state["version"] != 1
+                    or set(state) - {"version", "holds", "signatures", "paidFailure"}
+                    or not isinstance(state.get("holds"), dict)
+                    or not isinstance(state.get("signatures"), list)):
+                raise ValueError("schema")
+            for model, proof in state["holds"].items():
+                self._proof(model, proof)
+            for signature in state["signatures"]:
+                self._proof(signature.get("model"), signature)
+                if (not isinstance(signature.get("type"), str) or not signature["type"]
+                        or type(signature.get("status")) is not int
+                        or signature["status"] not in (402, 429)
+                        or not isinstance(signature.get("messagePrefix"), str)
+                        or not 12 <= len(signature["messagePrefix"]) <= 512):
+                    raise ValueError("signature")
+            if "paidFailure" in state and not isinstance(state["paidFailure"], dict):
+                raise ValueError("paid failure")
+            return state
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            raise AdmissionRefused("Quota evidence is unreadable or unverified; no dispatch") from error
+
+    @staticmethod
+    def _proof(model, proof):
+        if (model not in (MODEL, PAID_MODEL) or not isinstance(proof, dict)
+                or proof.get("verified") is not True
+                or not isinstance(proof.get("evidence"), str)
+                or not 12 <= len(proof["evidence"]) <= 4096):
+            raise ValueError("verified quota proof required")
+
+    def _quota_failure(self, config, model, info):
+        """Only a root-verified exact native error signature establishes exhaustion.
+
+        Native v2 errors have no quota enum. Generic 429s, auth and network errors
+        are deliberately not sufficient, and no provider signature is guessed.
+        """
+        error = info.get("error")
+        if not isinstance(error, dict):
+            return None
+        state = self._quota(config)
+        for signature in state["signatures"]:
+            if (signature["model"] == model and error.get("type") == signature["type"]
+                    and error.get("status") == signature["status"]
+                    and isinstance(error.get("message"), str)
+                    and error["message"].startswith(signature["messagePrefix"])):
+                return signature
+        return None
+
+    def _record_quota(self, config, model, info, proof=None, reason="native-error"):
+        if not config.quota_evidence_path:
+            return
+        with self._quota_lock:
+            state = self._quota(config)
+            if proof is not None:
+                state["holds"][model] = {
+                    "verified": True, "evidence": proof["evidence"],
+                    "assistantID": info.get("id"), "source": "matched-verified-native-signature"}
+            elif model == PAID_MODEL:
+                # Preserve a paid failure separately; do not mislabel it verified quota.
+                error = info.get("error", {})
+                state["paidFailure"] = {"kind": reason, "assistantID": info.get("id"),
+                                        "status": error.get("status") if isinstance(error, dict)
+                                        and type(error.get("status")) is int else None,
+                                        "source": "native-paid-failure;operator-review-required"}
+            path = Path(config.quota_evidence_path)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".quota-", dir=path.parent)
+            try:
+                with os.fdopen(fd, "w") as output:
+                    json.dump(state, output, sort_keys=True)
+                    output.write("\n")
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+    def _switch_model(self, config, session_id, job, model):
+        if set(self._session_tree(config, session_id)) & self._active_ids(config):
+            raise AdmissionRefused("Cannot switch an active native session")
+        provider, identifier = model.split("/", 1)
+        self._call(config, "POST", self._session_path(session_id, "/model"),
+                   {"model": {"providerID": provider, "id": identifier}})
+        session = self._data(self._call(config, "GET", self._session_path(session_id)))
+        if not isinstance(session, dict):
+            raise AdmissionRefused("Native model-switch readback is malformed")
+        location = session.get("directory") or session.get("location", {}).get("directory")
+        native_model = session.get("model")
+        expected_model = {"providerID": provider, "id": identifier}
+        # Native v2 may materialize its default variant after an unqualified
+        # model switch. Keep exact equality so other variants/keys fail closed.
+        if isinstance(native_model, dict) and native_model.get("variant") == "default":
+            expected_model["variant"] = "default"
+        if (session.get("id") != session_id or native_model != expected_model
+                or location != self.job_cwd(config, job)):
+            raise AdmissionRefused("Native switch did not preserve session/worktree/exact model")
 
     def _call(self, config, method, path, body=None, timeout=None):
         command = [config.executable, "api"]
@@ -144,26 +279,42 @@ class NativeExecutor:
         return response["data"]
 
     def verify(self, config):
+        state = self._quota(config)
+        paid_enabled = config.model == PAID_MODEL or config.fallback_model == PAID_MODEL
+        if paid_enabled and (PAID_MODEL in state["holds"] or "paidFailure" in state):
+            raise AdmissionRefused("Paid model is held after failure; operator review required")
+        if config.model == PAID_MODEL and MODEL not in state["holds"]:
+            raise AdmissionRefused("Direct paid admission requires a verified free-quota hold")
+        if (config.model == MODEL and MODEL in state["holds"]
+                and config.fallback_model != PAID_MODEL):
+            raise AdmissionRefused("Free quota is held and no paid fallback is authorized")
         executable = Path(config.executable)
         if (not executable.is_file() or not os.access(executable, os.X_OK)
                 or str(executable.resolve()) != config.executable):
             raise AdmissionRefused("Configured OpenCode executable is missing or changed")
+        if config.account != config.model.split("/", 1)[0]:
+            raise AdmissionRefused("Configured provider does not match the exact model")
         try:
             models = subprocess.run(
                 [config.executable, "models"], cwd=config.cwd,
                 capture_output=True, text=True, timeout=self._REQUEST_TIMEOUT, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise AdmissionRefused("OpenCode model list could not be read") from error
-        if models.returncode != 0 or not any(
-                line.strip() == config.model for line in models.stdout.splitlines()):
+        required_models = {config.model, *([config.fallback_model] if config.fallback_model else [])}
+        if models.returncode != 0 or not required_models <= set(models.stdout.splitlines()):
             raise AdmissionRefused("Exact configured OpenCode model is not listed locally")
         providers = self._data(self._call(config, "GET", "/api/provider"))
         if not isinstance(providers, list) or not any(
                 provider.get("id") == config.account
-                and provider.get("integrationID") == config.account
+                and provider.get("integrationID") == (
+                    "opencode" if config.model == PAID_MODEL else config.account)
                 for provider in providers if isinstance(provider, dict)):
             raise AdmissionRefused(
                 "Configured provider is not available in the existing OpenCode service")
+        if config.fallback_model and not any(
+                isinstance(provider, dict) and provider.get("id") == "opencode-go"
+                and provider.get("integrationID") == "opencode" for provider in providers):
+            raise AdmissionRefused("Existing OpenCode Go integration is unavailable")
         return True
 
     def verify_clean_start(self, config):
@@ -324,6 +475,8 @@ class NativeExecutor:
                 text = "".join(
                     part.get("text", "") for part in parts
                     if isinstance(part, dict) and part.get("type") == "text")
+                if "id" not in info and isinstance(item.get("id"), str):
+                    info = {**info, "id": item["id"]}
                 return info, text
         return {}, ""
 
@@ -337,12 +490,30 @@ class NativeExecutor:
                 self._interrupt(config, item)
 
     def run(self, config, session_id, job, cancel):
+        model = config.model
+        transitions = []
+        state = self._quota(config)
+        if model == MODEL and MODEL in state["holds"]:
+            if config.fallback_model != PAID_MODEL:
+                raise AdmissionRefused("Verified free quota hold forbids another free request")
+            model = PAID_MODEL
+        if model == PAID_MODEL:
+            paid = replace(config, model=PAID_MODEL, account="opencode-go", fallback_model=None)
+            self.verify(paid)
+            if cancel.is_set():
+                return RunResult("cancelled", stopped=True)
+            self._switch_model(config, session_id, job, model)
+            transitions.append({"model": PAID_MODEL, "reason": "verified-free-quota-hold"})
+        if cancel.is_set():
+            return RunResult("cancelled", stopped=True, transitions=tuple(transitions))
+        # Exactly one initial task prompt. Ambiguous API outcomes are never replayed.
         self._call(config, "POST", self._session_path(session_id, "/prompt"),
                    {"text": job.message})
         deadline = time.monotonic() + self._JOB_TIMEOUT
         interrupted = False
         cancelled = False
         stop_deadline = None
+        previous_assistant = None
         while True:
             if cancel.is_set() and not interrupted:
                 self._interrupt_tree(config, session_id)
@@ -353,26 +524,83 @@ class NativeExecutor:
             active = bool(set(tree) & self._active_ids(config))
             messages = self._messages(config, session_id)
             info, text = self._latest_assistant(messages)
+            if previous_assistant and info.get("id") == previous_assistant:
+                info = {}  # Await the paid turn; the prior free error is not its result.
             if not active and interrupted:
-                state = "cancelled" if cancelled else "failed"
+                if not cancelled and model == PAID_MODEL:
+                    return RunResult(
+                        "failed", text or "Paid job timed out", stopped=True,
+                        preserve_session=True,
+                        error="Paid model timed out; no retry; native context preserved",
+                        transitions=tuple(transitions))
+                status = "cancelled" if cancelled else "failed"
                 output = text or ("Cancelled by operator" if cancelled else "Job timed out")
-                return RunResult(state, output, stopped=True)
+                return RunResult(status, output, stopped=True, transitions=tuple(transitions))
             if not active and info.get("error"):
-                return RunResult("failed", text or str(info.get("error")), stopped=True)
+                proof = self._quota_failure(config, model, info)
+                if proof or model == PAID_MODEL:
+                    self._record_quota(config, model, info, proof)
+                if model == PAID_MODEL:
+                    return RunResult("failed", text, stopped=True, preserve_session=True,
+                                     error="Paid model failed; no retry; native context preserved",
+                                     transitions=tuple(transitions))
+                state = self._quota(config)
+                if (proof is not None and config.fallback_model == PAID_MODEL
+                        and MODEL in state["holds"] and isinstance(info.get("id"), str) and info["id"].startswith("msg_")):
+                    paid = replace(config, model=PAID_MODEL, account="opencode-go",
+                                   fallback_model=None)
+                    self.verify(paid)
+                    if cancel.is_set():
+                        return RunResult("cancelled", stopped=True)
+                    self._switch_model(config, session_id, job, PAID_MODEL)
+                    if cancel.is_set():
+                        return RunResult("cancelled", stopped=True)
+                    previous_assistant = info["id"]
+                    continuation_id = "msg_fallback_" + hashlib.sha256(
+                        f"{session_id}:{job.id}:{previous_assistant}".encode()).hexdigest()[:24]
+                    # A continuation, not a resend of the original task or a fork.
+                    self._call(config, "POST", self._session_path(session_id, "/prompt"), {
+                        "id": continuation_id,
+                        "text": "Continue the already approved task in this same session after "
+                                "the verified free-quota stop. Inspect existing progress and "
+                                "partial work first; do not repeat completed side effects."})
+                    model = PAID_MODEL
+                    transitions.append({"model": model, "reason": "verified-free-quota-error",
+                                        "previousAssistantID": previous_assistant})
+                    continue
+                return RunResult("failed", text, stopped=True,
+                                 preserve_session=bool(config.fallback_model),
+                                 error="Free error has no verified quota fallback proof",
+                                 transitions=tuple(transitions))
             if not active and info.get("finish") == "stop":
-                return RunResult("finished", text, stopped=True)
+                return RunResult("finished", text, stopped=True, transitions=tuple(transitions))
             if not active and self._permissions_pending(config, session_id):
-                pass  # Normal OpenCode permission flow remains under user control.
+                pass  # Existing native permission controls are unchanged.
             elif not active and info.get("finish") == "length":
-                return RunResult("finished", text, stopped=True)
+                return RunResult("finished", text, stopped=True, transitions=tuple(transitions))
             elif not active and info.get("finish") == "error":
-                return RunResult("failed", text, stopped=True)
+                if model == PAID_MODEL:
+                    self._record_quota(config, model, info)
+                return RunResult("failed", text, stopped=True,
+                                 preserve_session=bool(config.fallback_model) or model == PAID_MODEL,
+                                 error="Unclassified native failure; no provider retry",
+                                 transitions=tuple(transitions))
             if not interrupted and time.monotonic() >= deadline:
-                self._interrupt_tree(config, session_id)
+                # Classify once at the deadline decision. A cancellation already
+                # requested after the loop-top check wins over timeout.
+                cancelled = cancel.is_set()
                 interrupted = True
                 stop_deadline = time.monotonic() + self._STOP_TIMEOUT
+                try:
+                    if not cancelled and model == PAID_MODEL:
+                        self._record_quota(config, model, info, reason="timeout")
+                finally:
+                    # Persist first, but still attempt a stop if evidence I/O fails.
+                    self._interrupt_tree(config, session_id)
             if interrupted and stop_deadline is not None and time.monotonic() >= stop_deadline:
-                return RunResult("failed", text, stopped=False)
+                return RunResult("failed", text, stopped=False,
+                                 preserve_session=model == PAID_MODEL,
+                                 transitions=tuple(transitions))
             cancel.wait(self._POLL_SECONDS)
 
     def retire(self, config, session_id):
@@ -416,14 +644,13 @@ class Fleet:
     retire(config, sid) deletes that exact session and returns True only after
     verifying absence. A create exception is ambiguous, so all admission stops.
     Exceptions from run are unverified execution, so deletion is unsafe and
-    admission stops. There is no retry, import, resume, or recovery operation.
+    admission stops. Verified free-quota continuation stays within the same job;
+    there is no task replay, history import or old-session recovery operation.
     """
     def __init__(self, config, executor):
         if not isinstance(config, Config):
             raise AdmissionRefused("Explicit validated disposable configuration required")
-        Config.parse({"executable": config.executable, "account": config.account,
-                      "cwd": config.cwd, "model": config.model,
-                      "maxConcurrent": config.max_concurrent})
+        Config.parse(config.raw())
         self.config = config
         self.executor = executor
         self._lock = threading.RLock()
@@ -474,7 +701,7 @@ class Fleet:
             worker.start()
 
     def _finish(self, identifier, state, output="", session=None,
-                retired=False, error=None, release=False):
+                retired=False, error=None, release=False, transitions=()):
         with self._lock:
             if identifier in self._terminal:
                 raise RuntimeError("Terminal result already published")
@@ -484,6 +711,8 @@ class Fleet:
             self._terminal[identifier] = {"id": identifier, "state": state,
                                           "output": output, "sessionId": session,
                                           "retired": retired, "error": error}
+            if transitions:
+                self._terminal[identifier]["providerTransitions"] = list(transitions)
             if release:
                 self._active.pop(identifier, None)
             else:
@@ -545,6 +774,11 @@ class Fleet:
             self._finish(identifier, "failed", session=sid, error=str(error))
             return
 
+        if result.preserve_session:
+            self._finish(identifier, result.state, result.output, sid, retired=False,
+                         error=result.error or "Native session preserved for operator review",
+                         transitions=result.transitions)
+            return
         try:
             if self.executor.retire(self.config, sid) is not True:
                 raise AdmissionRefused("Native retirement was not confirmed")
@@ -555,7 +789,8 @@ class Fleet:
         # The lifecycle owner decides once, after a confirmed stop and deletion.
         state = "cancelled" if cancel.is_set() else result.state
         self._finish(identifier, state, result.output, sid, retired=True,
-                     error=dispatch_error, release=True)
+                     error=dispatch_error or result.error, release=True,
+                     transitions=result.transitions)
 
     def cancel(self, identifier):
         with self._lock:
@@ -663,7 +898,8 @@ def command(config_path, stream, output, inspect=False):
 
 def _acquire_manager_lock(config):
     """Keep the three-job cap global across concurrent manager invocations."""
-    account_digest = hashlib.sha256(config.account.encode()).hexdigest()[:16]
+    binding = "opencode" if config.account in {"opencode", "opencode-go"} else config.account
+    account_digest = hashlib.sha256(binding.encode()).hexdigest()[:16]
     directory = Path.home() / "Developer" / ".codex" / "fleet"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = directory / f"disposable-opencode-{account_digest}.lock"

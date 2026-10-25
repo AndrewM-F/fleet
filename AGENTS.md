@@ -7,16 +7,22 @@ command prints JSON on stdout and exits non-zero on failure.
 The separately authorized `disposable-opencode` route is an exception to the
 legacy manager's no-model-call rule: it runs new root-authorized jobs through the
 already signed-in local OpenCode service, with a fresh native session per job,
-the exact MiMo free model, and at most three concurrent jobs. It uses OpenCode's
-normal same-user permissions; it is not an OS credential sandbox. It must never
-read/copy credentials, switch accounts/models, probe quota, resume old sessions,
-or import legacy queue/history. See `docs/disposable-opencode.md`.
+MiMo Flash free first, with the explicitly authorized existing Go Flash fallback
+only after verified free usage exhaustion, and at most three concurrent jobs
+across both providers. It uses OpenCode's normal same-user permissions; it is not
+an OS credential sandbox. Never read/copy credentials, change account identity,
+probe quota, revive archived workers, or import legacy queue/history. The only
+approved model transition is the same owned native session from
+`opencode/mimo-v2.6-flash-free` to `opencode-go/mimo-v2.6-flash`, retaining context
+and partial work. Unknown errors are not quota proof; paid failure stops without
+retry. See `docs/disposable-opencode.md`.
 
 The separately authorized new-only OpenCode route is
 `bin/fleet disposable-opencode --config PATH [--inspect]`; see
 [docs/disposable-opencode.md](docs/disposable-opencode.md). Its lifecycle uses a
-new native session per admitted job and retires it after completion, with the
-explicit MiMo free model and at most three concurrent jobs. It does not use the
+new native session per admitted job and retires it after successful completion,
+with the approved free-first/fallback policy and at most three concurrent jobs.
+A quota-stopped/ambiguous session is preserved for root review, not replayed. It does not use the
 legacy roster, queue, ledger, resume or recovery commands below. The legacy
 OpenCode transport and old runtime/history cleanup remain separate.
 

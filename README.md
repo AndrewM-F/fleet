@@ -8,8 +8,10 @@ demand through the supported OpenCode CLI, which is the only path that may creat
 Agents: read [AGENTS.md](AGENTS.md).
 
 The separate [disposable OpenCode route](docs/disposable-opencode.md) accepts only
-new jobs, creates a fresh session per job, and enforces a three-job MiMo free cap
-through the signed-in local OpenCode service. It uses OpenCode's normal
+new jobs, creates a fresh session per job, and enforces a shared three-job cap
+through the signed-in local OpenCode service. MiMo Flash starts free; separately
+verified free-quota exhaustion permits the existing Go Flash model in the same
+native session. Paid failures stop and preserve context for root review. It uses OpenCode's normal
 same-user permissions; it does not claim OS-level credential isolation. Inspect
 checks the local service/provider/model without creating sessions or probing quota.
 
